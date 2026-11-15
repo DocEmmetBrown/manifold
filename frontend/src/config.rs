@@ -148,6 +148,32 @@ pub struct ToolConfig {
     pub nozzle_diameter_mm: f32,
     /// Target extrusion temperature in degrees Celsius (°C).
     pub temperature_celsius: f32,
+    /// Material type assigned to this tool (e.g. `"PLA"`, `"PETG"`, `"ABS"`, `"ASA"`, `"TPU"`).
+    pub filament_type: String,
+    /// Assigned filament preset name for this tool (e.g. `"Generic PLA"`, `"Generic PETG"`).
+    pub filament_preset_name: String,
+    /// Density of the filament loaded in this tool (`g/cm³`).
+    pub filament_density_g_cm3: f32,
+    /// Extrusion flow multiplier for the filament loaded in this tool (`1.0` = 100%).
+    pub extrusion_multiplier: f32,
+    /// Steady-state part cooling fan duty cycle (`0..=100%`) for the filament loaded in this tool.
+    pub fan_speed_percent: f32,
+    /// Minimum dynamic part cooling fan duty cycle (`0..=100%`) for this tool's filament.
+    pub min_fan_speed_percent: f32,
+    /// Maximum dynamic part cooling fan duty cycle (`0..=100%`) for this tool's filament.
+    pub max_fan_speed_percent: f32,
+    /// Bridge cooling fan duty cycle (`0..=100%`) for this tool's filament.
+    pub bridge_fan_speed_percent: f32,
+    /// Wave Overhang cooling fan duty cycle (`0..=100%`) for this tool's filament.
+    pub wave_overhang_fan_speed_percent: f32,
+    /// Low-flow Pressure Advance time constant `pa_low_flow_s` (s) for this tool's filament.
+    pub pa_low_flow_s: f32,
+    /// High-flow Pressure Advance time constant `pa_high_flow_s` (s) for this tool's filament.
+    pub pa_high_flow_s: f32,
+    /// Low-flow viscoelastic die swell ratio (`>= 1.0`) for this tool's filament.
+    pub swell_low: f32,
+    /// High-flow viscoelastic die swell ratio (`>= 1.0`) for this tool's filament.
+    pub swell_high: f32,
     /// Whether this tool has rotational axes capable of orienting the nozzle away from the bed normal.
     pub has_rotational_axes: bool,
     /// Maximum allowable angle (in degrees) between the tool axis (`nozzle_axis`) and the bed normal (`+Z_bed`).
@@ -182,6 +208,173 @@ impl Default for ToolConfig {
 }
 
 impl ToolConfig {
+    /// Applies standard material defaults (temperature, density, cooling fan schedule, and PA)
+    /// for a known filament type name (`"PLA"`, `"PLA+"`, `"PETG"`, `"ABS"`, `"ASA"`, `"TPU"`, `"PVA"`, `"BVOH"`, `"PA"`, `"PA-CF"`, `"PC"`).
+    pub fn apply_filament_type_defaults(&mut self, filament_type: &str) {
+        let trimmed = filament_type.trim();
+        if !trimmed.is_empty() {
+            self.filament_type = trimmed.to_string();
+        }
+        let upper = self.filament_type.to_ascii_uppercase();
+        if upper.contains("PETG") {
+            self.filament_preset_name = "Generic PETG".to_string();
+            self.temperature_celsius = 240.0;
+            self.filament_density_g_cm3 = 1.27;
+            self.fan_speed_percent = 40.0;
+            self.min_fan_speed_percent = 20.0;
+            self.max_fan_speed_percent = 80.0;
+            self.bridge_fan_speed_percent = 80.0;
+            self.wave_overhang_fan_speed_percent = 70.0;
+            self.pa_low_flow_s = 0.055;
+            self.pa_high_flow_s = 0.032;
+        } else if upper.contains("ASA") {
+            self.filament_preset_name = "Generic ASA".to_string();
+            self.temperature_celsius = 260.0;
+            self.filament_density_g_cm3 = 1.07;
+            self.fan_speed_percent = 20.0;
+            self.min_fan_speed_percent = 10.0;
+            self.max_fan_speed_percent = 50.0;
+            self.bridge_fan_speed_percent = 50.0;
+            self.wave_overhang_fan_speed_percent = 45.0;
+            self.pa_low_flow_s = 0.038;
+            self.pa_high_flow_s = 0.022;
+        } else if upper.contains("ABS") {
+            self.filament_preset_name = "Generic ABS".to_string();
+            self.temperature_celsius = 255.0;
+            self.filament_density_g_cm3 = 1.04;
+            self.fan_speed_percent = 20.0;
+            self.min_fan_speed_percent = 10.0;
+            self.max_fan_speed_percent = 50.0;
+            self.bridge_fan_speed_percent = 50.0;
+            self.wave_overhang_fan_speed_percent = 45.0;
+            self.pa_low_flow_s = 0.038;
+            self.pa_high_flow_s = 0.022;
+        } else if upper.contains("TPU") || upper.contains("FLEX") || upper.contains("TPE") {
+            self.filament_preset_name = "TPU 95A".to_string();
+            self.temperature_celsius = 225.0;
+            self.filament_density_g_cm3 = 1.21;
+            self.fan_speed_percent = 50.0;
+            self.min_fan_speed_percent = 25.0;
+            self.max_fan_speed_percent = 70.0;
+            self.bridge_fan_speed_percent = 75.0;
+            self.wave_overhang_fan_speed_percent = 65.0;
+            self.pa_low_flow_s = 0.120;
+            self.pa_high_flow_s = 0.085;
+        } else if upper.contains("PVA") || upper.contains("BVOH") {
+            self.filament_preset_name = format!("Soluble {}", self.filament_type);
+            self.temperature_celsius = 205.0;
+            self.filament_density_g_cm3 = 1.23;
+            self.fan_speed_percent = 80.0;
+            self.min_fan_speed_percent = 30.0;
+            self.max_fan_speed_percent = 100.0;
+            self.bridge_fan_speed_percent = 100.0;
+            self.wave_overhang_fan_speed_percent = 90.0;
+            self.pa_low_flow_s = 0.050;
+            self.pa_high_flow_s = 0.030;
+        } else if upper.contains("PA") || upper.contains("NYLON") {
+            self.filament_preset_name = format!("Generic {}", self.filament_type);
+            self.temperature_celsius = 275.0;
+            self.filament_density_g_cm3 = 1.14;
+            self.fan_speed_percent = 15.0;
+            self.min_fan_speed_percent = 0.0;
+            self.max_fan_speed_percent = 35.0;
+            self.bridge_fan_speed_percent = 45.0;
+            self.wave_overhang_fan_speed_percent = 40.0;
+            self.pa_low_flow_s = 0.040;
+            self.pa_high_flow_s = 0.024;
+        } else if upper.contains("PC") {
+            self.filament_preset_name = "Generic PC".to_string();
+            self.temperature_celsius = 280.0;
+            self.filament_density_g_cm3 = 1.20;
+            self.fan_speed_percent = 15.0;
+            self.min_fan_speed_percent = 0.0;
+            self.max_fan_speed_percent = 40.0;
+            self.bridge_fan_speed_percent = 50.0;
+            self.wave_overhang_fan_speed_percent = 45.0;
+            self.pa_low_flow_s = 0.038;
+            self.pa_high_flow_s = 0.022;
+        } else if upper.contains("PLA+") {
+            self.filament_preset_name = "High-Flow PLA+".to_string();
+            self.temperature_celsius = 225.0;
+            self.filament_density_g_cm3 = 1.24;
+            self.fan_speed_percent = 100.0;
+            self.min_fan_speed_percent = 20.0;
+            self.max_fan_speed_percent = 100.0;
+            self.bridge_fan_speed_percent = 100.0;
+            self.wave_overhang_fan_speed_percent = 100.0;
+            self.pa_low_flow_s = 0.036;
+            self.pa_high_flow_s = 0.020;
+        } else {
+            self.filament_preset_name = "Generic PLA".to_string();
+            self.temperature_celsius = 215.0;
+            self.filament_density_g_cm3 = 1.24;
+            self.fan_speed_percent = 100.0;
+            self.min_fan_speed_percent = 20.0;
+            self.max_fan_speed_percent = 100.0;
+            self.bridge_fan_speed_percent = 100.0;
+            self.wave_overhang_fan_speed_percent = 100.0;
+            self.pa_low_flow_s = 0.042;
+            self.pa_high_flow_s = 0.024;
+        }
+    }
+
+    /// Returns `true` if this tool has explicitly configured filament settings that differ from
+    /// the factory default `GcodeProcessConfig::default()`.
+    pub fn has_custom_filament_config(&self) -> bool {
+        let def = GcodeProcessConfig::default();
+        !self.filament_type.eq_ignore_ascii_case(&def.filament_type)
+            || !(self.filament_preset_name.is_empty()
+                || self.filament_preset_name == "Generic PLA")
+            || (self.filament_density_g_cm3 - def.filament_density_g_cm3).abs() > 1.0e-4
+            || (self.extrusion_multiplier - def.extrusion_multiplier).abs() > 1.0e-4
+            || (self.fan_speed_percent - def.fan_speed_percent).abs() > 1.0e-4
+            || (self.min_fan_speed_percent - def.min_fan_speed_percent).abs() > 1.0e-4
+            || (self.max_fan_speed_percent - def.max_fan_speed_percent).abs() > 1.0e-4
+            || (self.bridge_fan_speed_percent - def.bridge_fan_speed_percent).abs() > 1.0e-4
+            || (self.wave_overhang_fan_speed_percent - def.wave_overhang_fan_speed_percent).abs()
+                > 1.0e-4
+            || (self.pa_low_flow_s - def.pa_low_flow_s).abs() > 1.0e-5
+            || (self.pa_high_flow_s - def.pa_high_flow_s).abs() > 1.0e-5
+            || (self.swell_low - def.swell_low).abs() > 1.0e-4
+            || (self.swell_high - def.swell_high).abs() > 1.0e-4
+    }
+
+    /// Returns a copy of `base_gcfg` overlaid with this tool's assigned filament material properties
+    /// (filament type, density, flow multiplier, cooling fan schedule, PA, and die swell).
+    pub fn effective_gcode_config(&self, base_gcfg: &GcodeProcessConfig) -> GcodeProcessConfig {
+        let mut cfg = base_gcfg.clone();
+        if !self.filament_type.trim().is_empty() {
+            cfg.filament_type = self.filament_type.clone();
+        }
+        if self.filament_density_g_cm3.is_finite() && self.filament_density_g_cm3 > 0.1 {
+            cfg.filament_density_g_cm3 = self.filament_density_g_cm3;
+        }
+        if self.extrusion_multiplier.is_finite() && self.extrusion_multiplier > 0.1 {
+            cfg.extrusion_multiplier = self.extrusion_multiplier;
+        }
+        cfg.fan_speed_percent = self.fan_speed_percent.clamp(0.0, 100.0);
+        cfg.min_fan_speed_percent = self.min_fan_speed_percent.clamp(0.0, 100.0);
+        cfg.max_fan_speed_percent = self
+            .max_fan_speed_percent
+            .clamp(cfg.min_fan_speed_percent, 100.0);
+        cfg.bridge_fan_speed_percent = self.bridge_fan_speed_percent.clamp(0.0, 100.0);
+        cfg.wave_overhang_fan_speed_percent =
+            self.wave_overhang_fan_speed_percent.clamp(0.0, 100.0);
+        if self.pa_low_flow_s.is_finite() && self.pa_low_flow_s >= 0.0 {
+            cfg.pa_low_flow_s = self.pa_low_flow_s;
+        }
+        if self.pa_high_flow_s.is_finite() && self.pa_high_flow_s >= 0.0 {
+            cfg.pa_high_flow_s = self.pa_high_flow_s;
+        }
+        if self.swell_low.is_finite() && self.swell_low >= 1.0 {
+            cfg.swell_low = self.swell_low;
+        }
+        if self.swell_high.is_finite() && self.swell_high >= 1.0 {
+            cfg.swell_high = self.swell_high;
+        }
+        cfg
+    }
+
     /// Creates a standard extrusion tool with a default multi-segment XZ clearance profile
     /// modeling the nozzle tip flat, brass cone, heater block, and toolhead shroud.
     pub fn standard_tool(
@@ -196,6 +389,19 @@ impl ToolConfig {
             name: name.into(),
             nozzle_diameter_mm,
             temperature_celsius,
+            filament_type: "PLA".to_string(),
+            filament_preset_name: "Generic PLA".to_string(),
+            filament_density_g_cm3: 1.24,
+            extrusion_multiplier: 1.0,
+            fan_speed_percent: 100.0,
+            min_fan_speed_percent: 20.0,
+            max_fan_speed_percent: 100.0,
+            bridge_fan_speed_percent: 100.0,
+            wave_overhang_fan_speed_percent: 100.0,
+            pa_low_flow_s: 0.042,
+            pa_high_flow_s: 0.024,
+            swell_low: 1.03,
+            swell_high: 1.10,
             has_rotational_axes: true,
             max_angle_from_bed_normal_deg: 45.0,
             clearance_mode: ClearanceProfileMode::PiecewiseXZ,
@@ -2095,7 +2301,13 @@ impl SlicerConfig {
         }
         let max_tool_idx = self.tools.len().saturating_sub(1);
         for (i, slot) in slots.iter_mut().enumerate() {
-            slot.tool_index = i.min(max_tool_idx);
+            let t_idx = i.min(max_tool_idx);
+            slot.tool_index = t_idx;
+            if let Some(tool) = self.tools.get_mut(t_idx) {
+                if !slot.filament_type.trim().is_empty() {
+                    tool.apply_filament_type_defaults(&slot.filament_type);
+                }
+            }
         }
         self.filament_slots = slots;
     }
@@ -2119,6 +2331,72 @@ impl SlicerConfig {
             None
         } else {
             self.tools.get(self.support_tool_index_resolved())
+        }
+    }
+
+    /// Syncs the active tool's filament material fields into `self.gcode` and `self.filament_preset_name`.
+    pub fn sync_gcode_from_active_tool(&mut self) {
+        let Some(tool) = self.active_tool().cloned() else {
+            return;
+        };
+        if !tool.filament_preset_name.trim().is_empty() {
+            self.filament_preset_name = tool.filament_preset_name;
+        }
+        if !tool.filament_type.trim().is_empty() {
+            self.gcode.filament_type = tool.filament_type;
+        }
+        if tool.filament_density_g_cm3.is_finite() && tool.filament_density_g_cm3 > 0.1 {
+            self.gcode.filament_density_g_cm3 = tool.filament_density_g_cm3;
+        }
+        if tool.extrusion_multiplier.is_finite() && tool.extrusion_multiplier > 0.1 {
+            self.gcode.extrusion_multiplier = tool.extrusion_multiplier;
+        }
+        self.gcode.fan_speed_percent = tool.fan_speed_percent.clamp(0.0, 100.0);
+        self.gcode.min_fan_speed_percent = tool.min_fan_speed_percent.clamp(0.0, 100.0);
+        self.gcode.max_fan_speed_percent = tool
+            .max_fan_speed_percent
+            .clamp(self.gcode.min_fan_speed_percent, 100.0);
+        self.gcode.bridge_fan_speed_percent = tool.bridge_fan_speed_percent.clamp(0.0, 100.0);
+        self.gcode.wave_overhang_fan_speed_percent =
+            tool.wave_overhang_fan_speed_percent.clamp(0.0, 100.0);
+        if tool.pa_low_flow_s.is_finite() && tool.pa_low_flow_s >= 0.0 {
+            self.gcode.pa_low_flow_s = tool.pa_low_flow_s;
+        }
+        if tool.pa_high_flow_s.is_finite() && tool.pa_high_flow_s >= 0.0 {
+            self.gcode.pa_high_flow_s = tool.pa_high_flow_s;
+        }
+        if tool.swell_low.is_finite() && tool.swell_low >= 1.0 {
+            self.gcode.swell_low = tool.swell_low;
+        }
+        if tool.swell_high.is_finite() && tool.swell_high >= 1.0 {
+            self.gcode.swell_high = tool.swell_high;
+        }
+    }
+
+    /// Syncs `self.gcode` filament material fields back into the active tool (`self.tools[active_tool_index]`).
+    pub fn sync_active_tool_from_gcode(&mut self) {
+        if self.tools.is_empty() {
+            return;
+        }
+        let idx = self.active_tool_index.min(self.tools.len() - 1);
+        let preset_name = self.filament_preset_name.clone();
+        let g = &self.gcode;
+        if let Some(tool) = self.tools.get_mut(idx) {
+            if !preset_name.trim().is_empty() {
+                tool.filament_preset_name = preset_name;
+            }
+            tool.filament_type = g.filament_type.clone();
+            tool.filament_density_g_cm3 = g.filament_density_g_cm3;
+            tool.extrusion_multiplier = g.extrusion_multiplier;
+            tool.fan_speed_percent = g.fan_speed_percent;
+            tool.min_fan_speed_percent = g.min_fan_speed_percent;
+            tool.max_fan_speed_percent = g.max_fan_speed_percent;
+            tool.bridge_fan_speed_percent = g.bridge_fan_speed_percent;
+            tool.wave_overhang_fan_speed_percent = g.wave_overhang_fan_speed_percent;
+            tool.pa_low_flow_s = g.pa_low_flow_s;
+            tool.pa_high_flow_s = g.pa_high_flow_s;
+            tool.swell_low = g.swell_low;
+            tool.swell_high = g.swell_high;
         }
     }
 

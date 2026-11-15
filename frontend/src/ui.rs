@@ -3104,7 +3104,13 @@ pub fn ui_workspace_system(
                             );
                         }
                         PresetCategory::Tool => {
-                            render_tool_config_tab(ui, &mut config, &mut vis_state, is_computing);
+                            render_tool_config_tab(
+                                ui,
+                                &mut config,
+                                &mut vis_state,
+                                &mut preset_lib,
+                                is_computing,
+                            );
                         }
                         PresetCategory::Filament => {
                             render_filament_config_tab(
@@ -3112,6 +3118,7 @@ pub fn ui_workspace_system(
                                 &mut config,
                                 &mut vis_state,
                                 &mut calib_state,
+                                &mut preset_lib,
                                 is_computing,
                             );
                         }
@@ -4088,6 +4095,7 @@ fn render_tool_config_tab(
     ui: &mut egui::Ui,
     config: &mut SlicerConfig,
     vis_state: &mut FieldVisualizationState,
+    preset_lib: &mut PresetLibrary,
     is_computing: bool,
 ) {
     let mut dirty_backend = false;
@@ -4116,7 +4124,10 @@ fn render_tool_config_tab(
                 if render_delineated_pill_tab(
                     ui,
                     selected,
-                    format!("T{} ({:.2}mm)", tool.id, tool.nozzle_diameter_mm),
+                    format!(
+                        "T{} ({:.2}mm, {})",
+                        tool.id, tool.nozzle_diameter_mm, tool.filament_type
+                    ),
                 )
                 .clicked()
                 {
@@ -4125,7 +4136,16 @@ fn render_tool_config_tab(
             }
             if let Some(idx) = clicked_idx {
                 config.active_tool_index = idx;
+                config.sync_gcode_from_active_tool();
+                if preset_lib
+                    .filaments
+                    .iter()
+                    .any(|p| p.name == config.filament_preset_name)
+                {
+                    preset_lib.selected_filament = config.filament_preset_name.clone();
+                }
                 dirty_backend = true;
+                dirty_gcode = true;
             }
             if ui.small_button("+ Add Tool").clicked() {
                 let next_id = config.tools.iter().map(|t| t.id).max().unwrap_or(0) + 1;
@@ -4136,7 +4156,9 @@ fn render_tool_config_tab(
                     215.0,
                 ));
                 config.active_tool_index = config.tools.len() - 1;
+                config.sync_gcode_from_active_tool();
                 dirty_backend = true;
+                dirty_gcode = true;
             }
             if config.tools.len() > 1 && ui.small_button("Remove Tool").clicked() {
                 let rm_idx = config.active_tool_index;
@@ -4144,11 +4166,21 @@ fn render_tool_config_tab(
                 if config.active_tool_index >= config.tools.len() {
                     config.active_tool_index = config.tools.len() - 1;
                 }
+                config.sync_gcode_from_active_tool();
                 dirty_backend = true;
+                dirty_gcode = true;
             }
         });
 
         let active_idx = config.active_tool_index;
+        let filament_preset_list: Vec<(String, bool)> = preset_lib
+            .filaments
+            .iter()
+            .map(|p| (p.name.clone(), p.is_builtin))
+            .collect();
+        let mut chosen_filament_preset: Option<String> = None;
+        let mut sync_active_to_gcode = false;
+
         if let Some(tool) = config.tools.get_mut(active_idx) {
             ui.horizontal(|ui| {
                 ui.label("Tool Name:");
@@ -4169,6 +4201,92 @@ fn render_tool_config_tab(
                 }
                 param_help_button(ui, "tools.nozzle_diameter_mm");
             });
+
+            // Per-tool Filament Preset & Material Type assignment
+            ui.horizontal(|ui| {
+                ui.label("Tool Filament Preset:");
+                let cur_preset_lbl = if tool.filament_preset_name.trim().is_empty() {
+                    format!("Custom ({})", tool.filament_type)
+                } else {
+                    tool.filament_preset_name.clone()
+                };
+                egui::ComboBox::from_id_source(("tool_filament_preset_combo", tool.id))
+                    .selected_text(cur_preset_lbl)
+                    .width(205.0)
+                    .show_ui(ui, |ui| {
+                        for (p_name, builtin) in &filament_preset_list {
+                            let tag = if *builtin { "[Factory]" } else { "[User]" };
+                            let is_sel = &tool.filament_preset_name == p_name;
+                            if ui
+                                .selectable_label(is_sel, format!("{p_name}  {tag}"))
+                                .clicked()
+                            {
+                                chosen_filament_preset = Some(p_name.clone());
+                            }
+                        }
+                    });
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Filament Type:");
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut tool.filament_type)
+                            .desired_width(60.0)
+                            .hint_text("PLA"),
+                    )
+                    .on_hover_text("Material type assigned to this tool (PLA, PETG, ABS, ASA, TPU, PVA, PA-CF, etc.)")
+                    .changed()
+                {
+                    sync_active_to_gcode = true;
+                    dirty_gcode = true;
+                }
+                for mat_name in ["PLA", "PETG", "ABS", "ASA", "TPU", "PVA", "PA-CF"] {
+                    let is_mat = tool.filament_type.eq_ignore_ascii_case(mat_name);
+                    if ui
+                        .selectable_label(is_mat, mat_name)
+                        .on_hover_text(format!(
+                            "Apply {mat_name} temperature, cooling fan, density & PA defaults to T{}",
+                            tool.id
+                        ))
+                        .clicked()
+                    {
+                        tool.apply_filament_type_defaults(mat_name);
+                        sync_active_to_gcode = true;
+                        dirty_backend = true;
+                        dirty_gcode = true;
+                    }
+                }
+                param_help_button(ui, "gcode.filament_type");
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Slider::new(&mut tool.temperature_celsius, 170.0..=350.0)
+                            .text("Nozzle Temp (°C)"),
+                    )
+                    .changed()
+                {
+                    sync_active_to_gcode = true;
+                    dirty_backend = true;
+                    dirty_gcode = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut tool.fan_speed_percent)
+                            .speed(1.0)
+                            .range(0.0..=100.0)
+                            .prefix("Fan: ")
+                            .suffix("%"),
+                    )
+                    .on_hover_text("Part cooling fan speed for this tool's filament")
+                    .changed()
+                {
+                    sync_active_to_gcode = true;
+                    dirty_gcode = true;
+                }
+                param_help_button(ui, "tools.temperature_celsius");
+            });
+
             ui.horizontal(|ui| {
                 if ui
                     .checkbox(
@@ -4194,6 +4312,32 @@ fn render_tool_config_tab(
                     }
                     param_help_button(ui, "tools.rotational_axes");
                 });
+            }
+        }
+
+        if let Some(p_name) = chosen_filament_preset {
+            if let Some(fp) = preset_lib
+                .filaments
+                .iter()
+                .find(|p| p.name == p_name)
+                .cloned()
+            {
+                if let Some(tool) = config.tools.get_mut(active_idx) {
+                    fp.apply_to_tool(tool);
+                }
+                fp.apply_to_config(config);
+                preset_lib.selected_filament = p_name;
+                dirty_backend = true;
+                dirty_gcode = true;
+            }
+        } else if sync_active_to_gcode {
+            config.sync_gcode_from_active_tool();
+            if preset_lib
+                .filaments
+                .iter()
+                .any(|p| p.name == config.filament_preset_name)
+            {
+                preset_lib.selected_filament = config.filament_preset_name.clone();
             }
         }
 
@@ -4762,11 +4906,33 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                         }
                         for (i, slot) in config.filament_slots.iter_mut().enumerate() {
                             slot.slot_index = i as u32;
-                            slot.tool_index = i.min(config.tools.len().saturating_sub(1));
+                            let t_idx = i.min(config.tools.len().saturating_sub(1));
+                            slot.tool_index = t_idx;
+                            if let Some(tool) = config.tools.get_mut(t_idx) {
+                                tool.apply_filament_type_defaults(&slot.filament_type);
+                            }
                         }
+                        config.sync_gcode_from_active_tool();
                         *dirty_backend = true;
                         *dirty_gcode = true;
                         vis_state.dirty_toolpaths_mesh = true;
+                    }
+
+                    if ui
+                        .small_button("Sync Slot Types → Tools")
+                        .on_hover_text(
+                            "Apply each 3MF filament slot's material type (temperature, fan, density & PA defaults) to its mapped tool",
+                        )
+                        .clicked()
+                    {
+                        for slot in &config.filament_slots {
+                            if let Some(tool) = config.tools.get_mut(slot.tool_index) {
+                                tool.apply_filament_type_defaults(&slot.filament_type);
+                            }
+                        }
+                        config.sync_gcode_from_active_tool();
+                        *dirty_backend = true;
+                        *dirty_gcode = true;
                     }
 
                     if ui
@@ -4840,14 +5006,15 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                     (
                         idx,
                         format!(
-                            "T{} — {} ({:.2}mm, {:.0}°C)",
-                            t.id, t.name, t.nozzle_diameter_mm, t.temperature_celsius
+                            "T{} — {} ({:.2}mm, {} {:.0}°C)",
+                            t.id, t.name, t.nozzle_diameter_mm, t.filament_type, t.temperature_celsius
                         ),
                     )
                 })
                 .collect();
 
             let mut remove_slot_idx: Option<usize> = None;
+            let mut apply_slot_type_to_tool: Option<(usize, String)> = None;
             let total_slots = config.filament_slots.len();
             for (s_idx, slot) in config.filament_slots.iter_mut().enumerate() {
                 slot.slot_index = s_idx as u32;
@@ -4891,13 +5058,46 @@ fn render_3mf_filament_slot_mapping_section_config_only(
 
                     ui.add(
                         egui::TextEdit::singleline(&mut slot.name)
-                            .desired_width(105.0)
+                            .desired_width(92.0)
                             .hint_text("Slot Name"),
                     )
                     .on_hover_text(format!(
                         "3MF Filament Type: {} | Colour: {}",
                         slot.filament_type, slot.color_hex
                     ));
+
+                    // Editable filament material type for this 3MF slot (also applies defaults to mapped tool)
+                    egui::ComboBox::from_id_source((id_salt, "slot_mat_type", s_idx))
+                        .selected_text(if slot.filament_type.trim().is_empty() {
+                            "PLA"
+                        } else {
+                            slot.filament_type.as_str()
+                        })
+                        .width(62.0)
+                        .show_ui(ui, |ui| {
+                            for mat in ["PLA", "PETG", "ABS", "ASA", "TPU", "PVA", "PA-CF"] {
+                                let is_cur = slot.filament_type.eq_ignore_ascii_case(mat);
+                                if ui.selectable_label(is_cur, mat).clicked() {
+                                    slot.filament_type = mat.to_string();
+                                    apply_slot_type_to_tool =
+                                        Some((slot.tool_index, mat.to_string()));
+                                }
+                            }
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.small("Custom:");
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut slot.filament_type)
+                                            .desired_width(60.0),
+                                    )
+                                    .changed()
+                                {
+                                    apply_slot_type_to_tool =
+                                        Some((slot.tool_index, slot.filament_type.clone()));
+                                }
+                            });
+                        });
 
                     ui.label("→");
 
@@ -4907,7 +5107,7 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                         .unwrap_or_else(|| format!("T{}", slot.tool_index));
                     egui::ComboBox::from_id_source((id_salt, "slot_tool_map", s_idx))
                         .selected_text(current_tool_text)
-                        .width(145.0)
+                        .width(135.0)
                         .show_ui(ui, |ui| {
                             for (t_idx, t_lbl) in &tool_labels {
                                 if ui
@@ -4931,6 +5131,15 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                 });
             }
 
+            if let Some((t_idx, mat_type)) = apply_slot_type_to_tool {
+                if let Some(tool) = config.tools.get_mut(t_idx) {
+                    tool.apply_filament_type_defaults(&mat_type);
+                }
+                config.sync_gcode_from_active_tool();
+                *dirty_backend = true;
+                *dirty_gcode = true;
+            }
+
             if let Some(rm_idx) = remove_slot_idx {
                 config.filament_slots.remove(rm_idx);
                 for (i, s) in config.filament_slots.iter_mut().enumerate() {
@@ -4951,10 +5160,56 @@ fn render_filament_config_tab(
     config: &mut SlicerConfig,
     vis_state: &mut FieldVisualizationState,
     calib_state: &mut CalibrationUiState,
+    preset_lib: &mut PresetLibrary,
     is_computing: bool,
 ) {
     let mut dirty_backend = false;
     let mut gc_changed = false;
+
+    if config.tools.len() > 1 {
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Editing Tool Filament:").strong());
+                    let current_active = config.active_tool_index;
+                    let mut clicked_idx = None;
+                    for (idx, tool) in config.tools.iter().enumerate() {
+                        let selected = current_active == idx;
+                        if render_delineated_pill_tab(
+                            ui,
+                            selected,
+                            format!(
+                                "T{} ({}, {:.0}°C)",
+                                tool.id, tool.filament_type, tool.temperature_celsius
+                            ),
+                        )
+                        .on_hover_text(format!(
+                            "Edit filament settings & preset for Tool T{} ({})",
+                            tool.id, tool.name
+                        ))
+                        .clicked()
+                        {
+                            clicked_idx = Some(idx);
+                        }
+                    }
+                    if let Some(idx) = clicked_idx {
+                        config.active_tool_index = idx;
+                        config.sync_gcode_from_active_tool();
+                        if preset_lib
+                            .filaments
+                            .iter()
+                            .any(|p| p.name == config.filament_preset_name)
+                        {
+                            preset_lib.selected_filament = config.filament_preset_name.clone();
+                        }
+                        dirty_backend = true;
+                        vis_state.dirty_planned_gcode = true;
+                    }
+                });
+            });
+        ui.add_space(4.0);
+    }
 
     egui::CollapsingHeader::new(
         egui::RichText::new("Material, Diameter & Temperatures").strong(),
@@ -4962,7 +5217,7 @@ fn render_filament_config_tab(
     .id_source("filament_material_temp_section")
     .default_open(true)
     .show(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Material:");
             gc_changed |= ui
                 .add(
@@ -4970,12 +5225,15 @@ fn render_filament_config_tab(
                         .desired_width(64.0),
                 )
                 .changed();
+            let mut apply_quick_mat: Option<&'static str> = None;
             for (preset_name, density, fan_pct) in [
                 ("PLA", 1.24f32, 100.0f32),
                 ("PETG", 1.27, 40.0),
                 ("ABS", 1.04, 15.0),
                 ("ASA", 1.07, 15.0),
                 ("TPU", 1.21, 50.0),
+                ("PVA", 1.23, 70.0),
+                ("PA-CF", 1.15, 20.0),
             ] {
                 if ui
                     .selectable_label(
@@ -4986,15 +5244,28 @@ fn render_filament_config_tab(
                         preset_name,
                     )
                     .on_hover_text(format!(
-                        "Set material to {preset_name} (density {density:.2} g/cm³, fan {fan_pct:.0}%)"
+                        "Set active tool material to {preset_name} (density {density:.2} g/cm³, fan {fan_pct:.0}%)"
                     ))
                     .clicked()
                 {
-                    config.gcode.filament_type = preset_name.to_string();
-                    config.gcode.filament_density_g_cm3 = density;
-                    config.gcode.fan_speed_percent = fan_pct;
-                    gc_changed = true;
+                    apply_quick_mat = Some(preset_name);
                 }
+            }
+            if let Some(mat_name) = apply_quick_mat {
+                let active_idx = config.active_tool_index;
+                if let Some(tool) = config.tools.get_mut(active_idx) {
+                    tool.apply_filament_type_defaults(mat_name);
+                }
+                config.sync_gcode_from_active_tool();
+                if preset_lib
+                    .filaments
+                    .iter()
+                    .any(|p| p.name == config.filament_preset_name)
+                {
+                    preset_lib.selected_filament = config.filament_preset_name.clone();
+                }
+                dirty_backend = true;
+                gc_changed = true;
             }
             param_help_button(ui, "gcode.filament_type");
         });
@@ -5417,6 +5688,7 @@ fn render_filament_config_tab(
     }
     if gc_changed {
         config.gcode.sanitize();
+        config.sync_active_tool_from_gcode();
         vis_state.dirty_planned_gcode = true;
     }
 }

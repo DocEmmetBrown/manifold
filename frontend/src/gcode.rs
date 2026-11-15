@@ -3140,33 +3140,63 @@ fn compute_layer_fan_pwm_schedule(
     layer_ord: usize,
     up_bed: Vec3,
     gcfg: &GcodeProcessConfig,
+    tools: &[crate::config::ToolConfig],
 ) -> Vec<u8> {
     let n = layer.segments.len();
     if n == 0 {
         return Vec::new();
     }
 
+    let use_per_tool_fan = tools.iter().any(|t| t.has_custom_filament_config());
+    let tool_cfg_for = |tool_id: u32| -> Option<&crate::config::ToolConfig> {
+        if use_per_tool_fan {
+            tools.iter().find(|t| t.id == tool_id)
+        } else {
+            None
+        }
+    };
+
     let is_initial_layer = (layer_ord as u32) < gcfg.disable_fan_first_layers;
+    let first_tool = layer
+        .segments
+        .first()
+        .and_then(|s| tool_cfg_for(s.tool_id));
     let base_fan_pct = if is_initial_layer {
         gcfg.first_layer_fan_speed_percent.clamp(0.0, 100.0)
     } else {
-        gcfg.fan_speed_percent.clamp(0.0, 100.0)
+        first_tool
+            .map(|t| t.fan_speed_percent)
+            .unwrap_or(gcfg.fan_speed_percent)
+            .clamp(0.0, 100.0)
     };
     let base_pwm = (base_fan_pct * 2.55).round().clamp(0.0, 255.0) as u8;
 
     // On initial bed-adhesion layers or when dynamic fan modulation is disabled, preserve
-    // standard static/feature-override fan behavior.
+    // standard static/feature-override fan behavior (per tool).
     if is_initial_layer || !gcfg.enable_dynamic_fan_speed {
         let mut sched = vec![base_pwm; n];
         let mut last_pwm = base_pwm;
         for (i, seg) in layer.segments.iter().enumerate() {
             if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
+                let seg_tool = tool_cfg_for(seg.tool_id);
+                let seg_base_fan = if is_initial_layer {
+                    gcfg.first_layer_fan_speed_percent.clamp(0.0, 100.0)
+                } else {
+                    seg_tool
+                        .map(|t| t.fan_speed_percent)
+                        .unwrap_or(gcfg.fan_speed_percent)
+                        .clamp(0.0, 100.0)
+                };
                 let pct = match seg.kind {
-                    PlannedMoveKind::Bridge => gcfg.bridge_fan_speed_percent.clamp(0.0, 100.0),
-                    PlannedMoveKind::WaveOverhang => {
-                        gcfg.wave_overhang_fan_speed_percent.clamp(0.0, 100.0)
-                    }
-                    _ => base_fan_pct,
+                    PlannedMoveKind::Bridge => seg_tool
+                        .map(|t| t.bridge_fan_speed_percent)
+                        .unwrap_or(gcfg.bridge_fan_speed_percent)
+                        .clamp(0.0, 100.0),
+                    PlannedMoveKind::WaveOverhang => seg_tool
+                        .map(|t| t.wave_overhang_fan_speed_percent)
+                        .unwrap_or(gcfg.wave_overhang_fan_speed_percent)
+                        .clamp(0.0, 100.0),
+                    _ => seg_base_fan,
                 };
                 last_pwm = (pct * 2.55).round().clamp(0.0, 255.0) as u8;
             }
@@ -3175,8 +3205,8 @@ fn compute_layer_fan_pwm_schedule(
         return sched;
     }
 
-    let min_pct = gcfg.min_fan_speed_percent.clamp(0.0, 100.0);
-    let max_pct = gcfg.max_fan_speed_percent.clamp(min_pct, 100.0);
+    let default_min_pct = gcfg.min_fan_speed_percent.clamp(0.0, 100.0);
+    let default_max_pct = gcfg.max_fan_speed_percent.clamp(default_min_pct, 100.0);
     let q_ref = (0.65 * gcfg.max_volumetric_flow_mm3s).max(4.0);
 
     // Total layer time for layer-return thermal boost
@@ -3200,9 +3230,19 @@ fn compute_layer_fan_pwm_schedule(
     let filament_area_mm2 =
         std::f32::consts::FRAC_PI_4 * gcfg.filament_diameter_mm * gcfg.filament_diameter_mm;
 
-    let mut raw_pct = vec![min_pct; n];
+    let mut raw_pct = vec![default_min_pct; n];
     for i in 0..n {
         let seg = &layer.segments[i];
+        let seg_tool = tool_cfg_for(seg.tool_id);
+        let min_pct = seg_tool
+            .map(|t| t.min_fan_speed_percent)
+            .unwrap_or(default_min_pct)
+            .clamp(0.0, 100.0);
+        let max_pct = seg_tool
+            .map(|t| t.max_fan_speed_percent)
+            .unwrap_or(default_max_pct)
+            .clamp(min_pct, 100.0);
+
         if !seg.kind.is_extruding() || seg.delta_e_mm <= 1.0e-6 {
             raw_pct[i] = if i > 0 { raw_pct[i - 1] } else { min_pct };
             continue;
@@ -3210,11 +3250,17 @@ fn compute_layer_fan_pwm_schedule(
 
         // Dedicated feature overrides for free-air Bridges and Wave Overhangs
         if seg.kind == PlannedMoveKind::Bridge {
-            raw_pct[i] = gcfg.bridge_fan_speed_percent.clamp(min_pct, 100.0);
+            let br_pct = seg_tool
+                .map(|t| t.bridge_fan_speed_percent)
+                .unwrap_or(gcfg.bridge_fan_speed_percent);
+            raw_pct[i] = br_pct.clamp(min_pct, 100.0);
             continue;
         }
         if seg.kind == PlannedMoveKind::WaveOverhang {
-            raw_pct[i] = gcfg.wave_overhang_fan_speed_percent.clamp(min_pct, 100.0);
+            let wv_pct = seg_tool
+                .map(|t| t.wave_overhang_fan_speed_percent)
+                .unwrap_or(gcfg.wave_overhang_fan_speed_percent);
+            raw_pct[i] = wv_pct.clamp(min_pct, 100.0);
             continue;
         }
 
@@ -3332,12 +3378,16 @@ fn compute_layer_fan_pwm_schedule(
         } else {
             lead_pct[i]
         };
-        let target_pwm = (smoothed_pct * 2.55).round().clamp(0.0, 255.0) as u8;
-        // Preserve exact PWM for explicit Bridge/WaveOverhang features; otherwise use 7-unit (~2.7%) deadband
+        // Preserve exact PWM for explicit Bridge/WaveOverhang features; otherwise use smoothed PWM with 7-unit (~2.7%) deadband
         let is_special = matches!(
             layer.segments[i].kind,
             PlannedMoveKind::Bridge | PlannedMoveKind::WaveOverhang
         );
+        let target_pwm = if is_special {
+            (raw_pct[i] * 2.55).round().clamp(0.0, 255.0) as u8
+        } else {
+            (smoothed_pct * 2.55).round().clamp(0.0, 255.0) as u8
+        };
         if is_special || target_pwm.abs_diff(active_pwm) >= 7 {
             active_pwm = target_pwm;
         }
@@ -3435,8 +3485,26 @@ pub fn plan_and_emit_gcode_for_object(
 
     let filament_area_mm2 =
         std::f32::consts::FRAC_PI_4 * gcfg.filament_diameter_mm * gcfg.filament_diameter_mm;
-    let fluid = FluidDynamicsModel::from_config(&gcfg, nozzle_temp_c);
-    let support_fluid = FluidDynamicsModel::from_config(&gcfg, support_nozzle_temp_c);
+    let use_per_tool_filament = config.tools.iter().any(|t| t.has_custom_filament_config());
+    let tool_gcfg_for = |t_opt: Option<&crate::config::ToolConfig>| -> GcodeProcessConfig {
+        if use_per_tool_filament {
+            t_opt
+                .map(|t| t.effective_gcode_config(&gcfg))
+                .unwrap_or_else(|| gcfg.clone())
+        } else {
+            gcfg.clone()
+        }
+    };
+    let active_tool_gcfg = tool_gcfg_for(active_tool);
+    let support_tool_gcfg = if use_per_tool_filament {
+        support_tool
+            .map(|t| t.effective_gcode_config(&gcfg))
+            .unwrap_or_else(|| active_tool_gcfg.clone())
+    } else {
+        gcfg.clone()
+    };
+    let fluid = FluidDynamicsModel::from_config(&active_tool_gcfg, nozzle_temp_c);
+    let support_fluid = FluidDynamicsModel::from_config(&support_tool_gcfg, support_nozzle_temp_c);
     let min_retract_travel_mm = gcfg.effective_min_travel_for_retract();
 
     let mut planned_layers: Vec<PlannedLayerGcode> = Vec::with_capacity(raw_toolpaths.layers.len());
@@ -3516,7 +3584,8 @@ pub fn plan_and_emit_gcode_for_object(
                     }
                 })
                 .unwrap_or(max_tool_tilt_deg);
-            let slot_fluid = FluidDynamicsModel::from_config(&gcfg, slot_nozzle_temp_c);
+            let slot_tool_gcfg = tool_gcfg_for(slot_tool);
+            let slot_fluid = FluidDynamicsModel::from_config(&slot_tool_gcfg, slot_nozzle_temp_c);
             let chain_nozzle_diam = if base_kind.is_support() {
                 support_nozzle_diam_mm
             } else {
@@ -3607,12 +3676,18 @@ pub fn plan_and_emit_gcode_for_object(
                     .map(|t| t.nozzle_diameter_mm.max(0.1))
                     .unwrap_or(nozzle_diam_mm)
             };
+            let slot_tool_gcfg = tool_gcfg_for(slot_tool);
             let slot_fluid = FluidDynamicsModel::from_config(
-                &gcfg,
+                &slot_tool_gcfg,
                 slot_tool
                     .map(|t| t.temperature_celsius)
                     .unwrap_or(nozzle_temp_c),
             );
+            let chain_gcfg = if chain_is_support {
+                &support_tool_gcfg
+            } else {
+                &slot_tool_gcfg
+            };
             let chain_fluid = if chain_is_support {
                 &support_fluid
             } else {
@@ -4380,7 +4455,7 @@ pub fn plan_and_emit_gcode_for_object(
                     };
 
                     let composite_mult = rate_mult
-                        * gcfg.extrusion_multiplier
+                        * chain_gcfg.extrusion_multiplier
                         * m_feature
                         * m_first
                         * c_slope
@@ -4419,8 +4494,8 @@ pub fn plan_and_emit_gcode_for_object(
                         extrusion_multiplier: composite_mult,
                         pressure_advance_s: chain_fluid.pressure_advance_s(
                             q_est,
-                            gcfg.enable_dynamic_pa,
-                            gcfg.pa_low_flow_s,
+                            chain_gcfg.enable_dynamic_pa,
+                            chain_gcfg.pa_low_flow_s,
                         ),
                         melt_pressure_mm3s: q_est,
                         retract_before_mm: 0.0,
@@ -4694,15 +4769,32 @@ pub fn plan_and_emit_gcode_for_object(
     // 6. Global Melt-Zone Transient Pressure Pass & Slicer-Side PA Subdivision
     let mut pressure_tracker = MeltPressureTracker::new();
     let mut last_q_mm3s = 0.0f32;
-    let mut last_pa_s = gcfg.pa_low_flow_s;
+    let mut last_pa_s = active_tool_gcfg.pa_low_flow_s;
 
     for layer in &mut planned_layers {
         for seg in &mut layer.segments {
-            let seg_fluid = if seg.kind.is_support() {
-                &support_fluid
+            let seg_tool = config.tools.iter().find(|t| t.id == seg.tool_id);
+            let seg_gcfg = if use_per_tool_filament {
+                seg_tool
+                    .map(|t| t.effective_gcode_config(&gcfg))
+                    .unwrap_or_else(|| {
+                        if seg.kind.is_support() {
+                            support_tool_gcfg.clone()
+                        } else {
+                            active_tool_gcfg.clone()
+                        }
+                    })
             } else {
-                &fluid
+                gcfg.clone()
             };
+            let seg_temp_c = seg_tool.map(|t| t.temperature_celsius).unwrap_or(
+                if seg.kind.is_support() {
+                    support_nozzle_temp_c
+                } else {
+                    nozzle_temp_c
+                },
+            );
+            let seg_fluid = FluidDynamicsModel::from_config(&seg_gcfg, seg_temp_c);
             if seg.retract_before_mm > 0.0 {
                 seg.retract_before_mm = seg_fluid.adaptive_retract_length_mm(
                     last_q_mm3s,
@@ -4715,15 +4807,15 @@ pub fn plan_and_emit_gcode_for_object(
                 let q_nom = (seg.delta_e_mm * filament_area_mm2) / seg.duration_s.max(1.0e-4);
                 let pa_s = seg_fluid.pressure_advance_s(
                     q_nom,
-                    gcfg.enable_dynamic_pa,
-                    gcfg.pa_low_flow_s,
+                    seg_gcfg.enable_dynamic_pa,
+                    seg_gcfg.pa_low_flow_s,
                 );
                 let (m_trans, p_avg) = pressure_tracker.step_extrusion(
                     q_nom,
                     seg.duration_s,
                     pa_s,
                     seg.extrusion_multiplier,
-                    &gcfg,
+                    &seg_gcfg,
                 );
                 seg.delta_e_mm *= m_trans;
                 seg.extrusion_multiplier *= m_trans;
@@ -4731,8 +4823,8 @@ pub fn plan_and_emit_gcode_for_object(
                     (seg.delta_e_mm * filament_area_mm2) / seg.duration_s.max(1.0e-4);
                 seg.pressure_advance_s = seg_fluid.pressure_advance_s(
                     seg.volumetric_flow_mm3s,
-                    gcfg.enable_dynamic_pa,
-                    gcfg.pa_low_flow_s,
+                    seg_gcfg.enable_dynamic_pa,
+                    seg_gcfg.pa_low_flow_s,
                 );
                 seg.melt_pressure_mm3s = p_avg;
                 last_q_mm3s = seg.volumetric_flow_mm3s;
@@ -4740,7 +4832,7 @@ pub fn plan_and_emit_gcode_for_object(
             } else {
                 let p_avg = pressure_tracker.step_travel(
                     seg.duration_s,
-                    gcfg.transient_pressure_tau_s.max(last_pa_s),
+                    seg_gcfg.transient_pressure_tau_s.max(last_pa_s),
                 );
                 seg.melt_pressure_mm3s = p_avg;
                 seg.pressure_advance_s = last_pa_s;
@@ -4781,6 +4873,7 @@ pub fn plan_and_emit_gcode_for_object(
 
     let mut total_time_s_f64 = 0.0f64;
     let mut total_filament_mm_f64 = 0.0f64;
+    let mut total_filament_grams_f64 = 0.0f64;
     let mut extruding_move_count = 0usize;
     let mut travel_move_count = 0usize;
     let mut retract_count = 0usize;
@@ -4875,7 +4968,7 @@ pub fn plan_and_emit_gcode_for_object(
             }
         }
     }
-    let init_pa_s = gcfg.pa_low_flow_s.max(0.0);
+    let init_pa_s = active_tool_gcfg.pa_low_flow_s.max(0.0);
     gcode.push_str(&format!(
         "{} ; Initial Pressure Advance\n",
         format_pressure_advance_cmd(gcfg.gcode_dialect, tool_id, init_pa_s)
@@ -4935,7 +5028,7 @@ pub fn plan_and_emit_gcode_for_object(
 
         // Compute per-segment part cooling fan PWM schedule (`0..=255`) for this layer
         let fan_pwm_schedule =
-            compute_layer_fan_pwm_schedule(layer, layer_ord, up_bed, &gcfg);
+            compute_layer_fan_pwm_schedule(layer, layer_ord, up_bed, &gcfg, &config.tools);
         if let Some(&first_pwm) = fan_pwm_schedule.first() {
             if emitted_fan_pwm != Some(first_pwm) {
                 if first_pwm == 0 {
@@ -5048,13 +5141,33 @@ pub fn plan_and_emit_gcode_for_object(
                     in_g93_mode = false;
                 }
                 // Unretract before resuming extrusion (with thermal ooze / swell relaxation)
-                let seg_fluid = if seg.kind.is_support() {
-                    &support_fluid
+                let seg_tool = config.tools.iter().find(|t| t.id == seg.tool_id);
+                let seg_gcfg = if use_per_tool_filament {
+                    seg_tool
+                        .map(|t| t.effective_gcode_config(&gcfg))
+                        .unwrap_or_else(|| {
+                            if seg.kind.is_support() {
+                                support_tool_gcfg.clone()
+                            } else {
+                                active_tool_gcfg.clone()
+                            }
+                        })
                 } else {
-                    &fluid
+                    gcfg.clone()
                 };
-                let u_len =
-                    seg_fluid.unretract_length_mm(active_retract_mm, accum_travel_time_s, &gcfg);
+                let seg_temp_c = seg_tool.map(|t| t.temperature_celsius).unwrap_or(
+                    if seg.kind.is_support() {
+                        support_nozzle_temp_c
+                    } else {
+                        nozzle_temp_c
+                    },
+                );
+                let seg_fluid = FluidDynamicsModel::from_config(&seg_gcfg, seg_temp_c);
+                let u_len = seg_fluid.unretract_length_mm(
+                    active_retract_mm,
+                    accum_travel_time_s,
+                    &seg_gcfg,
+                );
                 let u_feed = (gcfg.retract_speed_mms * 60.0).max(60.0);
                 gcode.push_str(&format!("G1 E{u_len:.6} F{u_feed:.1} ; Unretract\n"));
                 active_retract_mm = 0.0;
@@ -5084,6 +5197,19 @@ pub fn plan_and_emit_gcode_for_object(
             if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
                 extruding_move_count += 1;
                 total_filament_mm_f64 += seg.delta_e_mm as f64;
+                let seg_density_g_cm3 = if use_per_tool_filament {
+                    config
+                        .tools
+                        .iter()
+                        .find(|t| t.id == seg.tool_id)
+                        .map(|t| t.filament_density_g_cm3)
+                        .unwrap_or(active_tool_gcfg.filament_density_g_cm3)
+                } else {
+                    gcfg.filament_density_g_cm3
+                };
+                let seg_vol_mm3 = (seg.delta_e_mm * filament_area_mm2) as f64;
+                total_filament_grams_f64 +=
+                    seg_vol_mm3 * ((seg_density_g_cm3 * 0.001).max(0.0001) as f64);
 
                 min_speed = min_speed.min(seg.cruise_speed_mms);
                 max_speed = max_speed.max(seg.cruise_speed_mms);
@@ -5334,8 +5460,39 @@ pub fn plan_and_emit_gcode_for_object(
     let total_time_s = total_time_s_f64 as f32;
     let total_filament_mm = total_filament_mm_f64 as f32;
     let total_filament_volume_mm3 = total_filament_mm * filament_area_mm2;
-    let density_g_mm3 = (gcfg.filament_density_g_cm3 * 0.001).max(0.0001);
-    let total_filament_grams = total_filament_volume_mm3 * density_g_mm3;
+    let total_filament_grams = if total_filament_grams_f64 > 0.0 {
+        total_filament_grams_f64 as f32
+    } else {
+        let density_g_mm3 = (active_tool_gcfg.filament_density_g_cm3 * 0.001).max(0.0001);
+        total_filament_volume_mm3 * density_g_mm3
+    };
+    let footer_filament_type = {
+        let mut used_types: Vec<String> = Vec::new();
+        for l in &planned_layers {
+            for s in &l.segments {
+                if s.kind.is_extruding() && s.delta_e_mm > 1.0e-6 {
+                    let ft = config
+                        .tools
+                        .iter()
+                        .find(|t| t.id == s.tool_id)
+                        .map(|t| t.filament_type.trim().to_string())
+                        .filter(|ft| !ft.is_empty())
+                        .unwrap_or_else(|| active_tool_gcfg.filament_type.clone());
+                    if !used_types
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(&ft))
+                    {
+                        used_types.push(ft);
+                    }
+                }
+            }
+        }
+        if used_types.is_empty() {
+            active_tool_gcfg.filament_type.clone()
+        } else {
+            used_types.join(";")
+        }
+    };
 
     gcode.push_str(&format_moonraker_metadata_footer(
         total_time_s,
@@ -5348,7 +5505,7 @@ pub fn plan_and_emit_gcode_for_object(
         planned_layers.len(),
         nozzle_diam_mm,
         gcfg.filament_diameter_mm,
-        &gcfg.filament_type,
+        &footer_filament_type,
         gcfg.bed_temperature_celsius,
         nozzle_temp_c,
     ));
@@ -6765,5 +6922,110 @@ mod tests {
                 post_g0s[0].2
             );
         }
+    }
+
+    #[test]
+    fn test_per_tool_filament_types_temperatures_fan_and_pa() {
+        let mut cfg = SlicerConfig::default();
+        cfg.gcode.gcode_origin_at_bed_center = true;
+        cfg.gcode.enable_dynamic_fan_speed = false;
+        cfg.gcode.disable_fan_first_layers = 0;
+
+        let mut t0 = crate::config::ToolConfig::standard_tool(0, "T0 - PLA", 0.40, 215.0);
+        t0.apply_filament_type_defaults("PLA");
+        let mut t1 = crate::config::ToolConfig::standard_tool(1, "T1 - ABS", 0.40, 255.0);
+        t1.apply_filament_type_defaults("ABS");
+
+        cfg.tools = vec![t0, t1];
+        cfg.active_tool_index = 0;
+        cfg.sync_gcode_from_active_tool();
+
+        let mut s0 = crate::config::ThreeMfFilamentSlot::default_for_slot(0, 0);
+        s0.filament_type = "PLA".to_string();
+        let mut s1 = crate::config::ThreeMfFilamentSlot::default_for_slot(1, 1);
+        s1.filament_type = "ABS".to_string();
+        cfg.filament_slots = vec![s0, s1];
+
+        let raw = crate::bridge::ffi::ObjectToolpathsResult {
+            valid: true,
+            total_path_count: 2,
+            outer_wall_count: 2,
+            inner_wall_count: 0,
+            solid_infill_count: 0,
+            sparse_infill_count: 0,
+            bridge_count: 0,
+            wave_overhang_count: 0,
+            support_count: 0,
+            support_interface_count: 0,
+            layers: vec![LayerToolpaths {
+                layer_index: 1,
+                branch_id: 0,
+                isovalue: 1.0,
+                paths: vec![
+                    ExtrusionPath {
+                        feature_kind: 0,
+                        wall_index: 0,
+                        is_closed: false,
+                        filament_slot: 0,
+                        total_length_mm: 10.0,
+                        mean_width_mm: 0.42,
+                        points: vec![
+                            make_pt(0.0, 0.0, 1.0, 0.42, 0.20),
+                            make_pt(10.0, 0.0, 1.0, 0.42, 0.20),
+                        ],
+                    },
+                    ExtrusionPath {
+                        feature_kind: 0,
+                        wall_index: 0,
+                        is_closed: false,
+                        filament_slot: 1,
+                        total_length_mm: 10.0,
+                        mean_width_mm: 0.42,
+                        points: vec![
+                            make_pt(0.0, 5.0, 1.0, 0.42, 0.20),
+                            make_pt(10.0, 5.0, 1.0, 0.42, 0.20),
+                        ],
+                    },
+                ],
+            }],
+        };
+
+        let res = plan_and_emit_gcode_for_object(
+            "MultiMaterial_PLA_ABS",
+            1,
+            &raw,
+            Transform::IDENTITY,
+            &cfg,
+        );
+
+        // 1. Auxiliary tool T1 (ABS at 255°C) must be preheated and switched to with 255°C
+        assert!(
+            res.gcode_text.contains("M104 S255 T1 ; Preheat tool T1"),
+            "Expected T1 preheat at 255°C (ABS), got:\n{}",
+            res.gcode_text
+        );
+        assert!(
+            res.gcode_text.contains("M104 S255 T1\nT1 ; Switch tool"),
+            "Expected T1 switch at 255°C (ABS), got:\n{}",
+            res.gcode_text
+        );
+
+        // 2. Cooling fan must switch from PLA (100% = M106 S255) on T0 to ABS (20% = M106 S51) on T1
+        assert!(
+            res.gcode_text.contains("M106 S255"),
+            "Expected PLA 100% fan (M106 S255) for T0"
+        );
+        assert!(
+            res.gcode_text.contains("M106 S51"),
+            "Expected ABS 20% fan (M106 S51) for T1, got:\n{}",
+            res.gcode_text
+        );
+
+        // 3. Moonraker metadata footer must record both filament types ("PLA;ABS")
+        assert!(
+            res.gcode_text.contains("; filament_type = PLA;ABS"),
+            "Expected Moonraker footer '; filament_type = PLA;ABS', got:\n{}",
+            res.gcode_text
+        );
     }
 }

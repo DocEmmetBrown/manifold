@@ -593,12 +593,29 @@ impl FilamentPreset {
         }
     }
 
+    pub fn apply_to_tool(&self, tool: &mut ToolConfig) {
+        tool.filament_preset_name = self.name.clone();
+        tool.filament_type = self.filament_type.clone();
+        tool.temperature_celsius = self.nozzle_temperature_celsius;
+        tool.filament_density_g_cm3 = self.filament_density_g_cm3;
+        tool.extrusion_multiplier = self.extrusion_multiplier;
+        tool.fan_speed_percent = self.fan_speed_percent;
+        tool.min_fan_speed_percent = self.min_fan_speed_percent;
+        tool.max_fan_speed_percent = self.max_fan_speed_percent;
+        tool.bridge_fan_speed_percent = self.bridge_fan_speed_percent;
+        tool.wave_overhang_fan_speed_percent = self.wave_overhang_fan_speed_percent;
+        tool.pa_low_flow_s = self.pa_low_flow_s;
+        tool.pa_high_flow_s = self.pa_high_flow_s;
+        tool.swell_low = self.swell_low;
+        tool.swell_high = self.swell_high;
+    }
+
     pub fn apply_to_config(&self, cfg: &mut SlicerConfig) {
         cfg.filament_preset_name = self.name.clone();
         if let Some(tool) = cfg.tools.get_mut(cfg.active_tool_index) {
-            tool.temperature_celsius = self.nozzle_temperature_celsius;
+            self.apply_to_tool(tool);
         } else if let Some(tool) = cfg.tools.first_mut() {
-            tool.temperature_celsius = self.nozzle_temperature_celsius;
+            self.apply_to_tool(tool);
         }
         cfg.gcode.filament_type = self.filament_type.clone();
         cfg.gcode.filament_diameter_mm = self.filament_diameter_mm;
