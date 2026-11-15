@@ -4,7 +4,7 @@ pub mod threemf;
 use std::path::{Path, PathBuf};
 use bevy::prelude::*;
 use crate::bridge::ffi::{self, DecomposedPartInfo, RenderVertex};
-use crate::config::SlicerConfig;
+use crate::config::{SlicerConfig, ThreeMfFilamentSlot};
 use crate::hull::{
     build_surface_patches, SimplifiedConvexHull, SurfacePatch, MAX_SIMPLIFIED_HULL_FACES,
 };
@@ -33,6 +33,10 @@ pub struct LoadedObjectData {
     pub hull: SimplifiedConvexHull,
     pub surface_patches: Vec<SurfacePatch>,
     pub triangle_to_patch: Vec<u32>,
+    /// Per-triangle 0-based 3MF filament/colour slot indices (`0..255`), or empty for single-colour objects.
+    pub triangle_filament_slots: Vec<u8>,
+    /// Per-vertex 0-based 3MF filament/colour slot indices (`0..255`), or empty for single-colour objects.
+    pub vertex_filament_slots: Vec<u8>,
 }
 
 /// Summary of an asynchronous multi-file import operation.
@@ -41,6 +45,8 @@ pub struct LoadedBatchReport {
     pub objects: Vec<LoadedObjectData>,
     /// Multi-plate definitions parsed from the imported `.3mf` archive (if present).
     pub plates: Vec<LoadedPlateInfo>,
+    /// Multi-colour / filament slot definitions parsed from the imported `.3mf` archive (if present).
+    pub filament_slots: Vec<ThreeMfFilamentSlot>,
     pub restored_config: Option<SlicerConfig>,
     /// File name (e.g. `"cowling_project.3mf"`) when a loaded `.3mf` archive is a Manifold project.
     pub manifold_project_filename: Option<String>,
@@ -188,6 +194,8 @@ pub fn build_loaded_object_from_part(
         hull,
         surface_patches,
         triangle_to_patch,
+        triangle_filament_slots: Vec::new(),
+        vertex_filament_slots: Vec::new(),
     })
 }
 

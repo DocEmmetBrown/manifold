@@ -308,6 +308,8 @@ pub mod ffi {
     pub struct ExtrusionPath {
         /// `0 = OuterWall`, `1 = InnerWall`, `2 = SolidInfill`, `3 = GapFill`, `4 = SparseInfill`, `5 = Bridge`, `6 = WaveOverhang`, `7 = Support`, `8 = SupportInterface`
         pub feature_kind: u8,
+        /// Zero-based 3MF colour / filament slot index (`0` = Slot 1 / default).
+        pub filament_slot: u8,
         /// `0` for outer wall, `1..=inner_wall_count` for inner walls, inside-out pass index for wave overhangs, pass index for infill/gap fill/bridges/supports.
         pub wall_index: u32,
         pub is_closed: bool,
@@ -374,6 +376,13 @@ pub mod ffi {
         /// Retrieves the per-triangle STEP B-Rep `TopoDS_Face` index for `object_id`
         /// (empty for pure triangle meshes).
         pub fn get_object_triangle_face_ids(object_id: u64) -> Vec<u32>;
+
+        /// Assigns per-triangle 0-based 3MF filament/colour slot indices (`0..255`) for `object_id`.
+        pub fn set_object_triangle_filament_slots(object_id: u64, triangle_slots: &[u8]);
+
+        /// Retrieves the per-triangle 0-based 3MF filament/colour slot indices for `object_id`
+        /// (empty for single-filament objects).
+        pub fn get_object_triangle_filament_slots(object_id: u64) -> Vec<u8>;
 
         /// Retrieves the solved 3D unit tool axis (`[ax, ay, az]` per vertex in local object
         /// coordinates, length `3 * vertex_count`) sampled on the object's surface mesh from

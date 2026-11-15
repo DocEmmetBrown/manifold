@@ -41,6 +41,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     const openvdb::FloatGrid* coarseOverhangGrid = nullptr,
     const std::array<float, 3>& defaultGravityDirectionBed = {0.0f, 0.0f, -1.0f},
     const ToolSpec* activeTool = nullptr,
-    float objectMinAxialBed = 0.0f);
+    float objectMinAxialBed = 0.0f,
+    const openvdb::FloatGrid* filamentSlotGrid = nullptr,
+    const openvdb::FloatGrid* coarseFilamentSlotGrid = nullptr);
 
 } // namespace manifold

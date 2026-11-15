@@ -801,6 +801,41 @@ fn render_toolpath_color_legend(
         return;
     }
 
+    if vis_state.toolpath_color_mode == ToolpathColorMode::ByToolOrFilament {
+        let mut owned_items: Vec<(String, [f32; 4])> = Vec::new();
+        if !config.filament_slots.is_empty() {
+            for slot in &config.filament_slots {
+                let tool_id = config.tool_id_for_filament_slot(slot.slot_index as u8);
+                let label = format!(
+                    "Slot {} ({}, {}) → T{}",
+                    slot.slot_index as usize + 1,
+                    slot.name,
+                    slot.color_hex,
+                    tool_id
+                );
+                owned_items.push((label, slot.color_srgba));
+            }
+        } else {
+            for (idx, tool) in config.tools.iter().enumerate() {
+                let (_, srgba) = crate::config::DEFAULT_FILAMENT_SLOT_PALETTE
+                    [idx % crate::config::DEFAULT_FILAMENT_SLOT_PALETTE.len()];
+                owned_items.push((
+                    format!("Slot {} → T{} ({})", idx + 1, tool.id, tool.name),
+                    srgba,
+                ));
+            }
+        }
+        owned_items.push(("Support".to_string(), [0.22, 0.88, 0.62, 1.0]));
+        owned_items.push(("Travel".to_string(), [0.28, 0.86, 0.98, 1.0]));
+        owned_items.push(("Z-Hop".to_string(), [0.98, 0.92, 0.22, 1.0]));
+        let borrowed: Vec<(&str, [f32; 4])> = owned_items
+            .iter()
+            .map(|(s, c)| (s.as_str(), *c))
+            .collect();
+        draw_categorical_swatch_legend(ui, "Tool / Filament Colour Legend", &borrowed);
+        return;
+    }
+
     if vis_state.toolpath_color_mode == ToolpathColorMode::BySurfaceNormalUsage {
         draw_categorical_swatch_legend(
             ui,
@@ -883,7 +918,9 @@ fn render_toolpath_color_legend(
                 "°",
                 1,
             ),
-            ToolpathColorMode::ByFeatureType | ToolpathColorMode::BySurfaceNormalUsage => {
+            ToolpathColorMode::ByFeatureType
+            | ToolpathColorMode::ByToolOrFilament
+            | ToolpathColorMode::BySurfaceNormalUsage => {
                 unreachable!()
             }
         };
@@ -2238,6 +2275,23 @@ pub fn ui_workspace_system(
                         if let Some(id) = remove_id {
                             remove_object_from_plate(&mut commands, &mut plate, id);
                         }
+                    }
+
+                    let plate_has_multicolor_obj = plate
+                        .objects
+                        .iter()
+                        .any(|o| !o.triangle_filament_slots.is_empty());
+                    if !config.filament_slots.is_empty() || plate_has_multicolor_obj {
+                        ui.add_space(6.0);
+                        render_3mf_filament_slot_mapping_section(
+                            ui,
+                            &mut config,
+                            &mut vis_state,
+                            &mut plate,
+                            &mut meshes,
+                            is_computing,
+                            "project_setup_filament_slot_mapping",
+                        );
                     }
 
                     // --- Selected Object Transform & Convex Hull Face Placement ---
@@ -4203,6 +4257,16 @@ fn render_tool_config_tab(
     });
 
     ui.add_space(4.0);
+    render_3mf_filament_slot_mapping_section_config_only(
+        ui,
+        config,
+        vis_state,
+        &mut dirty_backend,
+        &mut dirty_gcode,
+        "tool_tab_filament_slot_mapping",
+    );
+
+    ui.add_space(4.0);
     egui::CollapsingHeader::new(
         egui::RichText::new("Extruder Retraction, Wipe & Z-Hop").strong(),
     )
@@ -4275,6 +4339,40 @@ fn render_tool_config_tab(
                 )
                 .changed();
             param_help_button(ui, "gcode.pre_retract_taper_mm");
+        });
+        ui.horizontal(|ui| {
+            dirty_gcode |= ui
+                .add(
+                    egui::DragValue::new(&mut gc.tool_change_time_s)
+                        .speed(0.5)
+                        .range(0.0..=600.0)
+                        .prefix("Toolchange Time: ")
+                        .suffix(" s"),
+                )
+                .on_hover_text(
+                    "Estimated duration of each physical toolchange or MMU filament swap (T{id}) added to print time estimates",
+                )
+                .changed();
+            param_help_button(ui, "gcode.tool_change_time_s");
+        });
+        ui.horizontal(|ui| {
+            dirty_gcode |= ui
+                .checkbox(&mut gc.tool_change_hop_before, "Hop Before Toolchange")
+                .on_hover_text(
+                    "Hop above the highest so-far printed material before emitting T{id}",
+                )
+                .changed();
+            param_help_button(ui, "gcode.tool_change_hop_before");
+            dirty_gcode |= ui
+                .checkbox(
+                    &mut gc.tool_change_approach_after,
+                    "Approach After Toolchange",
+                )
+                .on_hover_text(
+                    "After T{id}, move to an approach position above the next chain start (same height as a hop) before descending",
+                )
+                .changed();
+            param_help_button(ui, "gcode.tool_change_approach_after");
         });
     });
 
@@ -4531,6 +4629,318 @@ fn render_tool_config_tab(
         config.gcode.sanitize();
         vis_state.dirty_planned_gcode = true;
     }
+}
+
+/// Renders the 3MF Colour / Filament Slot -> Machine Tool mapping card in the Project Setup tab,
+/// updating both `SlicerConfig` and any unselected multi-colour `SceneObject` meshes when colours change.
+fn render_3mf_filament_slot_mapping_section(
+    ui: &mut egui::Ui,
+    config: &mut SlicerConfig,
+    vis_state: &mut FieldVisualizationState,
+    plate: &mut BuildPlateState,
+    meshes: &mut Assets<Mesh>,
+    is_computing: bool,
+    id_salt: &str,
+) {
+    let mut dirty_backend = false;
+    let mut dirty_gcode = false;
+    let prev_surface_dirty = vis_state.dirty_surface_colors;
+
+    render_3mf_filament_slot_mapping_section_config_only(
+        ui,
+        config,
+        vis_state,
+        &mut dirty_backend,
+        &mut dirty_gcode,
+        id_salt,
+    );
+
+    if vis_state.dirty_surface_colors && !prev_surface_dirty {
+        for obj in &plate.objects {
+            if !obj.vertex_filament_slots.is_empty() {
+                if let Some(mesh) = meshes.get_mut(&obj.mesh_handle) {
+                    mesh.insert_attribute(
+                        Mesh::ATTRIBUTE_COLOR,
+                        crate::field_vis::default_cad_vertex_colors(
+                            obj.vertices.len(),
+                            &obj.vertex_filament_slots,
+                            config,
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    if dirty_backend && !is_computing {
+        sync_config_to_backend(config);
+    }
+    if dirty_gcode {
+        vis_state.dirty_planned_gcode = true;
+        vis_state.dirty_toolpaths_mesh = true;
+    }
+}
+
+/// Renders the collapsible **"3MF Colour / Filament → Tool Mapping"** UI section allowing the user
+/// to map each 3MF colour/filament slot (`ThreeMfFilamentSlot`) to any tool in `config.tools`,
+/// edit its display colour swatch, or auto-create/assign 1:1 tools.
+fn render_3mf_filament_slot_mapping_section_config_only(
+    ui: &mut egui::Ui,
+    config: &mut SlicerConfig,
+    vis_state: &mut FieldVisualizationState,
+    dirty_backend: &mut bool,
+    dirty_gcode: &mut bool,
+    id_salt: &str,
+) {
+    let slot_count = config.filament_slots.len();
+    let header_title = if slot_count > 0 {
+        format!("3MF Colour / Filament → Tool Mapping ({slot_count} Slots)")
+    } else {
+        "3MF Colour / Filament → Tool Mapping".to_string()
+    };
+
+    egui::CollapsingHeader::new(egui::RichText::new(header_title).strong())
+        .id_source(id_salt)
+        .default_open(slot_count > 0)
+        .show(ui, |ui| {
+            ui.small(
+                "Map each colour/filament slot from a multi-colour 3MF (e.g. PrusaSlicer / Bambu / OrcaSlicer MMU painting or multi-part extruders) to a machine extrusion tool (T0, T1, ...).",
+            );
+
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .small_button("+ Add Filament Slot")
+                    .on_hover_text("Add a filament / colour slot manually")
+                    .clicked()
+                {
+                    let next_idx = config.filament_slots.len().min(254) as u32;
+                    let (hex, srgba) = crate::config::DEFAULT_FILAMENT_SLOT_PALETTE
+                        [(next_idx as usize) % crate::config::DEFAULT_FILAMENT_SLOT_PALETTE.len()];
+                    let tool_idx = (next_idx as usize).min(config.tools.len().saturating_sub(1));
+                    config
+                        .filament_slots
+                        .push(crate::config::ThreeMfFilamentSlot {
+                            slot_index: next_idx,
+                            name: format!("Filament {} (PLA)", next_idx as usize + 1),
+                            filament_type: "PLA".to_string(),
+                            color_hex: hex.to_string(),
+                            color_srgba: srgba,
+                            tool_index: tool_idx,
+                        });
+                    vis_state.dirty_surface_colors = true;
+                    vis_state.dirty_toolpaths_mesh = true;
+                    *dirty_gcode = true;
+                }
+
+                if !config.filament_slots.is_empty() {
+                    if ui
+                        .small_button("Auto-Create 1:1 Tools (T0..Tn)")
+                        .on_hover_text(
+                            "Ensure the machine tool registry has at least one tool per 3MF filament slot and map Slot k → Tool Tk",
+                        )
+                        .clicked()
+                    {
+                        let needed = config.filament_slots.len();
+                        let base_nozzle = config
+                            .tools
+                            .first()
+                            .map(|t| t.nozzle_diameter_mm)
+                            .unwrap_or(0.40);
+                        let base_temp = config
+                            .tools
+                            .first()
+                            .map(|t| t.temperature_celsius)
+                            .unwrap_or(215.0);
+                        while config.tools.len() < needed {
+                            let new_id = config.tools.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+                            let slot_num = config.tools.len() + 1;
+                            config.tools.push(ToolConfig::standard_tool(
+                                new_id,
+                                format!("T{new_id} - Slot {slot_num} ({base_nozzle:.1}mm)"),
+                                base_nozzle,
+                                base_temp,
+                            ));
+                        }
+                        for (i, slot) in config.filament_slots.iter_mut().enumerate() {
+                            slot.slot_index = i as u32;
+                            slot.tool_index = i.min(config.tools.len().saturating_sub(1));
+                        }
+                        *dirty_backend = true;
+                        *dirty_gcode = true;
+                        vis_state.dirty_toolpaths_mesh = true;
+                    }
+
+                    if ui
+                        .small_button("Map All → Active Tool")
+                        .on_hover_text("Map all 3MF filament slots to the currently active tool")
+                        .clicked()
+                    {
+                        let active = config
+                            .active_tool_index
+                            .min(config.tools.len().saturating_sub(1));
+                        for slot in &mut config.filament_slots {
+                            slot.tool_index = active;
+                        }
+                        *dirty_gcode = true;
+                        vis_state.dirty_toolpaths_mesh = true;
+                    }
+                }
+                *dirty_gcode |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.gcode.tool_change_time_s)
+                            .speed(0.5)
+                            .range(0.0..=600.0)
+                            .prefix("Toolchange: ")
+                            .suffix(" s"),
+                    )
+                    .on_hover_text(
+                        "Estimated duration of each T{id} toolchange / MMU filament swap added to print time estimation",
+                    )
+                    .changed();
+                param_help_button(ui, "gcode.tool_change_time_s");
+            });
+            ui.horizontal(|ui| {
+                *dirty_gcode |= ui
+                    .checkbox(
+                        &mut config.gcode.tool_change_hop_before,
+                        "Hop Before Toolchange",
+                    )
+                    .on_hover_text(
+                        "Hop above the highest so-far printed material before emitting T{id}",
+                    )
+                    .changed();
+                param_help_button(ui, "gcode.tool_change_hop_before");
+                *dirty_gcode |= ui
+                    .checkbox(
+                        &mut config.gcode.tool_change_approach_after,
+                        "Approach After Toolchange",
+                    )
+                    .on_hover_text(
+                        "After T{id}, move to an approach position above the next chain start (same height as a hop) before descending",
+                    )
+                    .changed();
+                param_help_button(ui, "gcode.tool_change_approach_after");
+            });
+
+            if config.filament_slots.is_empty() {
+                ui.small(
+                    egui::RichText::new(
+                        "No multi-colour 3MF filament slots active. Import a multi-colour .3mf or click '+ Add Filament Slot'.",
+                    )
+                    .color(egui::Color32::GRAY),
+                );
+                return;
+            }
+
+            ui.add_space(3.0);
+            let tool_labels: Vec<(usize, String)> = config
+                .tools
+                .iter()
+                .enumerate()
+                .map(|(idx, t)| {
+                    (
+                        idx,
+                        format!(
+                            "T{} — {} ({:.2}mm, {:.0}°C)",
+                            t.id, t.name, t.nozzle_diameter_mm, t.temperature_celsius
+                        ),
+                    )
+                })
+                .collect();
+
+            let mut remove_slot_idx: Option<usize> = None;
+            let total_slots = config.filament_slots.len();
+            for (s_idx, slot) in config.filament_slots.iter_mut().enumerate() {
+                slot.slot_index = s_idx as u32;
+                if slot.tool_index >= tool_labels.len() && !tool_labels.is_empty() {
+                    slot.tool_index = tool_labels.len() - 1;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("#{}", s_idx + 1))
+                            .strong()
+                            .monospace(),
+                    );
+
+                    // Interactive colour swatch picker
+                    let mut c32 = egui::Color32::from_rgba_unmultiplied(
+                        (slot.color_srgba[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (slot.color_srgba[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (slot.color_srgba[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        255,
+                    );
+                    if ui
+                        .color_edit_button_srgba(&mut c32)
+                        .on_hover_text(format!(
+                            "Slot #{} colour ({}) — click to customize",
+                            s_idx + 1,
+                            slot.color_hex
+                        ))
+                        .changed()
+                    {
+                        slot.color_srgba = [
+                            (c32.r() as f32) / 255.0,
+                            (c32.g() as f32) / 255.0,
+                            (c32.b() as f32) / 255.0,
+                            1.0,
+                        ];
+                        slot.color_hex =
+                            format!("#{:02X}{:02X}{:02X}", c32.r(), c32.g(), c32.b());
+                        vis_state.dirty_surface_colors = true;
+                        vis_state.dirty_toolpaths_mesh = true;
+                    }
+
+                    ui.add(
+                        egui::TextEdit::singleline(&mut slot.name)
+                            .desired_width(105.0)
+                            .hint_text("Slot Name"),
+                    )
+                    .on_hover_text(format!(
+                        "3MF Filament Type: {} | Colour: {}",
+                        slot.filament_type, slot.color_hex
+                    ));
+
+                    ui.label("→");
+
+                    let current_tool_text = tool_labels
+                        .get(slot.tool_index)
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_else(|| format!("T{}", slot.tool_index));
+                    egui::ComboBox::from_id_source((id_salt, "slot_tool_map", s_idx))
+                        .selected_text(current_tool_text)
+                        .width(145.0)
+                        .show_ui(ui, |ui| {
+                            for (t_idx, t_lbl) in &tool_labels {
+                                if ui
+                                    .selectable_value(&mut slot.tool_index, *t_idx, t_lbl)
+                                    .changed()
+                                {
+                                    *dirty_gcode = true;
+                                    vis_state.dirty_toolpaths_mesh = true;
+                                }
+                            }
+                        });
+
+                    if total_slots > 1
+                        && ui
+                            .small_button("✕")
+                            .on_hover_text("Remove this filament slot")
+                            .clicked()
+                    {
+                        remove_slot_idx = Some(s_idx);
+                    }
+                });
+            }
+
+            if let Some(rm_idx) = remove_slot_idx {
+                config.filament_slots.remove(rm_idx);
+                for (i, s) in config.filament_slots.iter_mut().enumerate() {
+                    s.slot_index = i as u32;
+                }
+                vis_state.dirty_surface_colors = true;
+                vis_state.dirty_toolpaths_mesh = true;
+                *dirty_gcode = true;
+            }
+        });
 }
 
 /// Renders the `Filament` configuration sub-tab:
@@ -6910,10 +7320,23 @@ fn render_view_and_inspection_panel(
                 planned.total_filament_grams,
                 planned.total_filament_volume_mm3
             ));
-            ui.small(format!(
-                "Moves: {} extruding, {} travels, {} retracts",
-                planned.extruding_move_count, planned.travel_move_count, planned.retract_count,
-            ));
+            if planned.toolchange_count > 0 {
+                let tc_total_s =
+                    (planned.toolchange_count as f32) * config.gcode.tool_change_time_s.max(0.0);
+                ui.small(format!(
+                    "Moves: {} extruding, {} travels, {} retracts, {} toolchanges ({:.0}s)",
+                    planned.extruding_move_count,
+                    planned.travel_move_count,
+                    planned.retract_count,
+                    planned.toolchange_count,
+                    tc_total_s,
+                ));
+            } else {
+                ui.small(format!(
+                    "Moves: {} extruding, {} travels, {} retracts",
+                    planned.extruding_move_count, planned.travel_move_count, planned.retract_count,
+                ));
+            }
         }
     });
 }
@@ -7161,6 +7584,10 @@ pub fn poll_io_tasks_system(
                 preset_lib.selected_filament = config.filament_preset_name.clone();
                 preset_lib.selected_process = config.process_preset_name.clone();
                 sync_config_to_backend(&config);
+            } else if !report.filament_slots.is_empty() {
+                config.apply_imported_filament_slots(report.filament_slots.clone());
+                sync_config_to_backend(&config);
+                vis_state.toolpath_color_mode = ToolpathColorMode::ByToolOrFilament;
             }
             if let Some(proj_filename) = report.manifold_project_filename {
                 plate.project_3mf_filename = Some(proj_filename);
@@ -7204,6 +7631,22 @@ pub fn poll_io_tasks_system(
                     &mut plate,
                     report.objects,
                 );
+                // Populate initial painted filament vertex colors on all multi-colour objects
+                for obj in &plate.objects {
+                    if !obj.vertex_filament_slots.is_empty() {
+                        if let Some(mesh) = meshes.get_mut(&obj.mesh_handle) {
+                            mesh.insert_attribute(
+                                Mesh::ATTRIBUTE_COLOR,
+                                crate::field_vis::default_cad_vertex_colors(
+                                    obj.vertices.len(),
+                                    &obj.vertex_filament_slots,
+                                    &config,
+                                ),
+                            );
+                        }
+                    }
+                }
+                vis_state.dirty_surface_colors = true;
                 plate.sync_plate_visibility(&mut object_transforms);
                 frame_camera_to_plate(&plate, &config, &mut camera_query);
                 if plate.plates.len() > 1 {

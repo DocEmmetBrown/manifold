@@ -198,11 +198,14 @@ pub enum ToolpathColorMode {
     ByToolIsoNormalAngle,
     /// Highlights segments where the tool axis is actively oriented using the outward object surface normal $\nabla \phi_{\text{sdf}}$ vs. the slicing isosurface normal $\hat{\mathbf{n}}_{\text{iso}}$.
     BySurfaceNormalUsage,
+    /// Colors each segment by its 3MF filament / colour slot (`filament_slot`) and mapped machine tool.
+    ByToolOrFilament,
 }
 
 impl ToolpathColorMode {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::ByFeatureType,
+        Self::ByToolOrFilament,
         Self::ByLineWidth,
         Self::ByLayerHeight,
         Self::BySpeed,
@@ -218,6 +221,7 @@ impl ToolpathColorMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::ByFeatureType => "Feature Type (Outer / Inner / Solid / Sparse / Scarf / Wipe)",
+            Self::ByToolOrFilament => "Tool / Filament Colour (3MF Multi-Colour Slot)",
             Self::ByLineWidth => "Line Width W (mm)",
             Self::ByLayerHeight => "Layer Height H (mm)",
             Self::BySpeed => "Planned Speed v (mm/s)",
@@ -234,6 +238,7 @@ impl ToolpathColorMode {
     pub fn short_label(self) -> &'static str {
         match self {
             Self::ByFeatureType => "Feature / Line Type",
+            Self::ByToolOrFilament => "Tool / Filament Colour",
             Self::ByLineWidth => "Line Width W (mm)",
             Self::ByLayerHeight => "Layer Height H (mm)",
             Self::BySpeed => "Planned Speed v (mm/s)",
@@ -785,7 +790,11 @@ pub fn sync_field_visualization_system(
                 if let Some(mesh) = meshes.get_mut(&prev_obj.mesh_handle) {
                     mesh.insert_attribute(
                         Mesh::ATTRIBUTE_COLOR,
-                        vec![[1.0f32, 1.0, 1.0, 1.0]; prev_obj.vertices.len()],
+                        default_cad_vertex_colors(
+                            prev_obj.vertices.len(),
+                            &prev_obj.vertex_filament_slots,
+                            &config,
+                        ),
                     );
                 }
             }
@@ -979,7 +988,7 @@ pub fn sync_field_visualization_system(
             Vec::new()
         };
 
-        let (colors, min_deg, max_deg, mean_deg, uses_solved) =
+        let (mut colors, min_deg, max_deg, mean_deg, uses_solved) =
             compute_object_surface_vertex_colors(
                 &scene_obj.vertices,
                 &obj_world_tf,
@@ -987,6 +996,15 @@ pub fn sync_field_visualization_system(
                 vis_state.surface_color_mode,
                 &solved_axes,
             );
+        if vis_state.surface_color_mode == ObjectSurfaceColorMode::DefaultCad
+            && !scene_obj.vertex_filament_slots.is_empty()
+        {
+            colors = default_cad_vertex_colors(
+                scene_obj.vertices.len(),
+                &scene_obj.vertex_filament_slots,
+                &config,
+            );
+        }
         vis_state.surface_color_min_deg = min_deg;
         vis_state.surface_color_max_deg = max_deg;
         vis_state.surface_color_mean_deg = mean_deg;
@@ -2640,6 +2658,24 @@ pub const BRANCH_PALETTE: [[f32; 3]; 8] = [
     [0.24, 0.90, 0.92],
 ];
 
+/// Returns per-vertex Linear RGBA colors for a CAD object in `DefaultCad` surface color mode:
+/// uses the 3MF painted filament slot palette if `vertex_filament_slots` is non-empty, or
+/// uniform white (`[1.0, 1.0, 1.0, 1.0]`) so `StandardMaterial.base_color` shows through.
+pub fn default_cad_vertex_colors(
+    vertex_count: usize,
+    vertex_filament_slots: &[u8],
+    config: &SlicerConfig,
+) -> Vec<[f32; 4]> {
+    if vertex_filament_slots.len() == vertex_count && !vertex_filament_slots.is_empty() {
+        vertex_filament_slots
+            .iter()
+            .map(|&slot| srgba_to_linear_rgba(config.color_srgba_for_filament_slot(slot)))
+            .collect()
+    } else {
+        vec![[1.0f32, 1.0, 1.0, 1.0]; vertex_count]
+    }
+}
+
 /// Computes per-vertex linear RGBA colors (`Mesh::ATTRIBUTE_COLOR`) and summary angle statistics
 /// `(min_deg, max_deg, mean_deg, uses_solved_tool)` for an object's surface mesh under
 /// `ObjectSurfaceColorMode`.
@@ -2801,6 +2837,7 @@ fn compute_planned_segment_color(
             _ => compute_toolpath_point_color(
                 seg.kind as u8,
                 seg.wall_index,
+                seg.filament_slot,
                 seg.width_mm,
                 seg.tool_iso_angle_deg,
                 seg.uses_surface_normal,
@@ -2808,6 +2845,13 @@ fn compute_planned_segment_color(
                 config,
             ),
         },
+        ToolpathColorMode::ByToolOrFilament => {
+            if seg.kind.is_support() {
+                [0.22, 0.88, 0.62, 1.0]
+            } else {
+                config.color_srgba_for_filament_slot(seg.filament_slot)
+            }
+        }
         ToolpathColorMode::ByLineWidth => {
             let denom = (planned.max_width_mm - planned.min_width_mm).max(1.0e-4);
             let t = (seg.width_mm - planned.min_width_mm) / denom;
@@ -2946,6 +2990,7 @@ fn append_extrusion_path_bead_mesh(
         let mut rgba = compute_toolpath_point_color(
             path.feature_kind,
             path.wall_index,
+            path.filament_slot,
             pt.width_mm,
             pt.tool_iso_angle_deg,
             pt.uses_surface_normal,
@@ -3002,6 +3047,7 @@ fn append_extrusion_path_bead_mesh(
 fn compute_toolpath_point_color(
     feature_kind: u8,
     wall_index: u32,
+    filament_slot: u8,
     width_mm: f32,
     tool_iso_angle_deg: f32,
     uses_surface_normal: bool,
@@ -3028,6 +3074,13 @@ fn compute_toolpath_point_color(
             8 => [0.12, 0.96, 0.88, 1.0], // Support Interface: bright aquamarine
             _ => [0.98, 0.32, 0.88, 1.0], // Gap Fill: vivid magenta
         },
+        ToolpathColorMode::ByToolOrFilament => {
+            if feature_kind == 7 || feature_kind == 8 {
+                [0.22, 0.88, 0.62, 1.0]
+            } else {
+                config.color_srgba_for_filament_slot(filament_slot)
+            }
+        }
         ToolpathColorMode::ByToolIsoNormalAngle => {
             let max_ang = config
                 .active_tool()
@@ -7232,6 +7285,7 @@ mod tests {
                 c1_deg: c_deg,
                 kind: crate::gcode::PlannedMoveKind::OuterWall,
                 tool_id,
+                filament_slot: 0,
                 wall_index: 0,
                 width_mm: 0.42,
                 height_mm: 0.20,
@@ -7324,6 +7378,7 @@ mod tests {
             extruding_move_count: 5,
             travel_move_count: 0,
             retract_count: 0,
+            toolchange_count: 0,
             min_speed_mms: 80.0,
             max_speed_mms: 80.0,
             min_accel_mms2: -2000.0,
@@ -7555,6 +7610,150 @@ mod tests {
         assert!(
             nx_off < 0.08 && iso_ang_off < 4.0 && surf_cnt_off == 0,
             "Expected +X sloped wall to use isosurface normal when orient_outer_surfaces_to_normal is false, got {nx_off:.3}"
+        );
+
+        let default_cfg = SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(part.object_id);
+    }
+
+    #[test]
+    fn test_multicolor_3mf_filament_slot_field_toolpath_split_and_toolchange_gcode() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Construct a 16x16x8 mm rectangular box split along X = 0 so triangles on the -X half
+        // use filament_slot = 0 and triangles on the +X half use filament_slot = 1.
+        let positions: [f32; 24] = [
+            -8.0, -8.0, 0.0, // 0 (-X)
+             8.0, -8.0, 0.0, // 1 (+X)
+             8.0,  8.0, 0.0, // 2 (+X)
+            -8.0,  8.0, 0.0, // 3 (-X)
+            -8.0, -8.0, 8.0, // 4 (-X)
+             8.0, -8.0, 8.0, // 5 (+X)
+             8.0,  8.0, 8.0, // 6 (+X)
+            -8.0,  8.0, 8.0, // 7 (-X)
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2, // bottom
+            4, 5, 6, 4, 6, 7, // top
+            0, 1, 5, 0, 5, 4, // -Y front
+            1, 2, 6, 1, 6, 5, // +X right (slot 1)
+            2, 3, 7, 2, 7, 6, // +Y back
+            3, 0, 4, 3, 4, 7, // -X left (slot 0)
+        ];
+        // Tag triangles: right (+X) and +X half of top/bottom/front/back get slot 1; -X half get slot 0
+        let tri_slots: [u8; 12] = [
+            1, 0, // bottom
+            1, 0, // top
+            1, 0, // -Y front
+            1, 1, // +X right
+            0, 1, // +Y back
+            0, 0, // -X left
+        ];
+
+        let part = ffi::register_triangle_mesh("test_bicolor_box", &positions, &indices);
+        assert!(part.object_id > 0);
+        ffi::set_object_triangle_filament_slots(part.object_id, &tri_slots);
+
+        let mut cfg = SlicerConfig::default();
+        cfg.apply_imported_filament_slots(vec![
+            crate::config::ThreeMfFilamentSlot::default_for_slot(0, 0),
+            crate::config::ThreeMfFilamentSlot::default_for_slot(1, 1),
+        ]);
+        cfg.tools[0].id = 0;
+        cfg.tools[0].temperature_celsius = 210.0;
+        cfg.tools[1].id = 1;
+        cfg.tools[1].temperature_celsius = 225.0;
+        // Map Slot 0 -> Tool 1 (T1) and Slot 1 -> Tool 0 (T0) to verify arbitrary user-configured mapping!
+        cfg.filament_slots[0].tool_index = 1;
+        cfg.filament_slots[1].tool_index = 0;
+
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.5, 4.0));
+
+        let fields = ffi::list_object_fields(part.object_id);
+        assert!(
+            fields.iter().any(|f| f == "filament_slot"),
+            "Expected 'filament_slot' OpenVDB scalar field on multi-colour object, got {fields:?}"
+        );
+
+        let tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp.valid && !tp.layers.is_empty());
+
+        let mut count_slot_0 = 0usize;
+        let mut count_slot_1 = 0usize;
+        for layer in &tp.layers {
+            for path in &layer.paths {
+                if path.filament_slot == 0 {
+                    count_slot_0 += 1;
+                } else if path.filament_slot == 1 {
+                    count_slot_1 += 1;
+                }
+            }
+        }
+        assert!(
+            count_slot_0 > 0 && count_slot_1 > 0,
+            "Expected multi-colour toolpath splitting to emit both filament_slot 0 ({count_slot_0}) and filament_slot 1 ({count_slot_1}) paths"
+        );
+
+        let planned = crate::gcode::plan_and_emit_gcode_for_object(
+            "test_bicolor_box",
+            part.object_id,
+            &tp,
+            Transform::IDENTITY,
+            &cfg,
+        );
+        // Because Slot 0 is mapped to T1 (225°C) and Slot 1 is mapped to T0 (210°C),
+        // planned segments with filament_slot == 0 must have tool_id == 1, and filament_slot == 1 must have tool_id == 0!
+        let mut verified_slot0_t1 = false;
+        let mut verified_slot1_t0 = false;
+        for layer in &planned.layers {
+            for seg in &layer.segments {
+                if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-5 {
+                    if seg.filament_slot == 0 {
+                        assert_eq!(seg.tool_id, 1);
+                        verified_slot0_t1 = true;
+                    } else if seg.filament_slot == 1 {
+                        assert_eq!(seg.tool_id, 0);
+                        verified_slot1_t0 = true;
+                    }
+                }
+            }
+        }
+        assert!(verified_slot0_t1 && verified_slot1_t0);
+        assert!(
+            planned.gcode_text.contains("M104 S225 T1 ; Preheat tool T1"),
+            "Expected G-code header to preheat mapped auxiliary tool T1 at 225°C"
+        );
+        assert!(
+            planned.gcode_text.contains("T1 ; Switch tool")
+                && planned.gcode_text.contains("T0 ; Switch tool"),
+            "Expected G-code to emit toolchanges between T0 and T1"
+        );
+        assert!(
+            planned.toolchange_count > 0,
+            "Expected toolchange_count > 0 for multi-colour print, got {}",
+            planned.toolchange_count
+        );
+
+        // Verify that increasing `tool_change_time_s` by +10.0s increases `total_time_s`
+        // by exactly `toolchange_count * 10.0` seconds.
+        let mut cfg_slow_tc = cfg.clone();
+        cfg_slow_tc.gcode.tool_change_time_s = cfg.gcode.tool_change_time_s + 10.0;
+        let planned_slow_tc = crate::gcode::plan_and_emit_gcode_for_object(
+            "test_bicolor_box",
+            part.object_id,
+            &tp,
+            Transform::IDENTITY,
+            &cfg_slow_tc,
+        );
+        assert_eq!(planned_slow_tc.toolchange_count, planned.toolchange_count);
+        let expected_extra_s = (planned.toolchange_count as f32) * 10.0;
+        let actual_extra_s = planned_slow_tc.total_time_s - planned.total_time_s;
+        assert!(
+            (actual_extra_s - expected_extra_s).abs() < 0.05,
+            "Expected +10s per toolchange ({} toolchanges => +{expected_extra_s}s), got +{actual_extra_s}s",
+            planned.toolchange_count
         );
 
         let default_cfg = SlicerConfig::default();

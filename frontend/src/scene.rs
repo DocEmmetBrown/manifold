@@ -103,6 +103,8 @@ pub struct SceneObject {
     pub hull: SimplifiedConvexHull,
     pub surface_patches: Vec<SurfacePatch>,
     pub triangle_to_patch: Vec<u32>,
+    pub triangle_filament_slots: Vec<u8>,
+    pub vertex_filament_slots: Vec<u8>,
     pub vertex_buffer: Option<wgpu::Buffer>,
     pub index_buffer: Option<wgpu::Buffer>,
     pub visible: bool,
@@ -573,10 +575,15 @@ pub fn spawn_loaded_objects(
 
         let mesh_handle = meshes.add(bevy_mesh);
 
+        let has_filament_colors = !data.vertex_filament_slots.is_empty();
         let mat_handle = materials.add(StandardMaterial {
-            base_color: Color::srgb(0.24, 0.62, 0.92),
-            metallic: 0.22,
-            perceptual_roughness: 0.45,
+            base_color: if has_filament_colors {
+                Color::srgb(1.0, 1.0, 1.0)
+            } else {
+                Color::srgb(0.24, 0.62, 0.92)
+            },
+            metallic: if has_filament_colors { 0.04 } else { 0.22 },
+            perceptual_roughness: if has_filament_colors { 0.62 } else { 0.45 },
             double_sided: true,
             cull_mode: None,
             ..default()
@@ -626,6 +633,8 @@ pub fn spawn_loaded_objects(
             hull: data.hull,
             surface_patches: data.surface_patches,
             triangle_to_patch: data.triangle_to_patch,
+            triangle_filament_slots: data.triangle_filament_slots,
+            vertex_filament_slots: data.vertex_filament_slots,
             vertex_buffer,
             index_buffer,
             visible: true,
@@ -756,6 +765,8 @@ pub fn clone_object_on_plate(
     let src_hull = plate.objects[src_idx].hull.clone();
     let src_patches = plate.objects[src_idx].surface_patches.clone();
     let src_tri_to_patch = plate.objects[src_idx].triangle_to_patch.clone();
+    let src_tri_filament_slots = plate.objects[src_idx].triangle_filament_slots.clone();
+    let src_vert_filament_slots = plate.objects[src_idx].vertex_filament_slots.clone();
 
     let src_surface_hints: Vec<SurfaceFaceHint> = config
         .eikonal
@@ -860,6 +871,8 @@ pub fn clone_object_on_plate(
             hull: src_hull.clone(),
             surface_patches: src_patches.clone(),
             triangle_to_patch: src_tri_to_patch.clone(),
+            triangle_filament_slots: src_tri_filament_slots.clone(),
+            vertex_filament_slots: src_vert_filament_slots.clone(),
         });
     }
 
@@ -981,7 +994,8 @@ pub fn update_selection_materials_system(
                     1.0
                 };
                 let use_vertex_colormap = vis_state.surface_color_mode
-                    != crate::field_vis::ObjectSurfaceColorMode::DefaultCad;
+                    != crate::field_vis::ObjectSurfaceColorMode::DefaultCad
+                    || !obj.vertex_filament_slots.is_empty();
                 if alpha < 0.02 {
                     mat.base_color = Color::srgba(0.55, 0.60, 0.68, 0.0);
                     mat.alpha_mode = AlphaMode::Mask(1.0);
@@ -1022,10 +1036,17 @@ pub fn update_selection_materials_system(
                     mat.double_sided = true;
                 }
             } else {
-                mat.base_color = Color::srgb(0.22, 0.52, 0.78);
-                mat.metallic = 0.22;
-                mat.perceptual_roughness = 0.45;
-                mat.reflectance = 0.50;
+                if !obj.vertex_filament_slots.is_empty() {
+                    mat.base_color = Color::srgb(0.92, 0.92, 0.92);
+                    mat.metallic = 0.04;
+                    mat.perceptual_roughness = 0.62;
+                    mat.reflectance = 0.18;
+                } else {
+                    mat.base_color = Color::srgb(0.22, 0.52, 0.78);
+                    mat.metallic = 0.22;
+                    mat.perceptual_roughness = 0.45;
+                    mat.reflectance = 0.50;
+                }
                 mat.alpha_mode = AlphaMode::Opaque;
                 mat.cull_mode = None;
                 mat.double_sided = true;

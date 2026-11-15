@@ -70,6 +70,8 @@ struct ObjectRecord {
     std::vector<std::uint32_t> indexBuffer;
     /// Per-triangle STEP B-Rep TopoDS_Face index (1 entry per triangle when `hasBrep == true`).
     std::vector<std::uint32_t> triangleFaceIds;
+    /// Per-triangle 0-based 3MF filament/colour slot index (1 entry per triangle when present).
+    std::vector<std::uint8_t> triangleFilamentSlots;
     /// Generic dictionary of named scalar fields (e.g., "sdf", "eikonal", "overhang", "tool_tilt_deg").
     std::map<std::string, openvdb::FloatGrid::Ptr> scalarFields;
     /// Solved 3D unit tool axis field \hat{a}(x) in bed coordinates.
@@ -581,12 +583,17 @@ void extractWeldedWatertightMesh(
     const std::vector<std::uint32_t>& indexBuffer,
     std::vector<openvdb::Vec3s>& outPoints,
     std::vector<openvdb::Vec3I>& outTriangles,
-    std::vector<openvdb::Vec3I>* outPatchTriangles = nullptr)
+    std::vector<openvdb::Vec3I>* outPatchTriangles = nullptr,
+    const std::vector<std::uint8_t>* inTriangleFilamentSlots = nullptr,
+    std::vector<std::uint8_t>* outTriangleFilamentSlots = nullptr)
 {
     outPoints.clear();
     outTriangles.clear();
     if (outPatchTriangles != nullptr) {
         outPatchTriangles->clear();
+    }
+    if (outTriangleFilamentSlots != nullptr) {
+        outTriangleFilamentSlots->clear();
     }
     if (vertexBuffer.empty() || indexBuffer.size() < 3) {
         return;
@@ -614,6 +621,9 @@ void extractWeldedWatertightMesh(
     }
 
     outTriangles.reserve(indexBuffer.size() / 3);
+    if (outTriangleFilamentSlots != nullptr) {
+        outTriangleFilamentSlots->reserve(indexBuffer.size() / 3);
+    }
     struct EdgeDirCounts {
         std::uint32_t forwardCount = 0; // u -> v (u < v)
         std::uint32_t reverseCount = 0; // v -> u (u < v)
@@ -635,6 +645,14 @@ void extractWeldedWatertightMesh(
             continue;
         }
         outTriangles.emplace_back(w0, w1, w2);
+        if (outTriangleFilamentSlots != nullptr) {
+            const std::size_t triIdx = t / 3;
+            const std::uint8_t slot =
+                (inTriangleFilamentSlots != nullptr && triIdx < inTriangleFilamentSlots->size())
+                    ? (*inTriangleFilamentSlots)[triIdx]
+                    : 0u;
+            outTriangleFilamentSlots->push_back(slot);
+        }
 
         const std::array<std::pair<std::uint32_t, std::uint32_t>, 3> halfEdges{{
             {w0, w1},
@@ -769,6 +787,12 @@ void extractWeldedWatertightMesh(
         }
 
         outTriangles.insert(outTriangles.end(), patchTris.begin(), patchTris.end());
+        if (outTriangleFilamentSlots != nullptr) {
+            outTriangleFilamentSlots->insert(
+                outTriangleFilamentSlots->end(),
+                patchTris.size(),
+                0u);
+        }
         if (outPatchTriangles != nullptr) {
             *outPatchTriangles = std::move(patchTris);
         }
@@ -793,6 +817,65 @@ void extractWeldedWatertightMesh(
         }
     }
 }
+
+openvdb::FloatGrid::Ptr buildSdfAndFilamentSlotGrids(
+    const openvdb::math::Transform& xform,
+    const std::vector<openvdb::Vec3s>& points,
+    const std::vector<openvdb::Vec3I>& triangles,
+    float exBandVoxels,
+    float inBandVoxels,
+    const std::vector<std::uint8_t>& triangleFilamentSlots,
+    bool hasMultiFilament,
+    openvdb::FloatGrid::Ptr* outFilamentSlotGrid)
+{
+    if (outFilamentSlotGrid != nullptr) {
+        outFilamentSlotGrid->reset();
+    }
+    if (!hasMultiFilament || outFilamentSlotGrid == nullptr || points.empty() || triangles.empty()) {
+        std::vector<openvdb::Vec4I> quads;
+        return openvdb::tools::meshToSignedDistanceField<openvdb::FloatGrid>(
+            xform, points, triangles, quads, exBandVoxels, inBandVoxels);
+    }
+
+    const std::size_t numPoints = points.size();
+    std::unique_ptr<openvdb::Vec3s[]> indexSpacePoints(new openvdb::Vec3s[numPoints]);
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, numPoints),
+        openvdb::tools::mesh_to_volume_internal::TransformPoints<openvdb::Vec3s>(
+            &points[0], indexSpacePoints.get(), xform));
+
+    openvdb::tools::QuadAndTriangleDataAdapter<openvdb::Vec3s, openvdb::Vec3I> meshAdapter(
+        indexSpacePoints.get(), numPoints, &triangles[0], triangles.size());
+
+    openvdb::Int32Grid::Ptr polyIdxGrid =
+        openvdb::Int32Grid::create(openvdb::Int32(openvdb::util::INVALID_IDX));
+    polyIdxGrid->setTransform(xform.copy());
+
+    openvdb::FloatGrid::Ptr sdfGrid = openvdb::tools::meshToVolume<openvdb::FloatGrid>(
+        meshAdapter,
+        xform,
+        exBandVoxels,
+        inBandVoxels,
+        0,
+        polyIdxGrid.get());
+
+    openvdb::FloatGrid::Ptr slotGrid = openvdb::FloatGrid::create(0.0f);
+    slotGrid->setTransform(xform.copy());
+    slotGrid->setName("filament_slot");
+    auto slotAcc = slotGrid->getAccessor();
+
+    for (auto iter = polyIdxGrid->cbeginValueOn(); iter; ++iter) {
+        const std::int32_t triIdx = *iter;
+        if (triIdx >= 0 && static_cast<std::size_t>(triIdx) < triangleFilamentSlots.size()) {
+            slotAcc.setValueOn(
+                iter.getCoord(),
+                static_cast<float>(triangleFilamentSlots[static_cast<std::size_t>(triIdx)]));
+        }
+    }
+    *outFilamentSlotGrid = slotGrid;
+    return sdfGrid;
+}
+
 /// constrained 3D Eikonal + tool-orientation solver:
 /// 1. `"sdf"`: Full-interior + exterior-band Signed Distance Field via
 ///    `openvdb::tools::meshToSignedDistanceField`.
@@ -830,9 +913,28 @@ void buildObjectScalarFields(
 
     std::vector<openvdb::Vec3s> points;
     std::vector<openvdb::Vec3I> triangles;
-    extractWeldedWatertightMesh(rec.vertexBuffer, rec.indexBuffer, points, triangles, nullptr);
+    std::vector<std::uint8_t> weldedTriFilamentSlots;
+    const bool hasInputFilamentSlots = !rec.triangleFilamentSlots.empty();
+    extractWeldedWatertightMesh(
+        rec.vertexBuffer,
+        rec.indexBuffer,
+        points,
+        triangles,
+        nullptr,
+        hasInputFilamentSlots ? &rec.triangleFilamentSlots : nullptr,
+        hasInputFilamentSlots ? &weldedTriFilamentSlots : nullptr);
     if (points.empty() || triangles.empty()) {
         return;
+    }
+    bool hasMultiFilament = false;
+    if (!weldedTriFilamentSlots.empty()) {
+        const std::uint8_t firstSlot = weldedTriFilamentSlots.front();
+        for (const std::uint8_t s : weldedTriFilamentSlots) {
+            if (s != 0u || s != firstSlot) {
+                hasMultiFilament = true;
+                break;
+            }
+        }
     }
     std::vector<openvdb::Vec4I> quads;
 
@@ -942,14 +1044,16 @@ void buildObjectScalarFields(
 
             openvdb::math::Transform::Ptr fineXform =
                 openvdb::math::Transform::createLinearTransform(fineVoxelSize);
-            openvdb::FloatGrid::Ptr fineSdfGrid =
-                openvdb::tools::meshToSignedDistanceField<openvdb::FloatGrid>(
-                    *fineXform,
-                    points,
-                    triangles,
-                    quads,
-                    exBandFineVoxels,
-                    inBandFineVoxels);
+            openvdb::FloatGrid::Ptr fineFilamentSlotGrid;
+            openvdb::FloatGrid::Ptr fineSdfGrid = buildSdfAndFilamentSlotGrids(
+                *fineXform,
+                points,
+                triangles,
+                exBandFineVoxels,
+                inBandFineVoxels,
+                weldedTriFilamentSlots,
+                hasMultiFilament,
+                &fineFilamentSlotGrid);
             fineSdfGrid->setName("sdf");
 
             // Check whether the part actually has a deep interior core beyond `inBandFineMm`.
@@ -969,6 +1073,9 @@ void buildObjectScalarFields(
 
             if (deepCoreFloorVoxels < 128) {
                 rec.scalarFields["sdf"] = fineSdfGrid;
+                if (fineFilamentSlotGrid) {
+                    rec.scalarFields["filament_slot"] = fineFilamentSlotGrid;
+                }
                 EikonalSolveResult fineDirectSolved = solveConstrainedEikonal(
                     *fineSdfGrid,
                     rec.minZ,
@@ -1007,16 +1114,21 @@ void buildObjectScalarFields(
 
                 openvdb::math::Transform::Ptr coarseXform =
                     openvdb::math::Transform::createLinearTransform(coarseVoxelSize);
-                openvdb::FloatGrid::Ptr coarseSdfGrid =
-                    openvdb::tools::meshToSignedDistanceField<openvdb::FloatGrid>(
-                        *coarseXform,
-                        points,
-                        triangles,
-                        quads,
-                        exBandCoarseVoxels,
-                        inBandCoarseVoxels);
+                openvdb::FloatGrid::Ptr coarseFilamentSlotGrid;
+                openvdb::FloatGrid::Ptr coarseSdfGrid = buildSdfAndFilamentSlotGrids(
+                    *coarseXform,
+                    points,
+                    triangles,
+                    exBandCoarseVoxels,
+                    inBandCoarseVoxels,
+                    weldedTriFilamentSlots,
+                    hasMultiFilament,
+                    &coarseFilamentSlotGrid);
                 coarseSdfGrid->setName("sdf");
                 rec.coarseScalarFields["sdf"] = coarseSdfGrid;
+                if (coarseFilamentSlotGrid) {
+                    rec.coarseScalarFields["filament_slot"] = coarseFilamentSlotGrid;
+                }
 
                 EikonalSolverContext coarseCtx = ctx;
                 coarseCtx.reportProgress = [](float frac, const char* msg) {
@@ -1037,6 +1149,9 @@ void buildObjectScalarFields(
                 rec.coarseToolAxisGrid = coarseSolved.toolAxisGrid;
 
                 rec.scalarFields["sdf"] = fineSdfGrid;
+                if (fineFilamentSlotGrid) {
+                    rec.scalarFields["filament_slot"] = fineFilamentSlotGrid;
+                }
 
                 EikonalSolveResult fineSolved = solveFineShellWithCoarseGuidance(
                     *fineSdfGrid,
@@ -1085,11 +1200,21 @@ void buildObjectScalarFields(
         openvdb::math::Transform::createLinearTransform(voxelSize);
 
     // 1. Compute full-interior + exterior Signed Distance Field ("sdf")
-    openvdb::FloatGrid::Ptr sdfGrid =
-        openvdb::tools::meshToSignedDistanceField<openvdb::FloatGrid>(
-            *xform, points, triangles, quads, exBandVoxels, inBandVoxels);
+    openvdb::FloatGrid::Ptr filamentSlotGrid;
+    openvdb::FloatGrid::Ptr sdfGrid = buildSdfAndFilamentSlotGrids(
+        *xform,
+        points,
+        triangles,
+        exBandVoxels,
+        inBandVoxels,
+        weldedTriFilamentSlots,
+        hasMultiFilament,
+        &filamentSlotGrid);
     sdfGrid->setName("sdf");
     rec.scalarFields["sdf"] = sdfGrid;
+    if (filamentSlotGrid) {
+        rec.scalarFields["filament_slot"] = filamentSlotGrid;
+    }
 
     // 2. Solve iterative constrained 3D Eikonal + tool orientation fields
     EikonalSolveResult solved = solveConstrainedEikonal(
@@ -1587,6 +1712,7 @@ std::uint64_t SlicerBackend::cloneObject(
     rec.vertexBuffer = src.vertexBuffer;
     rec.indexBuffer = src.indexBuffer;
     rec.triangleFaceIds = src.triangleFaceIds;
+    rec.triangleFilamentSlots = src.triangleFilamentSlots;
     rec.isMultiResolution = src.isMultiResolution;
     rec.fineShellInnerDepthMm = src.fineShellInnerDepthMm;
     rec.coarseToFineRatio = src.coarseToFineRatio;
@@ -1657,6 +1783,30 @@ std::vector<std::uint32_t> SlicerBackend::objectTriangleFaceIds(std::uint64_t ob
         return {};
     }
     return it->second.triangleFaceIds;
+}
+
+void SlicerBackend::setObjectTriangleFilamentSlots(
+    std::uint64_t objectId,
+    const std::uint8_t* slots,
+    std::size_t count)
+{
+    const auto it = impl_->objects.find(objectId);
+    if (it == impl_->objects.end()) {
+        return;
+    }
+    if (slots != nullptr && count > 0) {
+        it->second.triangleFilamentSlots.assign(slots, slots + count);
+    } else {
+        it->second.triangleFilamentSlots.clear();
+    }
+}
+
+std::vector<std::uint8_t> SlicerBackend::objectTriangleFilamentSlots(std::uint64_t objectId) const {
+    const auto it = impl_->objects.find(objectId);
+    if (it == impl_->objects.end()) {
+        return {};
+    }
+    return it->second.triangleFilamentSlots;
 }
 
 std::vector<float> SlicerBackend::objectVertexToolAxes(std::uint64_t objectId) const {
@@ -2033,6 +2183,7 @@ bool SlicerBackend::recomputeObjectFields(
         workingRec.maxZ = it->second.maxZ;
         workingRec.vertexBuffer = it->second.vertexBuffer;
         workingRec.indexBuffer = it->second.indexBuffer;
+        workingRec.triangleFilamentSlots = it->second.triangleFilamentSlots;
 
         snapshotBackend.impl_->nozzleAxisBed = impl_->nozzleAxisBed;
         snapshotBackend.impl_->gravityDirectionBed = impl_->gravityDirectionBed;
@@ -2645,6 +2796,28 @@ rust::Vec<std::uint32_t> get_object_triangle_face_ids(std::uint64_t object_id) {
     out.reserve(src.size());
     for (const std::uint32_t fid : src) {
         out.push_back(fid);
+    }
+    return out;
+}
+
+void set_object_triangle_filament_slots(
+    std::uint64_t object_id,
+    rust::Slice<const std::uint8_t> triangle_slots)
+{
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    globalBackend().setObjectTriangleFilamentSlots(
+        object_id,
+        triangle_slots.data(),
+        triangle_slots.size());
+}
+
+rust::Vec<std::uint8_t> get_object_triangle_filament_slots(std::uint64_t object_id) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    const auto src = globalBackend().objectTriangleFilamentSlots(object_id);
+    rust::Vec<std::uint8_t> out;
+    out.reserve(src.size());
+    for (const std::uint8_t slot : src) {
+        out.push_back(slot);
     }
     return out;
 }
@@ -7540,10 +7713,15 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
     const openvdb::FloatGrid* overhangPtr =
         (ovIt != rec.scalarFields.end() && ovIt->second) ? ovIt->second.get() : nullptr;
 
+    const auto slotIt = rec.scalarFields.find("filament_slot");
+    const openvdb::FloatGrid* filamentSlotPtr =
+        (slotIt != rec.scalarFields.end() && slotIt->second) ? slotIt->second.get() : nullptr;
+
     const openvdb::FloatGrid* coarseSdfPtr = nullptr;
     const openvdb::FloatGrid* coarseEikPtr = nullptr;
     const openvdb::Vec3SGrid* coarseToolAxisPtr = nullptr;
     const openvdb::FloatGrid* coarseOverhangPtr = nullptr;
+    const openvdb::FloatGrid* coarseFilamentSlotPtr = nullptr;
     if (rec.isMultiResolution) {
         const auto cSdfIt = rec.coarseScalarFields.find("sdf");
         const auto cEikIt = rec.coarseScalarFields.find("eikonal");
@@ -7556,6 +7734,10 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
         const auto cOvIt = rec.coarseScalarFields.find("overhang");
         if (cOvIt != rec.coarseScalarFields.end() && cOvIt->second) {
             coarseOverhangPtr = cOvIt->second.get();
+        }
+        const auto cSlotIt = rec.coarseScalarFields.find("filament_slot");
+        if (cSlotIt != rec.coarseScalarFields.end() && cSlotIt->second) {
+            coarseFilamentSlotPtr = cSlotIt->second.get();
         }
     }
 
@@ -7597,7 +7779,9 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
         coarseOverhangPtr,
         impl_->gravityDirectionBed,
         &activeTool,
-        minAxialBed);
+        minAxialBed,
+        filamentSlotPtr,
+        coarseFilamentSlotPtr);
 
     // Step 2: Generate Support Base (`feature_kind = 7`) and Support Interface (`feature_kind = 8`)
     // toolpaths for unreachable order-field regions projected along gravity `+\hat{g}_{bed}`

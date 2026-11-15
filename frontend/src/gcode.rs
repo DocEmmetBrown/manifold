@@ -137,6 +137,8 @@ pub struct PlannedSegment {
     pub kind: PlannedMoveKind,
     /// Extruder tool ID (`T{tool_id}`, e.g. `0` for `T0`, `1` for `T1`) assigned to this segment.
     pub tool_id: u32,
+    /// 0-based 3MF filament/colour slot index (`0` = default slot 1).
+    pub filament_slot: u8,
     pub wall_index: u32,
     pub width_mm: f32,
     pub height_mm: f32,
@@ -199,6 +201,7 @@ pub struct PlannedGcodeResult {
     pub extruding_move_count: usize,
     pub travel_move_count: usize,
     pub retract_count: usize,
+    pub toolchange_count: usize,
 
     // Range statistics across segments for 3D colormap normalization
     pub min_speed_mms: f32,
@@ -238,6 +241,7 @@ struct WorkingChain {
     pts: Vec<WorkingVertex>,
     base_kind: PlannedMoveKind,
     wall_index: u32,
+    filament_slot: u8,
     is_closed: bool,
 }
 
@@ -798,6 +802,7 @@ struct PrintedHeightMap {
     basis: BedUpBasis,
     cell_size_mm: f32,
     curr_max_h: HashMap<(i32, i32), f32>,
+    global_max_h: Option<f32>,
 }
 
 impl PrintedHeightMap {
@@ -806,7 +811,13 @@ impl PrintedHeightMap {
             basis,
             cell_size_mm: 1.0,
             curr_max_h: HashMap::new(),
+            global_max_h: None,
         }
+    }
+
+    #[inline]
+    fn max_printed_h(&self) -> Option<f32> {
+        self.global_max_h
     }
 
     #[inline]
@@ -821,6 +832,8 @@ impl PrintedHeightMap {
     fn record_extrusion_segment(&mut self, p0_bed: Vec3, p1_bed: Vec3) {
         let (u0, v0, h0) = self.basis.project_uvh(p0_bed);
         let (u1, v1, h1) = self.basis.project_uvh(p1_bed);
+        let seg_max_h = h0.max(h1);
+        self.global_max_h = Some(self.global_max_h.map_or(seg_max_h, |m| m.max(seg_max_h)));
         let dist_uv = ((u1 - u0) * (u1 - u0) + (v1 - v0) * (v1 - v0)).sqrt();
         let steps = ((dist_uv / 0.45).ceil() as usize).max(1);
         for s in 0..=steps {
@@ -925,8 +938,61 @@ impl PrintedHeightMap {
     }
 }
 
-/// Orders a single elevation band of chains according to `Supports -> Walls -> WaveOverhangs -> Bridges -> Infill`.
+/// Orders a single elevation band of chains according to `Supports -> (per FilamentSlot: Walls -> WaveOverhangs -> Bridges -> Infill)`.
 fn order_chain_band(
+    mut chains: Vec<WorkingChain>,
+    wall_order: WallPrintOrder,
+    start_pos_bed: Vec3,
+    z_penalty: f32,
+) -> (Vec<WorkingChain>, Vec3) {
+    if chains.is_empty() {
+        return (chains, start_pos_bed);
+    }
+
+    let mut slot_order: Vec<u8> = Vec::new();
+    for ch in &chains {
+        if !ch.base_kind.is_support() && !slot_order.contains(&ch.filament_slot) {
+            slot_order.push(ch.filament_slot);
+        }
+    }
+    if slot_order.len() > 1 {
+        let mut supports = Vec::new();
+        let mut non_supports = Vec::new();
+        for ch in chains.drain(..) {
+            if ch.base_kind.is_support() {
+                supports.push(ch);
+            } else {
+                non_supports.push(ch);
+            }
+        }
+        let mut ordered = Vec::with_capacity(supports.len() + non_supports.len());
+        let mut curr_pos = start_pos_bed;
+        if !supports.is_empty() {
+            let (mut sup_ord, next_pos) =
+                order_chain_band(supports, wall_order, curr_pos, z_penalty);
+            curr_pos = next_pos;
+            ordered.append(&mut sup_ord);
+        }
+        for slot in slot_order {
+            let slot_chains: Vec<WorkingChain> = non_supports
+                .iter()
+                .filter(|ch| ch.filament_slot == slot)
+                .cloned()
+                .collect();
+            if !slot_chains.is_empty() {
+                let (mut slot_ord, next_pos) =
+                    order_chain_band_single_slot(slot_chains, wall_order, curr_pos, z_penalty);
+                curr_pos = next_pos;
+                ordered.append(&mut slot_ord);
+            }
+        }
+        return (ordered, curr_pos);
+    }
+
+    order_chain_band_single_slot(chains, wall_order, start_pos_bed, z_penalty)
+}
+
+fn order_chain_band_single_slot(
     mut chains: Vec<WorkingChain>,
     wall_order: WallPrintOrder,
     start_pos_bed: Vec3,
@@ -1717,11 +1783,12 @@ fn plan_velocity_lookahead(segments: &mut [PlannedSegment], cfg: &GcodeProcessCo
     for i in 1..n {
         let prev = &segments[i - 1];
         let curr = &segments[i];
-        // Full stop at Z-hop vertical transitions or retraction boundaries
+        // Full stop at Z-hop vertical transitions, retraction boundaries, or toolchanges
         if prev.kind == PlannedMoveKind::ZHop
             || curr.kind == PlannedMoveKind::ZHop
             || curr.retract_before_mm > 0.0
             || prev.unretract_after_mm > 0.0
+            || prev.tool_id != curr.tool_id
         {
             junction_max[i] = 0.0;
             continue;
@@ -2756,6 +2823,7 @@ fn generate_first_layer_brim_chains(
                 base_kind: PlannedMoveKind::OuterWall,
                 wall_index: 0,
                 is_closed: true,
+                filament_slot: layer0_chains.first().map_or(0, |c| c.filament_slot),
             };
             simplify_working_chain(&mut wc, 0.05 * w_line);
             if wc.pts.len() >= 4 {
@@ -3428,21 +3496,41 @@ pub fn plan_and_emit_gcode_for_object(
                 base_kind,
                 wall_index: raw_path.wall_index,
                 is_closed: raw_path.is_closed,
+                filament_slot: raw_path.filament_slot,
             };
+            let slot_tool = config.tool_for_filament_slot(raw_path.filament_slot);
+            let slot_nozzle_diam_mm = slot_tool
+                .map(|t| t.nozzle_diameter_mm.max(0.1))
+                .unwrap_or(nozzle_diam_mm);
+            let slot_nozzle_temp_c = slot_tool
+                .map(|t| t.temperature_celsius)
+                .unwrap_or(nozzle_temp_c);
+            let slot_max_tilt_deg = slot_tool
+                .map(|t| {
+                    if t.has_rotational_axes {
+                        t.max_angle_from_bed_normal_deg
+                    } else if is_five_axis_bc {
+                        max_bs_bound
+                    } else {
+                        0.0
+                    }
+                })
+                .unwrap_or(max_tool_tilt_deg);
+            let slot_fluid = FluidDynamicsModel::from_config(&gcfg, slot_nozzle_temp_c);
             let chain_nozzle_diam = if base_kind.is_support() {
                 support_nozzle_diam_mm
             } else {
-                nozzle_diam_mm
+                slot_nozzle_diam_mm
             };
             let chain_max_tilt_deg = if base_kind.is_support() {
                 support_max_tool_tilt_deg
             } else {
-                max_tool_tilt_deg
+                slot_max_tilt_deg
             };
             let chain_fluid = if base_kind.is_support() {
                 &support_fluid
             } else {
-                &fluid
+                &slot_fluid
             };
             simplify_working_chain(&mut wc, 0.04 * chain_nozzle_diam);
             smooth_chain_nozzle_orientations(
@@ -3506,20 +3594,29 @@ pub fn plan_and_emit_gcode_for_object(
 
         for chain in &mut ordered_chains {
             let chain_is_support = chain.base_kind.is_support();
+            let slot_tool = config.tool_for_filament_slot(chain.filament_slot);
             let chain_tool_id = if chain_is_support {
                 support_tool_id
             } else {
-                tool_id
+                slot_tool.map(|t| t.id).unwrap_or(tool_id)
             };
             let chain_nozzle_diam = if chain_is_support {
                 support_nozzle_diam_mm
             } else {
-                nozzle_diam_mm
+                slot_tool
+                    .map(|t| t.nozzle_diameter_mm.max(0.1))
+                    .unwrap_or(nozzle_diam_mm)
             };
+            let slot_fluid = FluidDynamicsModel::from_config(
+                &gcfg,
+                slot_tool
+                    .map(|t| t.temperature_celsius)
+                    .unwrap_or(nozzle_temp_c),
+            );
             let chain_fluid = if chain_is_support {
                 &support_fluid
             } else {
-                &fluid
+                &slot_fluid
             };
 
             let mut vertices = if chain.base_kind == PlannedMoveKind::Bridge {
@@ -3546,7 +3643,200 @@ pub fn plan_and_emit_gcode_for_object(
                 let travel_dist = travel_vec.length();
                 let tool_changed = chain_tool_id != curr_planned_tool_id;
                 let support_boundary_crossing = chain_is_support != curr_planned_is_support;
-                if travel_dist > 1.0e-3 || tool_changed {
+                if tool_changed {
+                    let (u_prev, v_prev, h_prev) = bed_basis.project_uvh(prev_bed);
+                    let (u_next, v_next, h_next) = bed_basis.project_uvh(chain_start_bed);
+                    let corridor_obs_h = height_map.max_corridor_obstacle_h(prev_bed, chain_start_bed);
+                    let hop_margin = if gcfg.z_hop_mm > 1.0e-3 {
+                        gcfg.z_hop_mm.max(0.30)
+                    } else {
+                        0.40
+                    };
+                    let mut h_peak = h_prev
+                        .max(h_next)
+                        .max(height_map.max_printed_h().unwrap_or(h_prev.max(h_next)))
+                        .max(corridor_obs_h.unwrap_or(h_prev.max(h_next)));
+                    let mut h_clear = (h_peak + hop_margin).max(h_prev + hop_margin).max(h_next + hop_margin);
+                    let mut p_lift = bed_basis.unproject_uvh(u_prev, v_prev, h_clear);
+                    let mut p_above = bed_basis.unproject_uvh(u_next, v_next, h_clear);
+                    if let Some(elev_obs_h) = height_map.max_corridor_obstacle_h(p_lift, p_above) {
+                        if elev_obs_h > h_peak {
+                            h_peak = elev_obs_h;
+                            h_clear = (h_peak + hop_margin).max(h_prev + hop_margin).max(h_next + hop_margin);
+                            p_lift = bed_basis.unproject_uvh(u_prev, v_prev, h_clear);
+                            p_above = bed_basis.unproject_uvh(u_next, v_next, h_clear);
+                        }
+                    }
+
+                    // 1. Optional Hop Before Toolchange (emitted with outgoing `curr_planned_tool_id` before `T{id}`)
+                    if gcfg.tool_change_hop_before {
+                        let lift_dist = (p_lift - prev_bed).length().max(1.0e-4);
+                        layer_segments.push(PlannedSegment {
+                            p0_local: to_local_pos(prev_bed),
+                            p1_local: to_local_pos(p_lift),
+                            p0_bed: prev_bed,
+                            p1_bed: p_lift,
+                            nozzle_local_0: to_local_dir(curr_nozzle_axis_bed),
+                            nozzle_local_1: to_local_dir(curr_nozzle_axis_bed),
+                            nozzle_bed_0: curr_nozzle_axis_bed,
+                            nozzle_bed_1: curr_nozzle_axis_bed,
+                            b0_deg: 0.0,
+                            c0_deg: 0.0,
+                            b1_deg: 0.0,
+                            c1_deg: 0.0,
+                            kind: PlannedMoveKind::ZHop,
+                            tool_id: curr_planned_tool_id,
+                            filament_slot: chain.filament_slot,
+                            wall_index: 0,
+                            width_mm: chain_nozzle_diam * 0.35,
+                            height_mm: lift_dist,
+                            length_mm: lift_dist,
+                            nominal_speed_mms: gcfg.z_hop_speed_mms,
+                            entry_speed_mms: 0.0,
+                            cruise_speed_mms: gcfg.z_hop_speed_mms,
+                            exit_speed_mms: 0.0,
+                            accel_mms2: gcfg.travel_accel_mms2,
+                            duration_s: (lift_dist / gcfg.z_hop_speed_mms.max(1.0)).max(1.0e-4),
+                            delta_e_mm: 0.0,
+                            volumetric_flow_mm3s: 0.0,
+                            extrusion_multiplier: 0.0,
+                            pressure_advance_s: 0.0,
+                            melt_pressure_mm3s: 0.0,
+                            retract_before_mm: gcfg.retract_length_mm,
+                            unretract_after_mm: 0.0,
+                            tool_iso_angle_deg: 0.0,
+                            uses_surface_normal: false,
+                        });
+                    }
+
+                    let post_tc_start_bed = if gcfg.tool_change_hop_before {
+                        p_lift
+                    } else {
+                        prev_bed
+                    };
+                    let post_tc_retract_before = if gcfg.tool_change_hop_before {
+                        0.0
+                    } else {
+                        gcfg.retract_length_mm
+                    };
+
+                    // 2. Post-toolchange move(s) (emitted with incoming `chain_tool_id` immediately after `T{id}`)
+                    if gcfg.tool_change_approach_after {
+                        let mid_len = (p_above - post_tc_start_bed).length().max(1.0e-4);
+                        layer_segments.push(PlannedSegment {
+                            p0_local: to_local_pos(post_tc_start_bed),
+                            p1_local: to_local_pos(p_above),
+                            p0_bed: post_tc_start_bed,
+                            p1_bed: p_above,
+                            nozzle_local_0: to_local_dir(curr_nozzle_axis_bed),
+                            nozzle_local_1: to_local_dir(chain_start_nozzle),
+                            nozzle_bed_0: curr_nozzle_axis_bed,
+                            nozzle_bed_1: chain_start_nozzle,
+                            b0_deg: 0.0,
+                            c0_deg: 0.0,
+                            b1_deg: 0.0,
+                            c1_deg: 0.0,
+                            kind: PlannedMoveKind::Travel,
+                            tool_id: chain_tool_id,
+                            filament_slot: chain.filament_slot,
+                            wall_index: 0,
+                            width_mm: chain_nozzle_diam * 0.35,
+                            height_mm: 0.15,
+                            length_mm: mid_len,
+                            nominal_speed_mms: gcfg.travel_speed_mms,
+                            entry_speed_mms: 0.0,
+                            cruise_speed_mms: gcfg.travel_speed_mms,
+                            exit_speed_mms: 0.0,
+                            accel_mms2: gcfg.travel_accel_mms2,
+                            duration_s: (mid_len / gcfg.travel_speed_mms.max(1.0)).max(1.0e-4),
+                            delta_e_mm: 0.0,
+                            volumetric_flow_mm3s: 0.0,
+                            extrusion_multiplier: 0.0,
+                            pressure_advance_s: 0.0,
+                            melt_pressure_mm3s: 0.0,
+                            retract_before_mm: post_tc_retract_before,
+                            unretract_after_mm: 0.0,
+                            tool_iso_angle_deg: 0.0,
+                            uses_surface_normal: false,
+                        });
+
+                        let drop_dist = (chain_start_bed - p_above).length().max(1.0e-4);
+                        layer_segments.push(PlannedSegment {
+                            p0_local: to_local_pos(p_above),
+                            p1_local: to_local_pos(chain_start_bed),
+                            p0_bed: p_above,
+                            p1_bed: chain_start_bed,
+                            nozzle_local_0: to_local_dir(chain_start_nozzle),
+                            nozzle_local_1: to_local_dir(chain_start_nozzle),
+                            nozzle_bed_0: chain_start_nozzle,
+                            nozzle_bed_1: chain_start_nozzle,
+                            b0_deg: 0.0,
+                            c0_deg: 0.0,
+                            b1_deg: 0.0,
+                            c1_deg: 0.0,
+                            kind: PlannedMoveKind::ZHop,
+                            tool_id: chain_tool_id,
+                            filament_slot: chain.filament_slot,
+                            wall_index: 0,
+                            width_mm: chain_nozzle_diam * 0.35,
+                            height_mm: drop_dist,
+                            length_mm: drop_dist,
+                            nominal_speed_mms: gcfg.z_hop_speed_mms,
+                            entry_speed_mms: 0.0,
+                            cruise_speed_mms: gcfg.z_hop_speed_mms,
+                            exit_speed_mms: 0.0,
+                            accel_mms2: gcfg.travel_accel_mms2,
+                            duration_s: (drop_dist / gcfg.z_hop_speed_mms.max(1.0)).max(1.0e-4),
+                            delta_e_mm: 0.0,
+                            volumetric_flow_mm3s: 0.0,
+                            extrusion_multiplier: 0.0,
+                            pressure_advance_s: 0.0,
+                            melt_pressure_mm3s: 0.0,
+                            retract_before_mm: 0.0,
+                            unretract_after_mm: gcfg.retract_length_mm,
+                            tool_iso_angle_deg: 0.0,
+                            uses_surface_normal: false,
+                        });
+                    } else {
+                        let direct_len = (chain_start_bed - post_tc_start_bed).length().max(1.0e-4);
+                        layer_segments.push(PlannedSegment {
+                            p0_local: to_local_pos(post_tc_start_bed),
+                            p1_local: to_local_pos(chain_start_bed),
+                            p0_bed: post_tc_start_bed,
+                            p1_bed: chain_start_bed,
+                            nozzle_local_0: to_local_dir(curr_nozzle_axis_bed),
+                            nozzle_local_1: to_local_dir(chain_start_nozzle),
+                            nozzle_bed_0: curr_nozzle_axis_bed,
+                            nozzle_bed_1: chain_start_nozzle,
+                            b0_deg: 0.0,
+                            c0_deg: 0.0,
+                            b1_deg: 0.0,
+                            c1_deg: 0.0,
+                            kind: PlannedMoveKind::Travel,
+                            tool_id: chain_tool_id,
+                            filament_slot: chain.filament_slot,
+                            wall_index: 0,
+                            width_mm: chain_nozzle_diam * 0.35,
+                            height_mm: 0.15,
+                            length_mm: direct_len,
+                            nominal_speed_mms: gcfg.travel_speed_mms,
+                            entry_speed_mms: 0.0,
+                            cruise_speed_mms: gcfg.travel_speed_mms,
+                            exit_speed_mms: 0.0,
+                            accel_mms2: gcfg.travel_accel_mms2,
+                            duration_s: (direct_len / gcfg.travel_speed_mms.max(1.0)).max(1.0e-4),
+                            delta_e_mm: 0.0,
+                            volumetric_flow_mm3s: 0.0,
+                            extrusion_multiplier: 0.0,
+                            pressure_advance_s: 0.0,
+                            melt_pressure_mm3s: 0.0,
+                            retract_before_mm: post_tc_retract_before,
+                            unretract_after_mm: gcfg.retract_length_mm,
+                            tool_iso_angle_deg: 0.0,
+                            uses_surface_normal: false,
+                        });
+                    }
+                } else if travel_dist > 1.0e-3 {
                     let (_, _, h_prev) = bed_basis.project_uvh(prev_bed);
                     let (_, _, h_next) = bed_basis.project_uvh(chain_start_bed);
                     let corridor_obs_h = height_map.max_corridor_obstacle_h(prev_bed, chain_start_bed);
@@ -3554,7 +3844,6 @@ pub fn plan_and_emit_gcode_for_object(
                         .is_some_and(|obs_h| obs_h > h_prev.min(h_next) - 0.15);
 
                     let needs_retract = travel_dist > min_retract_travel_mm
-                        || tool_changed
                         || support_boundary_crossing
                         || corridor_blocked;
                     let is_infill_to_infill = matches!(
@@ -3569,7 +3858,6 @@ pub fn plan_and_emit_gcode_for_object(
                     let use_z_hop = corridor_blocked
                         || (gcfg.z_hop_mm > 1.0e-3
                             && ((needs_retract && !is_infill_to_infill)
-                                || tool_changed
                                 || support_boundary_crossing));
 
                     if use_z_hop {
@@ -3627,6 +3915,7 @@ pub fn plan_and_emit_gcode_for_object(
                             c1_deg: 0.0,
                             kind: PlannedMoveKind::ZHop,
                             tool_id: curr_planned_tool_id,
+                            filament_slot: chain.filament_slot,
                             wall_index: 0,
                             width_mm: chain_nozzle_diam * 0.35,
                             height_mm: lift_dist,
@@ -3665,6 +3954,7 @@ pub fn plan_and_emit_gcode_for_object(
                             c1_deg: 0.0,
                             kind: PlannedMoveKind::Travel,
                             tool_id: chain_tool_id,
+                            filament_slot: chain.filament_slot,
                             wall_index: 0,
                             width_mm: chain_nozzle_diam * 0.35,
                             height_mm: 0.15,
@@ -3702,6 +3992,7 @@ pub fn plan_and_emit_gcode_for_object(
                             c1_deg: 0.0,
                             kind: PlannedMoveKind::ZHop,
                             tool_id: chain_tool_id,
+                            filament_slot: chain.filament_slot,
                             wall_index: 0,
                             width_mm: chain_nozzle_diam * 0.35,
                             height_mm: drop_dist,
@@ -3743,6 +4034,7 @@ pub fn plan_and_emit_gcode_for_object(
                             c1_deg: 0.0,
                             kind: PlannedMoveKind::Travel,
                             tool_id: chain_tool_id,
+                            filament_slot: chain.filament_slot,
                             wall_index: 0,
                             width_mm: chain_nozzle_diam * 0.35,
                             height_mm: 0.15,
@@ -3764,6 +4056,182 @@ pub fn plan_and_emit_gcode_for_object(
                             uses_surface_normal: false,
                         });
                     }
+                }
+            } else {
+                // First chain of the print: emit initial positioning move to `chain_start_bed`
+                // (or toolchange hop/approach sequence if the first chain's tool differs from the initial active tool).
+                let tool_changed = chain_tool_id != curr_planned_tool_id;
+                let (u_next, v_next, h_next) = bed_basis.project_uvh(chain_start_bed);
+                let hop_margin = if gcfg.z_hop_mm > 1.0e-3 {
+                    gcfg.z_hop_mm.max(0.30)
+                } else {
+                    0.40
+                };
+                let h_clear = h_next + hop_margin;
+                let p_above = bed_basis.unproject_uvh(u_next, v_next, h_clear);
+
+                if tool_changed && gcfg.tool_change_hop_before {
+                    let p_init_lift = bed_basis.unproject_uvh(u_next, v_next, h_clear);
+                    layer_segments.push(PlannedSegment {
+                        p0_local: to_local_pos(chain_start_bed),
+                        p1_local: to_local_pos(p_init_lift),
+                        p0_bed: chain_start_bed,
+                        p1_bed: p_init_lift,
+                        nozzle_local_0: to_local_dir(curr_nozzle_axis_bed),
+                        nozzle_local_1: to_local_dir(curr_nozzle_axis_bed),
+                        nozzle_bed_0: curr_nozzle_axis_bed,
+                        nozzle_bed_1: curr_nozzle_axis_bed,
+                        b0_deg: 0.0,
+                        c0_deg: 0.0,
+                        b1_deg: 0.0,
+                        c1_deg: 0.0,
+                        kind: PlannedMoveKind::ZHop,
+                        tool_id: curr_planned_tool_id,
+                        filament_slot: chain.filament_slot,
+                        wall_index: 0,
+                        width_mm: chain_nozzle_diam * 0.35,
+                        height_mm: hop_margin,
+                        length_mm: hop_margin,
+                        nominal_speed_mms: gcfg.z_hop_speed_mms,
+                        entry_speed_mms: 0.0,
+                        cruise_speed_mms: gcfg.z_hop_speed_mms,
+                        exit_speed_mms: 0.0,
+                        accel_mms2: gcfg.travel_accel_mms2,
+                        duration_s: (hop_margin / gcfg.z_hop_speed_mms.max(1.0)).max(1.0e-4),
+                        delta_e_mm: 0.0,
+                        volumetric_flow_mm3s: 0.0,
+                        extrusion_multiplier: 0.0,
+                        pressure_advance_s: 0.0,
+                        melt_pressure_mm3s: 0.0,
+                        retract_before_mm: gcfg.retract_length_mm,
+                        unretract_after_mm: 0.0,
+                        tool_iso_angle_deg: 0.0,
+                        uses_surface_normal: false,
+                    });
+                }
+
+                let init_retract_before = if tool_changed && !gcfg.tool_change_hop_before {
+                    gcfg.retract_length_mm
+                } else {
+                    0.0
+                };
+                let init_unretract_after = if tool_changed {
+                    gcfg.retract_length_mm
+                } else {
+                    0.0
+                };
+
+                if tool_changed && gcfg.tool_change_approach_after {
+                    layer_segments.push(PlannedSegment {
+                        p0_local: to_local_pos(p_above),
+                        p1_local: to_local_pos(p_above),
+                        p0_bed: p_above,
+                        p1_bed: p_above,
+                        nozzle_local_0: to_local_dir(chain_start_nozzle),
+                        nozzle_local_1: to_local_dir(chain_start_nozzle),
+                        nozzle_bed_0: chain_start_nozzle,
+                        nozzle_bed_1: chain_start_nozzle,
+                        b0_deg: 0.0,
+                        c0_deg: 0.0,
+                        b1_deg: 0.0,
+                        c1_deg: 0.0,
+                        kind: PlannedMoveKind::Travel,
+                        tool_id: chain_tool_id,
+                        filament_slot: chain.filament_slot,
+                        wall_index: 0,
+                        width_mm: chain_nozzle_diam * 0.35,
+                        height_mm: 0.15,
+                        length_mm: 1.0e-4,
+                        nominal_speed_mms: gcfg.travel_speed_mms,
+                        entry_speed_mms: 0.0,
+                        cruise_speed_mms: gcfg.travel_speed_mms,
+                        exit_speed_mms: 0.0,
+                        accel_mms2: gcfg.travel_accel_mms2,
+                        duration_s: 1.0e-4,
+                        delta_e_mm: 0.0,
+                        volumetric_flow_mm3s: 0.0,
+                        extrusion_multiplier: 0.0,
+                        pressure_advance_s: 0.0,
+                        melt_pressure_mm3s: 0.0,
+                        retract_before_mm: init_retract_before,
+                        unretract_after_mm: 0.0,
+                        tool_iso_angle_deg: 0.0,
+                        uses_surface_normal: false,
+                    });
+                    let drop_dist = (chain_start_bed - p_above).length().max(1.0e-4);
+                    layer_segments.push(PlannedSegment {
+                        p0_local: to_local_pos(p_above),
+                        p1_local: to_local_pos(chain_start_bed),
+                        p0_bed: p_above,
+                        p1_bed: chain_start_bed,
+                        nozzle_local_0: to_local_dir(chain_start_nozzle),
+                        nozzle_local_1: to_local_dir(chain_start_nozzle),
+                        nozzle_bed_0: chain_start_nozzle,
+                        nozzle_bed_1: chain_start_nozzle,
+                        b0_deg: 0.0,
+                        c0_deg: 0.0,
+                        b1_deg: 0.0,
+                        c1_deg: 0.0,
+                        kind: PlannedMoveKind::ZHop,
+                        tool_id: chain_tool_id,
+                        filament_slot: chain.filament_slot,
+                        wall_index: 0,
+                        width_mm: chain_nozzle_diam * 0.35,
+                        height_mm: drop_dist,
+                        length_mm: drop_dist,
+                        nominal_speed_mms: gcfg.z_hop_speed_mms,
+                        entry_speed_mms: 0.0,
+                        cruise_speed_mms: gcfg.z_hop_speed_mms,
+                        exit_speed_mms: 0.0,
+                        accel_mms2: gcfg.travel_accel_mms2,
+                        duration_s: (drop_dist / gcfg.z_hop_speed_mms.max(1.0)).max(1.0e-4),
+                        delta_e_mm: 0.0,
+                        volumetric_flow_mm3s: 0.0,
+                        extrusion_multiplier: 0.0,
+                        pressure_advance_s: 0.0,
+                        melt_pressure_mm3s: 0.0,
+                        retract_before_mm: 0.0,
+                        unretract_after_mm: init_unretract_after,
+                        tool_iso_angle_deg: 0.0,
+                        uses_surface_normal: false,
+                    });
+                } else {
+                    layer_segments.push(PlannedSegment {
+                        p0_local: to_local_pos(chain_start_bed),
+                        p1_local: to_local_pos(chain_start_bed),
+                        p0_bed: chain_start_bed,
+                        p1_bed: chain_start_bed,
+                        nozzle_local_0: to_local_dir(chain_start_nozzle),
+                        nozzle_local_1: to_local_dir(chain_start_nozzle),
+                        nozzle_bed_0: chain_start_nozzle,
+                        nozzle_bed_1: chain_start_nozzle,
+                        b0_deg: 0.0,
+                        c0_deg: 0.0,
+                        b1_deg: 0.0,
+                        c1_deg: 0.0,
+                        kind: PlannedMoveKind::Travel,
+                        tool_id: chain_tool_id,
+                        filament_slot: chain.filament_slot,
+                        wall_index: 0,
+                        width_mm: chain_nozzle_diam * 0.35,
+                        height_mm: 0.15,
+                        length_mm: 1.0e-4,
+                        nominal_speed_mms: gcfg.travel_speed_mms,
+                        entry_speed_mms: 0.0,
+                        cruise_speed_mms: gcfg.travel_speed_mms,
+                        exit_speed_mms: 0.0,
+                        accel_mms2: gcfg.travel_accel_mms2,
+                        duration_s: 1.0e-4,
+                        delta_e_mm: 0.0,
+                        volumetric_flow_mm3s: 0.0,
+                        extrusion_multiplier: 0.0,
+                        pressure_advance_s: 0.0,
+                        melt_pressure_mm3s: 0.0,
+                        retract_before_mm: init_retract_before,
+                        unretract_after_mm: init_unretract_after,
+                        tool_iso_angle_deg: 0.0,
+                        uses_surface_normal: false,
+                    });
                 }
             }
 
@@ -3935,6 +4403,7 @@ pub fn plan_and_emit_gcode_for_object(
                         c1_deg: 0.0,
                         kind,
                         tool_id: chain_tool_id,
+                        filament_slot: chain.filament_slot,
                         wall_index: chain.wall_index,
                         width_mm: width,
                         height_mm: height,
@@ -3975,6 +4444,7 @@ pub fn plan_and_emit_gcode_for_object(
                         c1_deg: 0.0,
                         kind: PlannedMoveKind::Wipe,
                         tool_id: chain_tool_id,
+                        filament_slot: chain.filament_slot,
                         wall_index: chain.wall_index,
                         width_mm: width * 0.5,
                         height_mm: height * 0.5,
@@ -4160,6 +4630,7 @@ pub fn plan_and_emit_gcode_for_object(
                 c1_deg: last_ext.c1_deg,
                 kind: PlannedMoveKind::Wipe,
                 tool_id: last_ext.tool_id,
+                filament_slot: last_ext.filament_slot,
                 wall_index: 0,
                 width_mm: nozzle_diam_mm * 0.4,
                 height_mm: 0.15,
@@ -4196,6 +4667,7 @@ pub fn plan_and_emit_gcode_for_object(
                 c1_deg: last_ext.c1_deg,
                 kind: PlannedMoveKind::ZHop,
                 tool_id: last_ext.tool_id,
+                filament_slot: last_ext.filament_slot,
                 wall_index: 0,
                 width_mm: nozzle_diam_mm * 0.35,
                 height_mm: 2.0,
@@ -4307,11 +4779,12 @@ pub fn plan_and_emit_gcode_for_object(
     let mut min_iso_angle = f32::MAX;
     let mut max_iso_angle = 0.0f32;
 
-    let mut total_time_s = 0.0f32;
-    let mut total_filament_mm = 0.0f32;
+    let mut total_time_s_f64 = 0.0f64;
+    let mut total_filament_mm_f64 = 0.0f64;
     let mut extruding_move_count = 0usize;
     let mut travel_move_count = 0usize;
     let mut retract_count = 0usize;
+    let mut toolchange_count = 0usize;
 
     let exclude_object_name = sanitize_exclude_object_name(object_name, object_id);
     let exclude_object_center_bed = [
@@ -4364,22 +4837,39 @@ pub fn plan_and_emit_gcode_for_object(
         gcode.push('\n');
     }
     gcode.push_str("M83 ; Ensure relative extrusion\n");
-    if support_tool_id != tool_id {
-        let has_support_segs = planned_layers.iter().any(|l| {
-            l.segments
+    {
+        let mut preheat_tool_ids: Vec<u32> = Vec::new();
+        for l in &planned_layers {
+            for s in &l.segments {
+                if s.kind.is_extruding()
+                    && s.delta_e_mm > 1.0e-6
+                    && s.tool_id != tool_id
+                    && !preheat_tool_ids.contains(&s.tool_id)
+                {
+                    preheat_tool_ids.push(s.tool_id);
+                }
+            }
+        }
+        for &aux_tool_id in &preheat_tool_ids {
+            let aux_temp_c = config
+                .tools
                 .iter()
-                .any(|s| s.kind.is_support() && s.delta_e_mm > 1.0e-6)
-        });
-        if has_support_segs {
+                .find(|t| t.id == aux_tool_id)
+                .map(|t| t.temperature_celsius)
+                .unwrap_or(if aux_tool_id == support_tool_id {
+                    support_nozzle_temp_c
+                } else {
+                    nozzle_temp_c
+                });
             match gcfg.gcode_dialect {
                 GcodeDialect::Klipper => {
                     gcode.push_str(&format!(
-                        "M104 S{support_nozzle_temp_c:.0} T{support_tool_id} ; Preheat support tool T{support_tool_id}\n"
+                        "M104 S{aux_temp_c:.0} T{aux_tool_id} ; Preheat tool T{aux_tool_id}\n"
                     ));
                 }
                 GcodeDialect::RepRapFirmware => {
                     gcode.push_str(&format!(
-                        "M568 P{support_tool_id} S{support_nozzle_temp_c:.0} R{support_nozzle_temp_c:.0} A2 ; Preheat support tool T{support_tool_id}\n"
+                        "M568 P{aux_tool_id} S{aux_temp_c:.0} R{aux_temp_c:.0} A2 ; Preheat tool T{aux_tool_id}\n"
                     ));
                 }
             }
@@ -4461,7 +4951,7 @@ pub fn plan_and_emit_gcode_for_object(
         }
 
         for (seg_idx, seg) in layer.segments.iter().enumerate() {
-            total_time_s += seg.duration_s;
+            total_time_s_f64 += seg.duration_s as f64;
 
             // Emit dynamic or feature-override cooling fan update when scheduled PWM changes
             if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
@@ -4493,11 +4983,11 @@ pub fn plan_and_emit_gcode_for_object(
                 accum_travel_time_s = 0.0;
                 emitted_feed_mm_min = r_feed;
                 retract_count += 1;
-                total_time_s += r_len / gcfg.retract_speed_mms.max(1.0);
+                total_time_s_f64 += (r_len / gcfg.retract_speed_mms.max(1.0)) as f64;
             }
 
-            // Emit toolchange (`T{id}`) before resuming extrusion if the segment uses a different tool
-            if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 && seg.tool_id != emitted_tool_id {
+            // Emit toolchange (`T{id}`) when switching tools (after any pre-toolchange hop and before post-toolchange approach/travel)
+            if seg.tool_id != emitted_tool_id {
                 if active_retract_mm <= 1.0e-4 && gcfg.retract_length_mm > 1.0e-4 {
                     if in_g93_mode {
                         gcode.push_str("G94 ; Standard mm/min feedrate for retract\n");
@@ -4511,13 +5001,18 @@ pub fn plan_and_emit_gcode_for_object(
                     active_retract_mm = r_len;
                     accum_travel_time_s = 0.0;
                     retract_count += 1;
-                    total_time_s += r_len / gcfg.retract_speed_mms.max(1.0);
+                    total_time_s_f64 += (r_len / gcfg.retract_speed_mms.max(1.0)) as f64;
                 }
-                let target_temp_c = if seg.tool_id == support_tool_id {
-                    support_nozzle_temp_c
-                } else {
-                    nozzle_temp_c
-                };
+                let target_temp_c = config
+                    .tools
+                    .iter()
+                    .find(|t| t.id == seg.tool_id)
+                    .map(|t| t.temperature_celsius)
+                    .unwrap_or(if seg.tool_id == support_tool_id {
+                        support_nozzle_temp_c
+                    } else {
+                        nozzle_temp_c
+                    });
                 match gcfg.gcode_dialect {
                     GcodeDialect::Klipper => {
                         gcode.push_str(&format!(
@@ -4540,6 +5035,9 @@ pub fn plan_and_emit_gcode_for_object(
                 emitted_pa = -1.0;
                 emitted_feed_mm_min = -1.0;
                 e_rounding_residual_mm = 0.0;
+                toolchange_count += 1;
+                let tc_time_s = gcfg.tool_change_time_s.max(0.0);
+                total_time_s_f64 += tc_time_s as f64;
             }
 
             if !seg.kind.is_extruding() || seg.delta_e_mm <= 1.0e-6 {
@@ -4562,7 +5060,7 @@ pub fn plan_and_emit_gcode_for_object(
                 active_retract_mm = 0.0;
                 accum_travel_time_s = 0.0;
                 emitted_feed_mm_min = u_feed;
-                total_time_s += u_len / gcfg.retract_speed_mms.max(1.0);
+                total_time_s_f64 += (u_len / gcfg.retract_speed_mms.max(1.0)) as f64;
             }
 
             // Deadband-compacted `SET_VELOCITY_LIMIT ACCEL=...` / `M204 P... T...`
@@ -4585,7 +5083,7 @@ pub fn plan_and_emit_gcode_for_object(
 
             if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
                 extruding_move_count += 1;
-                total_filament_mm += seg.delta_e_mm;
+                total_filament_mm_f64 += seg.delta_e_mm as f64;
 
                 min_speed = min_speed.min(seg.cruise_speed_mms);
                 max_speed = max_speed.max(seg.cruise_speed_mms);
@@ -4833,6 +5331,8 @@ pub fn plan_and_emit_gcode_for_object(
         max_iso_angle = 15.0;
     }
 
+    let total_time_s = total_time_s_f64 as f32;
+    let total_filament_mm = total_filament_mm_f64 as f32;
     let total_filament_volume_mm3 = total_filament_mm * filament_area_mm2;
     let density_g_mm3 = (gcfg.filament_density_g_cm3 * 0.001).max(0.0001);
     let total_filament_grams = total_filament_volume_mm3 * density_g_mm3;
@@ -4868,6 +5368,7 @@ pub fn plan_and_emit_gcode_for_object(
         extruding_move_count,
         travel_move_count,
         retract_count,
+        toolchange_count,
         min_speed_mms: min_speed,
         max_speed_mms: max_speed,
         min_accel_mms2: min_accel,
@@ -4967,6 +5468,7 @@ mod tests {
             ],
             feature_kind: 0,
             wall_index: 0,
+            filament_slot: 0,
             is_closed: true,
             total_length_mm: 80.0,
             mean_width_mm: 0.42,
@@ -4980,6 +5482,7 @@ mod tests {
             ],
             feature_kind: 1,
             wall_index: 1,
+            filament_slot: 0,
             is_closed: false,
             total_length_mm: 32.0,
             mean_width_mm: 0.42,
@@ -4993,6 +5496,7 @@ mod tests {
             ],
             feature_kind: 4,
             wall_index: 0,
+            filament_slot: 0,
             is_closed: false,
             total_length_mm: 14.14,
             mean_width_mm: 0.45,
@@ -5110,6 +5614,7 @@ mod tests {
                 paths: vec![ExtrusionPath {
                     feature_kind: 0,
                     wall_index: 0,
+                    filament_slot: 0,
                     is_closed: false,
                     total_length_mm: 40.0,
                     mean_width_mm: 0.42,
@@ -5226,6 +5731,7 @@ mod tests {
         let supported_inner = ExtrusionPath {
             feature_kind: 1,
             wall_index: 1,
+            filament_slot: 0,
             is_closed: false,
             total_length_mm: 20.0,
             mean_width_mm: 0.45,
@@ -5237,6 +5743,7 @@ mod tests {
         let wave_outer_pass = ExtrusionPath {
             feature_kind: 6,
             wall_index: 2, // outer wave pass (must be re-ordered AFTER wall_index = 1)
+            filament_slot: 0,
             is_closed: false,
             total_length_mm: 20.0,
             mean_width_mm: 0.45,
@@ -5248,6 +5755,7 @@ mod tests {
         let wave_inner_pass = ExtrusionPath {
             feature_kind: 6,
             wall_index: 1, // inner wave pass (must print first among wave overhangs: inside-out!)
+            filament_slot: 0,
             is_closed: false,
             total_length_mm: 20.0,
             mean_width_mm: 0.45,
@@ -5260,6 +5768,7 @@ mod tests {
         let bridge_path = ExtrusionPath {
             feature_kind: 5,
             wall_index: 0,
+            filament_slot: 0,
             is_closed: false,
             total_length_mm: (20.0f32 * 20.0 + 2.0 * 2.0).sqrt(),
             mean_width_mm: 0.40,
@@ -5424,6 +5933,7 @@ mod tests {
             points: pts,
             feature_kind: 0,
             wall_index: 0,
+            filament_slot: 0,
             is_closed: true,
             total_length_mm: std::f32::consts::TAU * radius,
             mean_width_mm: 0.36,
@@ -5506,6 +6016,7 @@ mod tests {
         let flat_path = ExtrusionPath {
             feature_kind: 1,
             wall_index: 2, // InnerOuterInner prints wall_index >= 2 first, then outer wall 0
+            filament_slot: 0,
             is_closed: false,
             total_length_mm: 10.0,
             mean_width_mm: 0.42,
@@ -5558,6 +6069,7 @@ mod tests {
         let cone_path = ExtrusionPath {
             feature_kind: 0,
             wall_index: 0,
+            filament_slot: 0,
             is_closed: true,
             total_length_mm: std::f32::consts::TAU * 20.0,
             mean_width_mm: 0.42,
@@ -5713,6 +6225,7 @@ mod tests {
             ExtrusionPath {
                 feature_kind: 0,
                 wall_index: 0,
+                filament_slot: 0,
                 is_closed: true,
                 total_length_mm: 8.0 * half_w,
                 mean_width_mm: w,
@@ -5731,6 +6244,7 @@ mod tests {
         let obstacle_ridge_l0 = ExtrusionPath {
             feature_kind: 1,
             wall_index: 1,
+            filament_slot: 0,
             is_closed: false,
             total_length_mm: 8.0,
             mean_width_mm: 0.42,
@@ -5742,6 +6256,7 @@ mod tests {
         let high_peak_l1 = ExtrusionPath {
             feature_kind: 0,
             wall_index: 0,
+            filament_slot: 0,
             is_closed: false,
             total_length_mm: 8.0,
             mean_width_mm: 0.42,
@@ -5753,6 +6268,7 @@ mod tests {
         let left_valley_l1 = ExtrusionPath {
             feature_kind: 0,
             wall_index: 0,
+            filament_slot: 0,
             is_closed: false,
             total_length_mm: 8.0,
             mean_width_mm: 0.42,
@@ -5764,6 +6280,7 @@ mod tests {
         let right_valley_l1 = ExtrusionPath {
             feature_kind: 0,
             wall_index: 0,
+            filament_slot: 0,
             is_closed: false,
             total_length_mm: 8.0,
             mean_width_mm: 0.42,
@@ -5824,6 +6341,7 @@ mod tests {
                         ExtrusionPath {
                             feature_kind: 4, // SparseInfill (higher speed/flow than OuterWall)
                             wall_index: 0,
+                            filament_slot: 0,
                             is_closed: false,
                             total_length_mm: 24.0,
                             mean_width_mm: 0.48,
@@ -5940,5 +6458,312 @@ mod tests {
             m106_values.len() >= 2,
             "Expected dynamic cooling fan to emit at least 2 distinct M106 PWM levels, got {m106_values:?}"
         );
+    }
+
+    #[test]
+    fn test_tool_change_hop_before_and_approach_after_options() {
+        let make_pt = |x: f32, y: f32, z: f32| ToolpathPoint {
+            x,
+            y,
+            z,
+            nx: 0.0,
+            ny: 0.0,
+            nz: 1.0,
+            width_mm: 0.42,
+            height_mm: 0.20,
+            tool_iso_angle_deg: 0.0,
+            uses_surface_normal: false,
+        };
+
+        // Layer 0 prints a tall crest at Z = 5.0 mm with Slot 0 (Tool 0).
+        // Layer 1 prints a low chain at Z = 1.0 mm with Slot 0 (Tool 0), then switches to Slot 1 (Tool 1)
+        // at Z = 1.2 mm. The highest so-far printed material is Z = 5.0 mm, so `h_clear` must be 5.0 + 0.40 = 5.40 mm!
+        let tall_crest_l0 = ExtrusionPath {
+            feature_kind: 0,
+            wall_index: 0,
+            filament_slot: 0,
+            is_closed: false,
+            total_length_mm: 8.0,
+            mean_width_mm: 0.42,
+            points: vec![make_pt(-4.0, 0.0, 5.0), make_pt(4.0, 0.0, 5.0)],
+        };
+        let slot0_chain_l1 = ExtrusionPath {
+            feature_kind: 0,
+            wall_index: 0,
+            filament_slot: 0,
+            is_closed: false,
+            total_length_mm: 4.0,
+            mean_width_mm: 0.42,
+            points: vec![make_pt(-6.0, -4.0, 1.0), make_pt(-2.0, -4.0, 1.0)],
+        };
+        let slot1_chain_l1 = ExtrusionPath {
+            feature_kind: 0,
+            wall_index: 0,
+            filament_slot: 1,
+            is_closed: false,
+            total_length_mm: 4.0,
+            mean_width_mm: 0.42,
+            points: vec![make_pt(2.0, 4.0, 1.2), make_pt(6.0, 4.0, 1.2)],
+        };
+
+        let raw = ObjectToolpathsResult {
+            valid: true,
+            total_path_count: 3,
+            outer_wall_count: 3,
+            inner_wall_count: 0,
+            solid_infill_count: 0,
+            sparse_infill_count: 0,
+            bridge_count: 0,
+            wave_overhang_count: 0,
+            support_count: 0,
+            support_interface_count: 0,
+            layers: vec![
+                LayerToolpaths {
+                    layer_index: 0,
+                    branch_id: 0,
+                    isovalue: 0.2,
+                    paths: vec![tall_crest_l0],
+                },
+                LayerToolpaths {
+                    layer_index: 1,
+                    branch_id: 0,
+                    isovalue: 1.0,
+                    paths: vec![slot0_chain_l1, slot1_chain_l1],
+                },
+            ],
+        };
+
+        let mut base_cfg = SlicerConfig::default();
+        base_cfg.gcode.enable_auto_brim = false;
+        base_cfg.gcode.brim_width_mm = 0.0;
+        base_cfg.gcode.wipe_length_mm = 0.0;
+        base_cfg.gcode.pre_retract_taper_mm = 0.0;
+        base_cfg.gcode.z_hop_mm = 0.40;
+        base_cfg.tools = vec![
+            crate::config::ToolConfig {
+                id: 0,
+                name: "Tool 0".to_string(),
+                ..crate::config::ToolConfig::default()
+            },
+            crate::config::ToolConfig {
+                id: 1,
+                name: "Tool 1".to_string(),
+                ..crate::config::ToolConfig::default()
+            },
+        ];
+        base_cfg.filament_slots = vec![
+            crate::config::ThreeMfFilamentSlot::default_for_slot(0, 0),
+            crate::config::ThreeMfFilamentSlot::default_for_slot(1, 1),
+        ];
+
+        let parse_g0_z = |line: &str| -> Option<(f32, f32, f32)> {
+            if !line.starts_with("G0 ") {
+                return None;
+            }
+            let mut x = None;
+            let mut y = None;
+            let mut z = None;
+            for tok in line.split_whitespace() {
+                if let Some(v) = tok.strip_prefix('X') {
+                    x = v.parse::<f32>().ok();
+                } else if let Some(v) = tok.strip_prefix('Y') {
+                    y = v.parse::<f32>().ok();
+                } else if let Some(v) = tok.strip_prefix('Z') {
+                    z = v.parse::<f32>().ok();
+                }
+            }
+            Some((x?, y?, z?))
+        };
+
+        // Case 1: Both `tool_change_hop_before = true` and `tool_change_approach_after = true`
+        {
+            let mut cfg = base_cfg.clone();
+            cfg.gcode.tool_change_hop_before = true;
+            cfg.gcode.tool_change_approach_after = true;
+            let res = plan_and_emit_gcode_for_object("TC_Both", 1, &raw, Transform::IDENTITY, &cfg);
+            let lines: Vec<&str> = res.gcode_text.lines().collect();
+            let tc_idx = lines
+                .iter()
+                .position(|l| l.starts_with("T1 ; Switch tool"))
+                .expect("Expected T1 toolchange line");
+
+            // Immediately preceding G0 before `T1` must hop to Z = 5.4000 (above the Z=5.0 printed crest)
+            let prev_g0 = lines[..tc_idx]
+                .iter()
+                .rev()
+                .find_map(|l| parse_g0_z(l))
+                .expect("Expected G0 hop before T1");
+            assert!(
+                (prev_g0.2 - 5.40).abs() < 1.0e-3,
+                "Expected pre-toolchange hop Z=5.40 (above max printed Z=5.0), got Z={:.4}",
+                prev_g0.2
+            );
+
+            // After `T1`, the first G0 must move to the approach position at the exact same height Z = 5.4000,
+            // and the second G0 must descend to the new chain's start height Z = 1.2000.
+            let post_g0s: Vec<(f32, f32, f32)> = lines[(tc_idx + 1)..]
+                .iter()
+                .take_while(|l| !l.starts_with("G1 X"))
+                .filter_map(|l| parse_g0_z(l))
+                .collect();
+            assert_eq!(
+                post_g0s.len(),
+                2,
+                "Expected 2 G0 moves (approach at h_clear + drop to chain start) after T1, got {post_g0s:?}"
+            );
+            assert!(
+                (post_g0s[0].2 - prev_g0.2).abs() < 1.0e-3,
+                "Expected approach Z ({:.4}) to match hop Z ({:.4})",
+                post_g0s[0].2,
+                prev_g0.2
+            );
+            assert!(
+                (post_g0s[1].2 - 1.20).abs() < 1.0e-3
+                    && (post_g0s[0].0 - post_g0s[1].0).abs() < 1.0e-3
+                    && (post_g0s[0].1 - post_g0s[1].1).abs() < 1.0e-3,
+                "Expected vertical descent from approach XY=({:.2},{:.2}) Z={:.2} to start XY=({:.2},{:.2}) Z={:.2}",
+                post_g0s[0].0,
+                post_g0s[0].1,
+                post_g0s[0].2,
+                post_g0s[1].0,
+                post_g0s[1].1,
+                post_g0s[1].2
+            );
+        }
+
+        // Case 2: `tool_change_hop_before = true`, `tool_change_approach_after = false`
+        {
+            let mut cfg = base_cfg.clone();
+            cfg.gcode.tool_change_hop_before = true;
+            cfg.gcode.tool_change_approach_after = false;
+            let res =
+                plan_and_emit_gcode_for_object("TC_HopOnly", 1, &raw, Transform::IDENTITY, &cfg);
+            let lines: Vec<&str> = res.gcode_text.lines().collect();
+            let tc_idx = lines
+                .iter()
+                .position(|l| l.starts_with("T1 ; Switch tool"))
+                .expect("Expected T1 toolchange line");
+
+            let prev_g0 = lines[..tc_idx]
+                .iter()
+                .rev()
+                .find_map(|l| parse_g0_z(l))
+                .expect("Expected G0 hop before T1");
+            assert!(
+                (prev_g0.2 - 5.40).abs() < 1.0e-3,
+                "Expected pre-toolchange hop Z=5.40, got Z={:.4}",
+                prev_g0.2
+            );
+
+            let post_g0s: Vec<(f32, f32, f32)> = lines[(tc_idx + 1)..]
+                .iter()
+                .take_while(|l| !l.starts_with("G1 X"))
+                .filter_map(|l| parse_g0_z(l))
+                .collect();
+            assert_eq!(
+                post_g0s.len(),
+                1,
+                "Expected 1 direct G0 travel move after T1 when approach_after is false, got {post_g0s:?}"
+            );
+            assert!(
+                (post_g0s[0].2 - 1.20).abs() < 1.0e-3,
+                "Expected post-toolchange travel directly to Z=1.20, got Z={:.4}",
+                post_g0s[0].2
+            );
+        }
+
+        // Case 3: `tool_change_hop_before = false`, `tool_change_approach_after = true`
+        {
+            let mut cfg = base_cfg.clone();
+            cfg.gcode.tool_change_hop_before = false;
+            cfg.gcode.tool_change_approach_after = true;
+            let res = plan_and_emit_gcode_for_object(
+                "TC_ApproachOnly",
+                1,
+                &raw,
+                Transform::IDENTITY,
+                &cfg,
+            );
+            let lines: Vec<&str> = res.gcode_text.lines().collect();
+            let tc_idx = lines
+                .iter()
+                .position(|l| l.starts_with("T1 ; Switch tool"))
+                .expect("Expected T1 toolchange line");
+
+            // Between the last extruding G1 of Slot 0 and `T1`, there must be NO G0 hop
+            let last_ext_before_tc = lines[..tc_idx]
+                .iter()
+                .rposition(|l| l.starts_with("G1 X"))
+                .expect("Expected extruding G1 before T1");
+            let g0_between_ext_and_tc: Vec<_> = lines[(last_ext_before_tc + 1)..tc_idx]
+                .iter()
+                .filter_map(|l| parse_g0_z(l))
+                .collect();
+            assert!(
+                g0_between_ext_and_tc.is_empty(),
+                "Expected no G0 hop between last extrusion and T1 when hop_before is false, got {g0_between_ext_and_tc:?}"
+            );
+
+            // After `T1`, there must be the approach move to Z = 5.40 followed by the drop to Z = 1.20
+            let post_g0s: Vec<(f32, f32, f32)> = lines[(tc_idx + 1)..]
+                .iter()
+                .take_while(|l| !l.starts_with("G1 X"))
+                .filter_map(|l| parse_g0_z(l))
+                .collect();
+            assert_eq!(
+                post_g0s.len(),
+                2,
+                "Expected 2 G0 moves (approach + drop) after T1 when approach_after is true, got {post_g0s:?}"
+            );
+            assert!(
+                (post_g0s[0].2 - 5.40).abs() < 1.0e-3 && (post_g0s[1].2 - 1.20).abs() < 1.0e-3,
+                "Expected post-T1 approach Z=5.40 then drop Z=1.20, got {post_g0s:?}"
+            );
+        }
+
+        // Case 4: Both `tool_change_hop_before = false` and `tool_change_approach_after = false`
+        {
+            let mut cfg = base_cfg.clone();
+            cfg.gcode.tool_change_hop_before = false;
+            cfg.gcode.tool_change_approach_after = false;
+            let res =
+                plan_and_emit_gcode_for_object("TC_Neither", 1, &raw, Transform::IDENTITY, &cfg);
+            let lines: Vec<&str> = res.gcode_text.lines().collect();
+            let tc_idx = lines
+                .iter()
+                .position(|l| l.starts_with("T1 ; Switch tool"))
+                .expect("Expected T1 toolchange line");
+
+            // No G0 hop before T1
+            let last_ext_before_tc = lines[..tc_idx]
+                .iter()
+                .rposition(|l| l.starts_with("G1 X"))
+                .expect("Expected extruding G1 before T1");
+            let g0_between_ext_and_tc: Vec<_> = lines[(last_ext_before_tc + 1)..tc_idx]
+                .iter()
+                .filter_map(|l| parse_g0_z(l))
+                .collect();
+            assert!(
+                g0_between_ext_and_tc.is_empty(),
+                "Expected no G0 hop before T1 when both are false, got {g0_between_ext_and_tc:?}"
+            );
+
+            // Exactly 1 ordinary travel move (`G0`) after `T1` directly to Z = 1.20
+            let post_g0s: Vec<(f32, f32, f32)> = lines[(tc_idx + 1)..]
+                .iter()
+                .take_while(|l| !l.starts_with("G1 X"))
+                .filter_map(|l| parse_g0_z(l))
+                .collect();
+            assert_eq!(
+                post_g0s.len(),
+                1,
+                "Expected 1 ordinary G0 travel move after T1 when both are false, got {post_g0s:?}"
+            );
+            assert!(
+                (post_g0s[0].2 - 1.20).abs() < 1.0e-3,
+                "Expected ordinary travel move to go directly to Z=1.20, got Z={:.4}",
+                post_g0s[0].2
+            );
+        }
     }
 }

@@ -1543,6 +1543,12 @@ pub struct GcodeProcessConfig {
     pub z_hop_mm: f32,
     pub ooze_relaxation_extra_prime_mm: f32,
     pub ooze_relaxation_tau_s: f32,
+    /// Estimated physical toolchange / MMU filament swap duration in seconds added per `T{id}` tool switch.
+    pub tool_change_time_s: f32,
+    /// Hop along `up_bed` (`z_nozzle`) to a clearance height above the highest so-far printed material before emitting `T{id}` toolchange.
+    pub tool_change_hop_before: bool,
+    /// After emitting `T{id}` toolchange, emit a travel move to the elevated approach position above the next chain start (same height as a hop) before descending to start extruding.
+    pub tool_change_approach_after: bool,
 
     // --- Bed Adhesion Brim & Lever-Arm / Curled-Corner Speed Governor ---
     /// Automatically generate a first-layer brim around narrow-footprint / high-lever-ratio parts
@@ -1652,6 +1658,9 @@ impl Default for GcodeProcessConfig {
             z_hop_mm: 0.40,
             ooze_relaxation_extra_prime_mm: -0.02,
             ooze_relaxation_tau_s: 1.50,
+            tool_change_time_s: 15.0,
+            tool_change_hop_before: true,
+            tool_change_approach_after: true,
             enable_auto_brim: true,
             brim_width_mm: 0.0,
             brim_gap_mm: 0.10,
@@ -1755,6 +1764,10 @@ impl GcodeProcessConfig {
         self.ooze_relaxation_extra_prime_mm =
             self.ooze_relaxation_extra_prime_mm.clamp(-0.5, 0.5);
         self.ooze_relaxation_tau_s = self.ooze_relaxation_tau_s.clamp(0.1, 30.0);
+        if !self.tool_change_time_s.is_finite() {
+            self.tool_change_time_s = 15.0;
+        }
+        self.tool_change_time_s = self.tool_change_time_s.clamp(0.0, 600.0);
         self.brim_width_mm = self.brim_width_mm.clamp(0.0, 30.0);
         self.brim_gap_mm = self.brim_gap_mm.clamp(0.0, 1.0);
         self.lever_arm_reference_ratio = self.lever_arm_reference_ratio.clamp(0.5, 15.0);
@@ -1857,6 +1870,88 @@ impl MoonrakerNetworkConfig {
     }
 }
 
+/// A colour / filament slot imported from a multi-colour `.3mf` project and its mapping to a machine tool.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThreeMfFilamentSlot {
+    /// Zero-based slot index (`0` corresponds to Extruder/Filament #1 in PrusaSlicer/OrcaSlicer).
+    pub slot_index: u32,
+    /// Human-readable display label (e.g. `"Filament #1 (PLA)"`).
+    pub name: String,
+    /// Filament material type parsed from the 3MF (e.g. `"PLA"`, `"PETG"`).
+    pub filament_type: String,
+    /// Hex color string from 3MF metadata (e.g. `"#25CC0F"`).
+    pub color_hex: String,
+    /// Display color in sRGB `[r, g, b, a]` (`0.0..=1.0`).
+    pub color_srgba: [f32; 4],
+    /// Assigned machine tool index in `SlicerConfig::tools` (`0..tools.len()`).
+    pub tool_index: usize,
+}
+
+impl Default for ThreeMfFilamentSlot {
+    fn default() -> Self {
+        Self::default_for_slot(0, 0)
+    }
+}
+
+impl ThreeMfFilamentSlot {
+    /// Constructs a default `ThreeMfFilamentSlot` for `slot_idx` (`0`-based) mapped to `tool_index`.
+    pub fn default_for_slot(slot_idx: usize, tool_index: usize) -> Self {
+        let (hex, srgba) =
+            DEFAULT_FILAMENT_SLOT_PALETTE[slot_idx % DEFAULT_FILAMENT_SLOT_PALETTE.len()];
+        Self {
+            slot_index: slot_idx as u32,
+            name: format!("Filament #{} (PLA {})", slot_idx + 1, hex),
+            filament_type: "PLA".to_string(),
+            color_hex: hex.to_string(),
+            color_srgba: srgba,
+            tool_index,
+        }
+    }
+
+    /// Parses a `#RRGGBB` or `#RRGGBBAA` hex string into sRGBA `[r, g, b, a]` in `[0.0, 1.0]`.
+    pub fn parse_hex_color(hex: &str) -> Option<[f32; 4]> {
+        let s = hex.trim().trim_start_matches('#');
+        if s.len() != 6 && s.len() != 8 {
+            return None;
+        }
+        let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+        let a = if s.len() == 8 {
+            u8::from_str_radix(&s[6..8], 16).ok()?
+        } else {
+            255
+        };
+        Some([
+            (r as f32) / 255.0,
+            (g as f32) / 255.0,
+            (b as f32) / 255.0,
+            (a as f32) / 255.0,
+        ])
+    }
+
+    /// Formats an sRGBA `[r, g, b, a]` color as `#RRGGBB`.
+    pub fn format_hex_color(rgba: [f32; 4]) -> String {
+        let r = (rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+        let g = (rgba[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+        let b = (rgba[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+        format!("#{:02X}{:02X}{:02X}", r, g, b)
+    }
+}
+
+/// Default 8-color fallback palette for 3MF filament slots when explicit hex colors are absent.
+pub const DEFAULT_FILAMENT_SLOT_PALETTE: [(&str, [f32; 4]); 8] = [
+    ("#25CC0F", [0.145, 0.800, 0.059, 1.0]),
+    ("#A958CE", [0.663, 0.345, 0.808, 1.0]),
+    ("#1E242B", [0.118, 0.141, 0.169, 1.0]),
+    ("#F5F5F2", [0.961, 0.961, 0.949, 1.0]),
+    ("#F87028", [0.973, 0.439, 0.157, 1.0]),
+    ("#2298FA", [0.133, 0.596, 0.980, 1.0]),
+    ("#F8C822", [0.973, 0.784, 0.133, 1.0]),
+    ("#F2387A", [0.949, 0.220, 0.478, 1.0]),
+];
+
 /// Top-level extensible slicer configuration stored as a Bevy resource and
 /// persisted inside `.3mf` project files under `/Metadata/manifold2_config.toml`.
 #[derive(Resource, Clone, Debug, Serialize, Deserialize)]
@@ -1871,6 +1966,8 @@ pub struct SlicerConfig {
     pub network: MoonrakerNetworkConfig,
     pub tools: Vec<ToolConfig>,
     pub active_tool_index: usize,
+    /// Multi-colour / multi-filament slots imported from a `.3mf` archive and their tool mappings.
+    pub filament_slots: Vec<ThreeMfFilamentSlot>,
     pub printer_preset_name: String,
     pub tool_preset_name: String,
     pub filament_preset_name: String,
@@ -1892,6 +1989,7 @@ impl Default for SlicerConfig {
                 ToolConfig::standard_tool(1, "T1 - 0.6mm High-Flow", 0.60, 230.0),
             ],
             active_tool_index: 0,
+            filament_slots: Vec::new(),
             printer_preset_name: "256³ CoreXY (Standard Klipper)".to_string(),
             tool_preset_name: "0.4mm Standard 5/6-Axis Conical".to_string(),
             filament_preset_name: "Generic PLA".to_string(),
@@ -1909,6 +2007,97 @@ impl SlicerConfig {
             let idx = self.active_tool_index.min(self.tools.len() - 1);
             self.tools.get(idx)
         }
+    }
+
+    /// Returns the resolved tool index into `self.tools` for a 0-based 3MF `filament_slot`
+    /// (`filament_slots[slot].tool_index` if configured, otherwise `active_tool_index`).
+    pub fn tool_index_for_filament_slot(&self, slot: u8) -> usize {
+        if self.tools.is_empty() {
+            return 0;
+        }
+        let max_idx = self.tools.len() - 1;
+        if let Some(entry) = self
+            .filament_slots
+            .iter()
+            .find(|s| s.slot_index == slot as u32)
+            .or_else(|| self.filament_slots.get(slot as usize))
+        {
+            entry.tool_index.min(max_idx)
+        } else {
+            self.active_tool_index.min(max_idx)
+        }
+    }
+
+    /// Returns the `ToolConfig` mapped to a 0-based 3MF `filament_slot`.
+    pub fn tool_for_filament_slot(&self, slot: u8) -> Option<&ToolConfig> {
+        if self.tools.is_empty() {
+            None
+        } else {
+            self.tools.get(self.tool_index_for_filament_slot(slot))
+        }
+    }
+
+    /// Returns the firmware `tool_id` (`T{id}`) mapped to a 0-based 3MF `filament_slot`.
+    pub fn tool_id_for_filament_slot(&self, slot: u8) -> u32 {
+        self.tool_for_filament_slot(slot)
+            .map(|t| t.id)
+            .unwrap_or(0)
+    }
+
+    /// Returns the display sRGB color `[r, g, b, a]` for a 0-based 3MF `filament_slot`.
+    pub fn color_srgba_for_filament_slot(&self, slot: u8) -> [f32; 4] {
+        if let Some(entry) = self
+            .filament_slots
+            .iter()
+            .find(|s| s.slot_index == slot as u32)
+            .or_else(|| self.filament_slots.get(slot as usize))
+        {
+            entry.color_srgba
+        } else {
+            DEFAULT_FILAMENT_SLOT_PALETTE[(slot as usize) % DEFAULT_FILAMENT_SLOT_PALETTE.len()].1
+        }
+    }
+
+    /// Applies a list of 3MF filament/colour slots imported from a `.3mf` archive, ensuring
+    /// `self.tools` has enough tools for a 1:1 default mapping (`Slot #k -> Tk`) by cloning
+    /// the primary tool's nozzle and clearance geometry when additional tools are needed.
+    pub fn apply_imported_filament_slots(&mut self, mut slots: Vec<ThreeMfFilamentSlot>) {
+        if slots.is_empty() {
+            return;
+        }
+        if self.tools.is_empty() {
+            self.tools.push(ToolConfig::default());
+        }
+        let template_tool = self
+            .active_tool()
+            .cloned()
+            .unwrap_or_else(ToolConfig::default);
+        while self.tools.len() < slots.len() {
+            let new_idx = self.tools.len();
+            let next_id = self
+                .tools
+                .iter()
+                .map(|t| t.id)
+                .max()
+                .map_or(0, |m| m + 1)
+                .max(new_idx as u32);
+            let mut new_tool = template_tool.clone();
+            new_tool.id = next_id;
+            if let Some(slot_info) = slots.get(new_idx) {
+                new_tool.name = format!(
+                    "T{next_id} - {:.2}mm ({} {})",
+                    new_tool.nozzle_diameter_mm, slot_info.filament_type, slot_info.color_hex
+                );
+            } else {
+                new_tool.name = format!("T{next_id} - {:.2}mm", new_tool.nozzle_diameter_mm);
+            }
+            self.tools.push(new_tool);
+        }
+        let max_tool_idx = self.tools.len().saturating_sub(1);
+        for (i, slot) in slots.iter_mut().enumerate() {
+            slot.tool_index = i.min(max_tool_idx);
+        }
+        self.filament_slots = slots;
     }
 
     /// Returns the resolved tool index into `self.tools` used for support structures
@@ -2880,6 +3069,33 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         default_value: "-0.02 mm / τ = 1.50 s",
         summary: "Adjusts unretract prime length as an exponential function of travel duration (`1 - exp(-t / τ)`).",
         details: "Short hops slightly under-prime to avoid viscoelastic swell blobs; long travels decay toward full prime as melt pressure relaxes.",
+    },
+    ParameterDoc {
+        key: "gcode.tool_change_time_s",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "Toolchange Time",
+        units: "s",
+        default_value: "15.0 s",
+        summary: "Estimated duration of each physical toolchange or MMU/AMS filament swap (`T{id}`) added to print time estimates.",
+        details: "Added to total print time and Moonraker metadata (`; estimated printing time`) every time the planner emits a `T{id}` tool switch between multi-colour 3MF filament slots or support extruders. Typical values: 3-10 s for multi-toolhead changers (Prusa XL, StealthChanger), 15-45 s for MMU / ERCF / AMS single-nozzle filament multiplexers.",
+    },
+    ParameterDoc {
+        key: "gcode.tool_change_hop_before",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "Hop Before Toolchange",
+        units: "bool",
+        default_value: "true",
+        summary: "Lifts the outgoing tool above the highest so-far printed material (`h_clear` along `up_bed`) before emitting `T{id}`.",
+        details: "Prevents the outgoing nozzle or toolchanger dock motion from dragging across already-printed non-planar crests when departing for a toolchange. Disable if your firmware toolchange macro already executes its own safe Z-hop.",
+    },
+    ParameterDoc {
+        key: "gcode.tool_change_approach_after",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "Approach Above Target After Toolchange",
+        units: "bool",
+        default_value: "true",
+        summary: "Emits a travel move to the elevated approach position directly above the next path start (at the same `h_clear` height as a toolchange hop) after `T{id}`, then descends vertically.",
+        details: "Ensures the incoming tool approaches from above the highest so-far printed material before descending to the extrusion start point. Disable if your toolchanger macro returns the new tool directly to the previous position and you prefer an ordinary travel move when both hop and approach are off.",
     },
 
     // --- Non-Newtonian Rheology, Die Swell & Transient Flow ---

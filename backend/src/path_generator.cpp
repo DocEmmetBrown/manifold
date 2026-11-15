@@ -2750,7 +2750,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     const openvdb::FloatGrid* coarseOverhangGrid,
     const std::array<float, 3>& defaultGravityDirectionBed,
     const ToolSpec* activeTool,
-    float objectMinAxialBed)
+    float objectMinAxialBed,
+    const openvdb::FloatGrid* filamentSlotGrid,
+    const openvdb::FloatGrid* coarseFilamentSlotGrid)
 {
     ObjectToolpathsResult result{};
     result.valid = false;
@@ -5409,6 +5411,243 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
                 }
 
+                // Multi-colour / multi-filament segmentation from `filamentSlotGrid`:
+                // Tag each point with its nearest-surface 0-based `filament_slot`, filter out
+                // sub-nozzle single-voxel chatter, and split multi-colour paths into contiguous
+                // single-slot `ExtrusionPath` segments.
+                if ((filamentSlotGrid != nullptr || coarseFilamentSlotGrid != nullptr) &&
+                    !layerOut.paths.empty()) {
+                    std::unique_ptr<FloatAcc> slotAccPtr;
+                    if (filamentSlotGrid != nullptr) {
+                        slotAccPtr = std::make_unique<FloatAcc>(filamentSlotGrid->getConstAccessor());
+                    }
+                    std::unique_ptr<FloatAcc> cSlotAccPtr;
+                    if (coarseFilamentSlotGrid != nullptr) {
+                        cSlotAccPtr = std::make_unique<FloatAcc>(coarseFilamentSlotGrid->getConstAccessor());
+                    }
+
+                    auto lookupSlotInGrid = [](const openvdb::FloatGrid& grid,
+                                               FloatAcc& acc,
+                                               const openvdb::Vec3d& wp,
+                                               std::uint8_t& outSlot) -> bool {
+                        const openvdb::Vec3d ip = grid.transform().worldToIndex(wp);
+                        const openvdb::Coord ijk(
+                            static_cast<openvdb::Int32>(std::llround(ip.x())),
+                            static_cast<openvdb::Int32>(std::llround(ip.y())),
+                            static_cast<openvdb::Int32>(std::llround(ip.z())));
+                        if (acc.isValueOn(ijk)) {
+                            const int s = static_cast<int>(std::lround(acc.getValue(ijk)));
+                            outSlot = static_cast<std::uint8_t>(std::clamp(s, 0, 255));
+                            return true;
+                        }
+                        double bestDist2 = std::numeric_limits<double>::max();
+                        bool found = false;
+                        for (int dz = -1; dz <= 1; ++dz) {
+                            for (int dy = -1; dy <= 1; ++dy) {
+                                for (int dx = -1; dx <= 1; ++dx) {
+                                    const openvdb::Coord nCoord(ijk.x() + dx, ijk.y() + dy, ijk.z() + dz);
+                                    if (acc.isValueOn(nCoord)) {
+                                        const double ddx = ip.x() - static_cast<double>(nCoord.x());
+                                        const double ddy = ip.y() - static_cast<double>(nCoord.y());
+                                        const double ddz = ip.z() - static_cast<double>(nCoord.z());
+                                        const double d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+                                        if (d2 < bestDist2) {
+                                            bestDist2 = d2;
+                                            const int s = static_cast<int>(std::lround(acc.getValue(nCoord)));
+                                            outSlot = static_cast<std::uint8_t>(std::clamp(s, 0, 255));
+                                            found = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return found;
+                    };
+
+                    auto sampleFilamentSlot = [&](const ToolpathPoint& pt) -> std::uint8_t {
+                        const openvdb::Vec3d wp(pt.x, pt.y, pt.z);
+                        std::uint8_t slot = 0;
+                        if (filamentSlotGrid != nullptr && slotAccPtr &&
+                            lookupSlotInGrid(*filamentSlotGrid, *slotAccPtr, wp, slot)) {
+                            return slot;
+                        }
+                        if (coarseFilamentSlotGrid != nullptr && cSlotAccPtr &&
+                            lookupSlotInGrid(*coarseFilamentSlotGrid, *cSlotAccPtr, wp, slot)) {
+                            return slot;
+                        }
+                        return 0;
+                    };
+
+                    auto lerpToolpathPt = [](const ToolpathPoint& a,
+                                             const ToolpathPoint& b,
+                                             float t) -> ToolpathPoint {
+                        ToolpathPoint m{};
+                        m.x = a.x + (b.x - a.x) * t;
+                        m.y = a.y + (b.y - a.y) * t;
+                        m.z = a.z + (b.z - a.z) * t;
+                        const Vec3f n = normalize3(
+                            {a.nx + (b.nx - a.nx) * t,
+                             a.ny + (b.ny - a.ny) * t,
+                             a.nz + (b.nz - a.nz) * t},
+                            {a.nx, a.ny, a.nz});
+                        m.nx = n.x;
+                        m.ny = n.y;
+                        m.nz = n.z;
+                        m.width_mm = a.width_mm + (b.width_mm - a.width_mm) * t;
+                        m.height_mm = a.height_mm + (b.height_mm - a.height_mm) * t;
+                        m.tool_iso_angle_deg =
+                            a.tool_iso_angle_deg + (b.tool_iso_angle_deg - a.tool_iso_angle_deg) * t;
+                        m.uses_surface_normal = (t < 0.5f) ? a.uses_surface_normal : b.uses_surface_normal;
+                        return m;
+                    };
+
+                    auto ptDist = [](const ToolpathPoint& a, const ToolpathPoint& b) -> float {
+                        const float dx = b.x - a.x;
+                        const float dy = b.y - a.y;
+                        const float dz = b.z - a.z;
+                        return std::sqrt(dx * dx + dy * dy + dz * dz);
+                    };
+
+                    const float minColorRunMm = std::max(1.20f, 2.50f * nozzleDiameterMm);
+                    rust::Vec<ExtrusionPath> segmentedPaths;
+                    segmentedPaths.reserve(layerOut.paths.size());
+
+                    for (auto& srcPath : layerOut.paths) {
+                        const std::size_t nPts = srcPath.points.size();
+                        if (nPts < 2) {
+                            srcPath.filament_slot = (nPts == 1) ? sampleFilamentSlot(srcPath.points[0]) : 0;
+                            segmentedPaths.push_back(std::move(srcPath));
+                            continue;
+                        }
+
+                        std::vector<std::uint8_t> ptSlots(nPts, 0);
+                        bool allSame = true;
+                        for (std::size_t i = 0; i < nPts; ++i) {
+                            ptSlots[i] = sampleFilamentSlot(srcPath.points[i]);
+                            if (ptSlots[i] != ptSlots[0]) {
+                                allSame = false;
+                            }
+                        }
+
+                        if (allSame) {
+                            srcPath.filament_slot = ptSlots[0];
+                            segmentedPaths.push_back(std::move(srcPath));
+                            continue;
+                        }
+
+                        std::vector<ToolpathPoint> pts(srcPath.points.begin(), srcPath.points.end());
+                        if (srcPath.is_closed && pts.size() >= 3) {
+                            if (ptDist(pts.front(), pts.back()) < 1.0e-3f) {
+                                pts.pop_back();
+                                ptSlots.pop_back();
+                            }
+                            std::size_t transitionIdx = 0;
+                            for (std::size_t i = 0; i < pts.size(); ++i) {
+                                const std::size_t prev = (i + pts.size() - 1) % pts.size();
+                                if (ptSlots[i] != ptSlots[prev]) {
+                                    transitionIdx = i;
+                                    break;
+                                }
+                            }
+                            if (transitionIdx > 0) {
+                                std::rotate(pts.begin(), pts.begin() + static_cast<std::ptrdiff_t>(transitionIdx), pts.end());
+                                std::rotate(ptSlots.begin(), ptSlots.begin() + static_cast<std::ptrdiff_t>(transitionIdx), ptSlots.end());
+                            }
+                        }
+
+                        for (int pass = 0; pass < 2; ++pass) {
+                            std::size_t runStart = 0;
+                            while (runStart < pts.size()) {
+                                std::size_t runEnd = runStart + 1;
+                                float runLen = 0.0f;
+                                while (runEnd < pts.size() && ptSlots[runEnd] == ptSlots[runStart]) {
+                                    runLen += ptDist(pts[runEnd - 1], pts[runEnd]);
+                                    ++runEnd;
+                                }
+                                if (runStart > 0 && runEnd < pts.size()) {
+                                    runLen += 0.5f * ptDist(pts[runStart - 1], pts[runStart]);
+                                    runLen += 0.5f * ptDist(pts[runEnd - 1], pts[runEnd]);
+                                }
+                                if (runLen < minColorRunMm && (runStart > 0 || runEnd < pts.size())) {
+                                    const std::uint8_t replacement =
+                                        (runStart > 0) ? ptSlots[runStart - 1] : ptSlots[runEnd];
+                                    for (std::size_t k = runStart; k < runEnd; ++k) {
+                                        ptSlots[k] = replacement;
+                                    }
+                                }
+                                runStart = runEnd;
+                            }
+                        }
+
+                        bool uniformAfterSmooth = true;
+                        for (std::size_t i = 1; i < ptSlots.size(); ++i) {
+                            if (ptSlots[i] != ptSlots[0]) {
+                                uniformAfterSmooth = false;
+                                break;
+                            }
+                        }
+                        if (uniformAfterSmooth) {
+                            srcPath.filament_slot = ptSlots[0];
+                            segmentedPaths.push_back(std::move(srcPath));
+                            continue;
+                        }
+
+                        const bool wasClosed = srcPath.is_closed;
+                        const std::size_t mPts = pts.size();
+                        std::size_t runStart = 0;
+                        while (runStart < mPts) {
+                            const std::uint8_t runSlot = ptSlots[runStart];
+                            std::size_t runEnd = runStart + 1;
+                            while (runEnd < mPts && ptSlots[runEnd] == runSlot) {
+                                ++runEnd;
+                            }
+
+                            rust::Vec<ToolpathPoint> subPts;
+                            if (runStart > 0) {
+                                subPts.push_back(lerpToolpathPt(pts[runStart - 1], pts[runStart], 0.5f));
+                            } else if (wasClosed && ptSlots.back() != runSlot) {
+                                subPts.push_back(lerpToolpathPt(pts.back(), pts.front(), 0.5f));
+                            }
+
+                            for (std::size_t k = runStart; k < runEnd; ++k) {
+                                subPts.push_back(pts[k]);
+                            }
+
+                            if (runEnd < mPts) {
+                                subPts.push_back(lerpToolpathPt(pts[runEnd - 1], pts[runEnd], 0.5f));
+                            } else if (wasClosed && ptSlots.front() != runSlot) {
+                                subPts.push_back(lerpToolpathPt(pts.back(), pts.front(), 0.5f));
+                            }
+
+                            if (subPts.size() >= 2) {
+                                float totalLen = 0.0f;
+                                float sumW = 0.0f;
+                                for (std::size_t k = 0; k < subPts.size(); ++k) {
+                                    sumW += subPts[k].width_mm;
+                                    if (k + 1 < subPts.size()) {
+                                        totalLen += ptDist(subPts[k], subPts[k + 1]);
+                                    }
+                                }
+                                if (totalLen >= std::min(0.4f, minExtrusionLengthMm)) {
+                                    ExtrusionPath subPath{};
+                                    subPath.feature_kind = srcPath.feature_kind;
+                                    subPath.filament_slot = runSlot;
+                                    subPath.wall_index = srcPath.wall_index;
+                                    subPath.is_closed = false;
+                                    subPath.total_length_mm = totalLen;
+                                    subPath.mean_width_mm = sumW / static_cast<float>(subPts.size());
+                                    subPath.points = std::move(subPts);
+                                    segmentedPaths.push_back(std::move(subPath));
+                                }
+                            }
+
+                            runStart = runEnd;
+                        }
+                    }
+
+                    layerOut.paths = std::move(segmentedPaths);
+                }
+
                 perLayerResults[layerIdx] = std::move(layerOut);
                 const std::size_t done = completedLayers.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (progressCb && (done % 4 == 0 || done == numLayers)) {
@@ -5416,6 +5655,47 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 }
             }
         });
+
+    if (filamentSlotGrid != nullptr || coarseFilamentSlotGrid != nullptr) {
+        std::uint8_t activeSlot = 0;
+        for (auto& layer : perLayerResults) {
+            if (layer.paths.size() <= 1) {
+                if (!layer.paths.empty()) {
+                    activeSlot = layer.paths.back().filament_slot;
+                }
+                continue;
+            }
+            std::vector<std::uint8_t> layerSlots;
+            for (const auto& p : layer.paths) {
+                if (std::find(layerSlots.begin(), layerSlots.end(), p.filament_slot) == layerSlots.end()) {
+                    layerSlots.push_back(p.filament_slot);
+                }
+            }
+            if (layerSlots.size() <= 1) {
+                activeSlot = layerSlots.front();
+                continue;
+            }
+            std::sort(layerSlots.begin(), layerSlots.end());
+            auto activeIt = std::find(layerSlots.begin(), layerSlots.end(), activeSlot);
+            if (activeIt != layerSlots.end() && activeIt != layerSlots.begin()) {
+                const std::uint8_t s = *activeIt;
+                layerSlots.erase(activeIt);
+                layerSlots.insert(layerSlots.begin(), s);
+            }
+
+            rust::Vec<ExtrusionPath> orderedPaths;
+            orderedPaths.reserve(layer.paths.size());
+            for (const std::uint8_t slot : layerSlots) {
+                for (const auto& p : layer.paths) {
+                    if (p.filament_slot == slot) {
+                        orderedPaths.push_back(p);
+                    }
+                }
+            }
+            layer.paths = std::move(orderedPaths);
+            activeSlot = layerSlots.back();
+        }
+    }
 
     result.valid = true;
     result.layers.reserve(perLayerResults.size());

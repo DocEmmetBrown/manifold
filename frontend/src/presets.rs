@@ -339,6 +339,9 @@ pub struct ToolPreset {
     pub z_hop_mm: f32,
     pub wipe_length_mm: f32,
     pub pre_retract_taper_mm: f32,
+    pub tool_change_time_s: f32,
+    pub tool_change_hop_before: bool,
+    pub tool_change_approach_after: bool,
 }
 
 impl Default for ToolPreset {
@@ -378,6 +381,9 @@ impl ToolPreset {
             z_hop_mm: cfg.gcode.z_hop_mm,
             wipe_length_mm: cfg.gcode.wipe_length_mm,
             pre_retract_taper_mm: cfg.gcode.pre_retract_taper_mm,
+            tool_change_time_s: cfg.gcode.tool_change_time_s,
+            tool_change_hop_before: cfg.gcode.tool_change_hop_before,
+            tool_change_approach_after: cfg.gcode.tool_change_approach_after,
         }
     }
 
@@ -412,6 +418,9 @@ impl ToolPreset {
         cfg.gcode.z_hop_mm = self.z_hop_mm;
         cfg.gcode.wipe_length_mm = self.wipe_length_mm;
         cfg.gcode.pre_retract_taper_mm = self.pre_retract_taper_mm;
+        cfg.gcode.tool_change_time_s = self.tool_change_time_s;
+        cfg.gcode.tool_change_hop_before = self.tool_change_hop_before;
+        cfg.gcode.tool_change_approach_after = self.tool_change_approach_after;
         cfg.sync_auto_voxel_size();
         cfg.gcode.sanitize();
     }
@@ -470,6 +479,9 @@ impl ToolPreset {
             && approx_eq(self.z_hop_mm, cfg.gcode.z_hop_mm)
             && approx_eq(self.wipe_length_mm, cfg.gcode.wipe_length_mm)
             && approx_eq(self.pre_retract_taper_mm, cfg.gcode.pre_retract_taper_mm)
+            && approx_eq(self.tool_change_time_s, cfg.gcode.tool_change_time_s)
+            && self.tool_change_hop_before == cfg.gcode.tool_change_hop_before
+            && self.tool_change_approach_after == cfg.gcode.tool_change_approach_after
     }
 }
 

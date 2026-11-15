@@ -11,7 +11,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::bridge::ffi::{self, RenderVertex};
-use crate::config::SlicerConfig;
+use crate::config::{SlicerConfig, ThreeMfFilamentSlot};
 use crate::io::{
     build_loaded_object_from_part, load_step_file_parts, stl, LoadedBatchReport, LoadedObjectData,
     LoadedPlateInfo,
@@ -21,6 +21,8 @@ const MANIFOLD_CONFIG_ENTRY: &str = "Metadata/manifold2_config.toml";
 const MANIFOLD_SCENE_ENTRY: &str = "Metadata/manifold2_scene.toml";
 const MODEL_SETTINGS_CONFIG_ENTRY: &str = "Metadata/model_settings.config";
 const PROJECT_SETTINGS_CONFIG_ENTRY: &str = "Metadata/project_settings.config";
+const SLIC3R_PE_CONFIG_ENTRY: &str = "Metadata/Slic3r_PE.config";
+const SLIC3R_PE_MODEL_CONFIG_ENTRY: &str = "Metadata/Slic3r_PE_model.config";
 
 /// Saved metadata for objects exported by Manifold2 so that embedded STEP B-Rep
 /// shapes inside `/Metadata/` reconnect with their exact world transforms and plate assignments upon reload.
@@ -61,13 +63,47 @@ struct ParsedConfigPlate {
     instances: Vec<(String, u32)>,
 }
 
-/// Parsed metadata from `Metadata/model_settings.config`.
+/// Parsed `<volume firstid="..." lastid="...">` extruder assignment from `Slic3r_PE_model.config`.
+#[derive(Clone, Debug)]
+struct ParsedVolumeExtruderRange {
+    first_id: usize,
+    last_id: usize,
+    /// 1-based extruder index (`0` = inherit object default).
+    extruder_one_based: u8,
+}
+
+/// Parsed metadata from `Metadata/model_settings.config` or `Metadata/Slic3r_PE_model.config`.
 #[derive(Clone, Debug, Default)]
 struct ParsedModelSettingsConfig {
     /// Human-readable object names keyed by `<object id="...">`.
     object_names: HashMap<String, String>,
+    /// 1-based extruder index assigned at `<object id="...">` or `<part id="...">` level.
+    object_extruders: HashMap<String, u8>,
+    /// Per-object `<volume firstid="..." lastid="...">` extruder assignments.
+    volume_extruders: HashMap<String, Vec<ParsedVolumeExtruderRange>>,
     /// Multi-plate definitions ordered by `plater_id`.
     plates: Vec<ParsedConfigPlate>,
+}
+
+impl ParsedModelSettingsConfig {
+    fn merge_from(&mut self, other: Self) {
+        for (k, v) in other.object_names {
+            self.object_names.entry(k).or_insert(v);
+        }
+        for (k, v) in other.object_extruders {
+            if v > 0 {
+                self.object_extruders.insert(k, v);
+            }
+        }
+        for (k, v) in other.volume_extruders {
+            if !v.is_empty() {
+                self.volume_extruders.insert(k, v);
+            }
+        }
+        if self.plates.is_empty() && !other.plates.is_empty() {
+            self.plates = other.plates;
+        }
+    }
 }
 
 /// Raw `<mesh>` parsed from a `.model` XML inside a `.3mf` archive.
@@ -75,6 +111,9 @@ struct ParsedModelSettingsConfig {
 struct ParsedXmlMesh {
     positions: Vec<f32>,
     indices: Vec<u32>,
+    /// Per-triangle 1-based MMU extruder state (`0` = unpainted / use volume or object default,
+    /// `s >= 1` = 1-based extruder `s`, corresponding to 0-based `filament_slot = s - 1`).
+    triangle_mmu_states: Vec<u8>,
 }
 
 /// `<component>` reference inside an `<object><components>` block.
@@ -144,6 +183,7 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
     let mut scene_manifest: Option<SavedSceneManifest> = None;
     let mut model_settings: Option<ParsedModelSettingsConfig> = None;
     let mut project_settings_bed_size: Option<(f32, f32)> = None;
+    let mut imported_filament_slots: Vec<ThreeMfFilamentSlot> = Vec::new();
     let mut is_manifold_project = false;
     let mut skipped_third_party_entries: Vec<String> = Vec::new();
 
@@ -194,11 +234,28 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
             continue;
         }
 
-        if lower_name.eq_ignore_ascii_case(MODEL_SETTINGS_CONFIG_ENTRY) {
+        if lower_name.eq_ignore_ascii_case(MODEL_SETTINGS_CONFIG_ENTRY)
+            || lower_name.eq_ignore_ascii_case(SLIC3R_PE_MODEL_CONFIG_ENTRY)
+        {
             let mut xml_bytes = Vec::new();
             if entry.read_to_end(&mut xml_bytes).is_ok() {
                 if let Ok(parsed_settings) = parse_model_settings_config_xml(&xml_bytes) {
-                    model_settings = Some(parsed_settings);
+                    if let Some(ref mut existing) = model_settings {
+                        existing.merge_from(parsed_settings);
+                    } else {
+                        model_settings = Some(parsed_settings);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if lower_name.eq_ignore_ascii_case(SLIC3R_PE_CONFIG_ENTRY) {
+            let mut text = String::new();
+            if entry.read_to_string(&mut text).is_ok() {
+                let parsed_slots = parse_slic3r_pe_config_filament_slots(&text);
+                if !parsed_slots.is_empty() {
+                    imported_filament_slots = parsed_slots;
                 }
             }
             continue;
@@ -208,6 +265,9 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
             let mut text = String::new();
             if entry.read_to_string(&mut text).is_ok() {
                 project_settings_bed_size = parse_project_settings_bed_size(&text);
+                if imported_filament_slots.is_empty() {
+                    imported_filament_slots = parse_project_settings_filament_slots(&text);
+                }
             }
             continue;
         }
@@ -425,7 +485,24 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                     })
                     .unwrap_or_else(|| format!("{file_stem}_obj_{}", obj.id));
                 let plate_idx = object_to_plate.get(&obj.id).copied().unwrap_or(0);
-                instantiate_3mf_mesh(&name, mesh, Mat4::IDENTITY, plate_idx, &archive_label, report);
+                let obj_extruder = model_settings
+                    .as_ref()
+                    .and_then(|ms| ms.object_extruders.get(&obj.id).copied())
+                    .unwrap_or(1);
+                let vol_ranges = model_settings
+                    .as_ref()
+                    .and_then(|ms| ms.volume_extruders.get(&obj.id).map(Vec::as_slice))
+                    .unwrap_or(&[]);
+                instantiate_3mf_mesh(
+                    &name,
+                    mesh,
+                    Mat4::IDENTITY,
+                    plate_idx,
+                    obj_extruder,
+                    vol_ranges,
+                    &archive_label,
+                    report,
+                );
             }
         }
     } else {
@@ -479,18 +556,54 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                 .unwrap_or_else(|| format!("{file_stem}_{}", idx + 1));
 
             visited.clear();
+            let root_extruder = model_settings
+                .as_ref()
+                .and_then(|ms| ms.object_extruders.get(&item.object_id).copied())
+                .unwrap_or(1);
             instantiate_3mf_object_recursive(
                 &model_files,
                 &target_model,
                 &item.object_id,
                 item.transform,
                 plate_idx,
+                root_extruder,
+                model_settings.as_ref(),
                 &default_fallback,
                 &archive_label,
                 &mut visited,
                 report,
             );
         }
+    }
+
+    // Populate `report.filament_slots` when the 3MF defines filament slots or uses multi-filament assignments
+    let mut max_used_slot: Option<usize> = None;
+    let mut distinct_slots: HashSet<u8> = HashSet::new();
+    for obj in &report.objects[objects_start_idx..] {
+        for &slot in &obj.triangle_filament_slots {
+            distinct_slots.insert(slot);
+            let s = slot as usize;
+            max_used_slot = Some(max_used_slot.map_or(s, |m| m.max(s)));
+        }
+    }
+    if !imported_filament_slots.is_empty() || distinct_slots.len() > 1 || max_used_slot.unwrap_or(0) > 0 {
+        let needed_len = max_used_slot
+            .map_or(0, |m| m + 1)
+            .max(imported_filament_slots.len());
+        while imported_filament_slots.len() < needed_len {
+            let idx = imported_filament_slots.len();
+            imported_filament_slots.push(ThreeMfFilamentSlot::default_for_slot(idx, idx));
+        }
+        if !is_manifold_project && imported_filament_slots.len() > 1 {
+            report.notices.push(format!(
+                "Imported {} 3MF filament/colour slot(s) from '{}'.",
+                imported_filament_slots.len(),
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&archive_label)
+            ));
+        }
+        report.filament_slots = imported_filament_slots;
     }
 
     // 4. For third-party 3MF archives (OrcaSlicer / Bambu Studio / PrusaSlicer), convert global
@@ -614,6 +727,8 @@ fn instantiate_3mf_object_recursive(
     object_id: &str,
     accumulated_transform: Mat4,
     plate_index: usize,
+    inherited_extruder_one_based: u8,
+    model_settings: Option<&ParsedModelSettingsConfig>,
     fallback_name: &str,
     archive_label: &str,
     visited: &mut HashSet<(String, String)>,
@@ -649,12 +764,22 @@ fn instantiate_3mf_object_recursive(
         .filter(|s| !s.is_empty())
         .unwrap_or(fallback_name);
 
+    let effective_extruder = model_settings
+        .and_then(|ms| ms.object_extruders.get(object_id).copied())
+        .filter(|&e| e > 0)
+        .unwrap_or(inherited_extruder_one_based.max(1));
+    let vol_ranges = model_settings
+        .and_then(|ms| ms.volume_extruders.get(object_id).map(Vec::as_slice))
+        .unwrap_or(&[]);
+
     if let Some(ref mesh) = xml_obj.mesh {
         instantiate_3mf_mesh(
             obj_name,
             mesh,
             accumulated_transform,
             plate_index,
+            effective_extruder,
+            vol_ranges,
             archive_label,
             report,
         );
@@ -679,6 +804,8 @@ fn instantiate_3mf_object_recursive(
             &comp.object_id,
             next_transform,
             plate_index,
+            effective_extruder,
+            model_settings,
             &child_fallback,
             archive_label,
             visited,
@@ -687,11 +814,14 @@ fn instantiate_3mf_object_recursive(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn instantiate_3mf_mesh(
     name: &str,
     mesh: &ParsedXmlMesh,
     world_transform: Mat4,
     plate_index: usize,
+    default_extruder_one_based: u8,
+    volume_ranges: &[ParsedVolumeExtruderRange],
     archive_label: &str,
     report: &mut LoadedBatchReport,
 ) {
@@ -719,8 +849,82 @@ fn instantiate_3mf_mesh(
     let part_info = ffi::register_triangle_mesh(name, &transformed_positions, &mesh.indices);
     if let Some(mut obj) = build_loaded_object_from_part(part_info, archive_label) {
         obj.plate_index = plate_index;
+
+        let num_tris = mesh.indices.len() / 3;
+        let base_slot = default_extruder_one_based.saturating_sub(1);
+        let has_mmu_paint = mesh.triangle_mmu_states.iter().any(|&s| s > 0);
+        let has_volume_extruder = volume_ranges.iter().any(|r| r.extruder_one_based > 0);
+
+        if has_mmu_paint || has_volume_extruder || base_slot > 0 {
+            let mut tri_slots = vec![base_slot; num_tris];
+            for range in volume_ranges {
+                if range.extruder_one_based > 0 && range.first_id < num_tris {
+                    let v_slot = range.extruder_one_based - 1;
+                    let end_excl = (range.last_id + 1).min(num_tris);
+                    for s in &mut tri_slots[range.first_id..end_excl] {
+                        *s = v_slot;
+                    }
+                }
+            }
+            for (t_idx, &mmu_state) in mesh.triangle_mmu_states.iter().enumerate().take(num_tris) {
+                if mmu_state > 0 {
+                    tri_slots[t_idx] = mmu_state - 1;
+                }
+            }
+
+            ffi::set_object_triangle_filament_slots(obj.object_id, &tri_slots);
+            obj.vertex_filament_slots = compute_vertex_filament_slots_from_triangles(
+                obj.vertices.len(),
+                &obj.indices,
+                &tri_slots,
+                base_slot,
+            );
+            obj.triangle_filament_slots = tri_slots;
+        }
+
         report.objects.push(obj);
     }
+}
+
+/// Computes a per-vertex filament slot index from per-triangle filament slots by selecting
+/// each vertex's dominant incident triangle slot.
+pub fn compute_vertex_filament_slots_from_triangles(
+    num_vertices: usize,
+    indices: &[u32],
+    triangle_slots: &[u8],
+    default_slot: u8,
+) -> Vec<u8> {
+    if num_vertices == 0 || triangle_slots.is_empty() {
+        return Vec::new();
+    }
+    let mut counts = vec![[0u16; 8]; num_vertices];
+    let mut overflow_slot = vec![default_slot; num_vertices];
+    for (t_idx, tri) in indices.chunks_exact(3).enumerate() {
+        let slot = triangle_slots.get(t_idx).copied().unwrap_or(default_slot);
+        for &v_u32 in tri {
+            let v = v_u32 as usize;
+            if v < num_vertices {
+                if (slot as usize) < 8 {
+                    counts[v][slot as usize] = counts[v][slot as usize].saturating_add(1);
+                } else {
+                    overflow_slot[v] = slot;
+                }
+            }
+        }
+    }
+    let mut out = vec![default_slot; num_vertices];
+    for v in 0..num_vertices {
+        let mut best_s = overflow_slot[v];
+        let mut best_c = 0u16;
+        for (s, &c) in counts[v].iter().enumerate() {
+            if c > best_c {
+                best_c = c;
+                best_s = s as u8;
+            }
+        }
+        out[v] = best_s;
+    }
+    out
 }
 
 fn load_embedded_step_bytes(
@@ -1088,18 +1292,153 @@ fn parse_triangle_element(e: &quick_xml::events::BytesStart<'_>, mesh: &mut Pars
     let mut v1 = 0_u32;
     let mut v2 = 0_u32;
     let mut v3 = 0_u32;
+    let mut mmu_seg_bytes: Option<Vec<u8>> = None;
+    let mut pid_state = 0_u8;
     for attr in e.attributes().flatten() {
         let val_str = std::str::from_utf8(&attr.value).unwrap_or("0");
         match local_tag_name(attr.key.as_ref()) {
             b"v1" => v1 = val_str.parse().unwrap_or(0),
             b"v2" => v2 = val_str.parse().unwrap_or(0),
             b"v3" => v3 = val_str.parse().unwrap_or(0),
+            b"mmu_segmentation" | b"paint_color" => {
+                let trimmed = val_str.trim().as_bytes();
+                if !trimmed.is_empty() {
+                    mmu_seg_bytes = Some(trimmed.to_vec());
+                }
+            }
+            b"p1" | b"pid" => {
+                if let Ok(idx) = val_str.parse::<u8>() {
+                    pid_state = idx.saturating_add(1);
+                }
+            }
             _ => {}
         }
     }
-    mesh.indices.push(v1);
-    mesh.indices.push(v2);
-    mesh.indices.push(v3);
+
+    if let Some(ref hex_bytes) = mmu_seg_bytes {
+        let mut cursor = hex_bytes.len();
+        emit_mmu_segmented_triangle(mesh, [v1, v2, v3], hex_bytes, &mut cursor, 0);
+    } else {
+        mesh.indices.push(v1);
+        mesh.indices.push(v2);
+        mesh.indices.push(v3);
+        mesh.triangle_mmu_states.push(pid_state);
+    }
+}
+
+fn read_next_mmu_nibble(hex_bytes: &[u8], cursor: &mut usize) -> u8 {
+    while *cursor > 0 {
+        *cursor -= 1;
+        let b = hex_bytes[*cursor];
+        let val = match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        };
+        if let Some(v) = val {
+            return v;
+        }
+    }
+    0
+}
+
+fn add_midpoint_vertex(mesh: &mut ParsedXmlMesh, va: u32, vb: u32) -> u32 {
+    let num_verts = mesh.positions.len() / 3;
+    let ia = (va as usize).min(num_verts.saturating_sub(1)) * 3;
+    let ib = (vb as usize).min(num_verts.saturating_sub(1)) * 3;
+    let mx = 0.5 * (mesh.positions[ia] + mesh.positions[ib]);
+    let my = 0.5 * (mesh.positions[ia + 1] + mesh.positions[ib + 1]);
+    let mz = 0.5 * (mesh.positions[ia + 2] + mesh.positions[ib + 2]);
+    let idx = num_verts as u32;
+    mesh.positions.push(mx);
+    mesh.positions.push(my);
+    mesh.positions.push(mz);
+    idx
+}
+
+/// Decodes a PrusaSlicer / Bambu Studio / OrcaSlicer `slic3rpe:mmu_segmentation` (`paint_color`)
+/// hex nibble stream (read right-to-left) for triangle `v = [v0, v1, v2]`.
+/// For unsplit leaf triangles (`split_sides == 0`), emits `(v0, v1, v2)` directly with zero overhead.
+/// For subdivided painted triangles (`split_sides in 1..=3`), recursively splits edges up to depth 4.
+fn emit_mmu_segmented_triangle(
+    mesh: &mut ParsedXmlMesh,
+    v: [u32; 3],
+    hex_bytes: &[u8],
+    cursor: &mut usize,
+    depth: u8,
+) -> u8 {
+    let code = read_next_mmu_nibble(hex_bytes, cursor);
+    let split_sides = code & 0b11;
+    let state_or_side = code >> 2;
+
+    if split_sides == 0 {
+        let state = if state_or_side == 3 {
+            read_next_mmu_nibble(hex_bytes, cursor).saturating_add(3)
+        } else {
+            state_or_side
+        };
+        if depth <= 4 {
+            mesh.indices.push(v[0]);
+            mesh.indices.push(v[1]);
+            mesh.indices.push(v[2]);
+            mesh.triangle_mmu_states.push(state);
+        }
+        return state;
+    }
+
+    let s = (state_or_side as usize) % 3;
+    let i0 = s;
+    let i1 = (s + 1) % 3;
+    let i2 = (s + 2) % 3;
+
+    if depth >= 4 {
+        // Consume child subtree without allocating further sub-triangles, then emit parent with majority state
+        let mut child_states = [0u8; 4];
+        let num_children = (split_sides as usize) + 1;
+        for c in 0..num_children {
+            child_states[c] = emit_mmu_segmented_triangle(mesh, v, hex_bytes, cursor, depth + 1);
+        }
+        let chosen = child_states[..num_children]
+            .iter()
+            .copied()
+            .find(|&st| st > 0)
+            .unwrap_or(child_states[0]);
+        if depth == 4 {
+            mesh.indices.push(v[0]);
+            mesh.indices.push(v[1]);
+            mesh.indices.push(v[2]);
+            mesh.triangle_mmu_states.push(chosen);
+        }
+        return chosen;
+    }
+
+    match split_sides {
+        1 => {
+            let m = add_midpoint_vertex(mesh, v[i0], v[i1]);
+            let s0 = emit_mmu_segmented_triangle(mesh, [v[i2], v[i0], m], hex_bytes, cursor, depth + 1);
+            let s1 = emit_mmu_segmented_triangle(mesh, [v[i1], v[i2], m], hex_bytes, cursor, depth + 1);
+            if s0 > 0 { s0 } else { s1 }
+        }
+        2 => {
+            let m1 = add_midpoint_vertex(mesh, v[i1], v[i2]);
+            let m2 = add_midpoint_vertex(mesh, v[i2], v[i0]);
+            let s0 = emit_mmu_segmented_triangle(mesh, [v[i2], m2, m1], hex_bytes, cursor, depth + 1);
+            let s1 = emit_mmu_segmented_triangle(mesh, [v[i0], v[i1], m1], hex_bytes, cursor, depth + 1);
+            let s2 = emit_mmu_segmented_triangle(mesh, [m1, m2, v[i0]], hex_bytes, cursor, depth + 1);
+            if s0 > 0 { s0 } else if s1 > 0 { s1 } else { s2 }
+        }
+        _ => {
+            let m0 = add_midpoint_vertex(mesh, v[0], v[1]);
+            let m1 = add_midpoint_vertex(mesh, v[1], v[2]);
+            let m2 = add_midpoint_vertex(mesh, v[2], v[0]);
+            let s0 = emit_mmu_segmented_triangle(mesh, [v[0], m0, m2], hex_bytes, cursor, depth + 1);
+            let s1 = emit_mmu_segmented_triangle(mesh, [m0, v[1], m1], hex_bytes, cursor, depth + 1);
+            let s2 = emit_mmu_segmented_triangle(mesh, [m1, v[2], m2], hex_bytes, cursor, depth + 1);
+            let s3 = emit_mmu_segmented_triangle(mesh, [m0, m1, m2], hex_bytes, cursor, depth + 1);
+            if s0 > 0 { s0 } else if s1 > 0 { s1 } else if s2 > 0 { s2 } else { s3 }
+        }
+    }
 }
 
 fn parse_component_element(e: &quick_xml::events::BytesStart<'_>) -> Option<ParsedComponentRef> {
@@ -1200,8 +1539,9 @@ fn escape_xml_attr(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Parses `Metadata/model_settings.config` (OrcaSlicer / Bambu Studio / PrusaSlicer XML)
-/// to extract `<object id="...">` names and `<plate>` (`plater_id`, `plater_name`, `<model_instance>`) assignments.
+/// Parses `Metadata/model_settings.config` or `Metadata/Slic3r_PE_model.config`
+/// (OrcaSlicer / Bambu Studio / PrusaSlicer XML) to extract `<object id="...">` names,
+/// per-object/part/volume `extruder` assignments, and `<plate>` assignments.
 fn parse_model_settings_config_xml(xml_bytes: &[u8]) -> Result<ParsedModelSettingsConfig, String> {
     let mut reader = Reader::from_reader(xml_bytes);
     reader.config_mut().trim_text(true);
@@ -1209,7 +1549,8 @@ fn parse_model_settings_config_xml(xml_bytes: &[u8]) -> Result<ParsedModelSettin
     let mut buf = Vec::new();
     let mut result = ParsedModelSettingsConfig::default();
     let mut current_object_id: Option<String> = None;
-    let mut in_part = false;
+    let mut current_part_id: Option<String> = None;
+    let mut current_volume_range: Option<ParsedVolumeExtruderRange> = None;
     let mut current_plate: Option<ParsedConfigPlate> = None;
     let mut current_instance: Option<(Option<String>, Option<u32>)> = None;
 
@@ -1226,10 +1567,34 @@ fn parse_model_settings_config_xml(xml_bytes: &[u8]) -> Result<ParsedModelSettin
                                     Some(String::from_utf8_lossy(&attr.value).into_owned());
                             }
                         }
-                        in_part = false;
+                        current_part_id = None;
+                        current_volume_range = None;
                     }
                     b"part" => {
-                        in_part = true;
+                        let mut part_id = None;
+                        for attr in e.attributes().flatten() {
+                            if local_tag_name(attr.key.as_ref()) == b"id" {
+                                part_id = Some(String::from_utf8_lossy(&attr.value).into_owned());
+                            }
+                        }
+                        current_part_id = part_id.or_else(|| Some(String::new()));
+                    }
+                    b"volume" => {
+                        let mut first_id = 0usize;
+                        let mut last_id = 0usize;
+                        for attr in e.attributes().flatten() {
+                            let val_str = std::str::from_utf8(&attr.value).unwrap_or("0");
+                            match local_tag_name(attr.key.as_ref()) {
+                                b"firstid" => first_id = val_str.parse().unwrap_or(0),
+                                b"lastid" => last_id = val_str.parse().unwrap_or(0),
+                                _ => {}
+                            }
+                        }
+                        current_volume_range = Some(ParsedVolumeExtruderRange {
+                            first_id,
+                            last_id,
+                            extruder_one_based: 0,
+                        });
                     }
                     b"plate" => {
                         current_plate = Some(ParsedConfigPlate::default());
@@ -1241,10 +1606,11 @@ fn parse_model_settings_config_xml(xml_bytes: &[u8]) -> Result<ParsedModelSettin
                         handle_model_settings_metadata(
                             e,
                             &current_object_id,
-                            in_part,
+                            &current_part_id,
+                            &mut current_volume_range,
                             &mut current_plate,
                             &mut current_instance,
-                            &mut result.object_names,
+                            &mut result,
                         );
                     }
                     _ => {}
@@ -1257,10 +1623,11 @@ fn parse_model_settings_config_xml(xml_bytes: &[u8]) -> Result<ParsedModelSettin
                     handle_model_settings_metadata(
                         e,
                         &current_object_id,
-                        in_part,
+                        &current_part_id,
+                        &mut current_volume_range,
                         &mut current_plate,
                         &mut current_instance,
-                        &mut result.object_names,
+                        &mut result,
                     );
                 }
             }
@@ -1270,10 +1637,24 @@ fn parse_model_settings_config_xml(xml_bytes: &[u8]) -> Result<ParsedModelSettin
                 match local {
                     b"object" => {
                         current_object_id = None;
-                        in_part = false;
+                        current_part_id = None;
+                        current_volume_range = None;
                     }
                     b"part" => {
-                        in_part = false;
+                        current_part_id = None;
+                    }
+                    b"volume" => {
+                        if let (Some(ref obj_id), Some(vol_range)) =
+                            (&current_object_id, current_volume_range.take())
+                        {
+                            if vol_range.extruder_one_based > 0 {
+                                result
+                                    .volume_extruders
+                                    .entry(obj_id.clone())
+                                    .or_default()
+                                    .push(vol_range);
+                            }
+                        }
                     }
                     b"model_instance" => {
                         if let (Some(ref mut plate), Some((Some(obj_id), inst_opt))) =
@@ -1315,10 +1696,11 @@ fn parse_model_settings_config_xml(xml_bytes: &[u8]) -> Result<ParsedModelSettin
 fn handle_model_settings_metadata(
     e: &quick_xml::events::BytesStart<'_>,
     current_object_id: &Option<String>,
-    in_part: bool,
+    current_part_id: &Option<String>,
+    current_volume_range: &mut Option<ParsedVolumeExtruderRange>,
     current_plate: &mut Option<ParsedConfigPlate>,
     current_instance: &mut Option<(Option<String>, Option<u32>)>,
-    object_names: &mut HashMap<String, String>,
+    result: &mut ParsedModelSettingsConfig,
 ) {
     let mut key = String::new();
     let mut value = String::new();
@@ -1348,13 +1730,136 @@ fn handle_model_settings_metadata(
             }
             _ => {}
         }
+    } else if let Some(ref mut vol_range) = current_volume_range {
+        if key == "extruder" {
+            if let Ok(ext) = value.trim().parse::<u8>() {
+                vol_range.extruder_one_based = ext;
+            }
+        } else if key == "name" && !value.trim().is_empty() {
+            if let Some(ref obj_id) = current_object_id {
+                result.object_names.entry(obj_id.clone()).or_insert(value);
+            }
+        }
     } else if let Some(ref obj_id) = current_object_id {
+        let in_part = current_part_id.is_some();
         if key == "name" && !value.trim().is_empty() {
-            if !in_part || !object_names.contains_key(obj_id) {
-                object_names.insert(obj_id.clone(), value);
+            if !in_part || !result.object_names.contains_key(obj_id) {
+                result.object_names.insert(obj_id.clone(), value);
+            }
+        } else if key == "extruder" {
+            if let Ok(ext) = value.trim().parse::<u8>() {
+                if ext > 0 {
+                    if let Some(ref part_id) = current_part_id {
+                        if !part_id.is_empty() {
+                            result.object_extruders.insert(part_id.clone(), ext);
+                        }
+                        result.object_extruders.entry(obj_id.clone()).or_insert(ext);
+                    } else {
+                        result.object_extruders.insert(obj_id.clone(), ext);
+                    }
+                }
             }
         }
     }
+}
+
+/// Parses `Metadata/Slic3r_PE.config` (PrusaSlicer INI-style key-value config) to extract
+/// `extruder_colour`, `filament_colour`, and `filament_type` definitions into `Vec<ThreeMfFilamentSlot>`.
+fn parse_slic3r_pe_config_filament_slots(text: &str) -> Vec<ThreeMfFilamentSlot> {
+    let mut extruder_colours: Vec<String> = Vec::new();
+    let mut filament_colours: Vec<String> = Vec::new();
+    let mut filament_types: Vec<String> = Vec::new();
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim().trim_start_matches(';').trim();
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = val.trim();
+        match key {
+            "extruder_colour" => {
+                extruder_colours = val.split(';').map(|s| s.trim().to_string()).collect();
+            }
+            "filament_colour" => {
+                filament_colours = val.split(';').map(|s| s.trim().to_string()).collect();
+            }
+            "filament_type" => {
+                filament_types = val.split(';').map(|s| s.trim().to_string()).collect();
+            }
+            _ => {}
+        }
+    }
+
+    build_filament_slots_from_lists(&extruder_colours, &filament_colours, &filament_types)
+}
+
+/// Parses `"filament_colour"` and `"filament_type"` arrays from `Metadata/project_settings.config`
+/// (OrcaSlicer / Bambu Studio JSON config).
+fn parse_project_settings_filament_slots(json_text: &str) -> Vec<ThreeMfFilamentSlot> {
+    let filament_colours = extract_json_string_array(json_text, "\"filament_colour\"");
+    let extruder_colours = extract_json_string_array(json_text, "\"extruder_colour\"");
+    let filament_types = extract_json_string_array(json_text, "\"filament_type\"");
+    build_filament_slots_from_lists(&extruder_colours, &filament_colours, &filament_types)
+}
+
+fn extract_json_string_array(json_text: &str, key_quoted: &str) -> Vec<String> {
+    let Some(key_idx) = json_text.find(key_quoted) else {
+        return Vec::new();
+    };
+    let after_key = &json_text[key_idx + key_quoted.len()..];
+    let Some(open_bracket) = after_key.find('[') else {
+        return Vec::new();
+    };
+    let after_open = &after_key[open_bracket + 1..];
+    let Some(close_bracket) = after_open.find(']') else {
+        return Vec::new();
+    };
+    let array_body = &after_open[..close_bracket];
+    array_body
+        .split(',')
+        .map(|tok| tok.trim().trim_matches('"').trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn build_filament_slots_from_lists(
+    extruder_colours: &[String],
+    filament_colours: &[String],
+    filament_types: &[String],
+) -> Vec<ThreeMfFilamentSlot> {
+    let count = extruder_colours
+        .len()
+        .max(filament_colours.len())
+        .max(filament_types.len());
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut slots = Vec::with_capacity(count);
+    for idx in 0..count {
+        let mut slot = ThreeMfFilamentSlot::default_for_slot(idx, idx);
+        let hex_candidate = extruder_colours
+            .get(idx)
+            .filter(|s| !s.is_empty())
+            .or_else(|| filament_colours.get(idx).filter(|s| !s.is_empty()));
+        if let Some(hex) = hex_candidate {
+            if let Some(rgba) = ThreeMfFilamentSlot::parse_hex_color(hex) {
+                slot.color_srgba = rgba;
+                slot.color_hex = ThreeMfFilamentSlot::format_hex_color(rgba);
+            }
+        }
+        if let Some(ftype) = filament_types.get(idx).filter(|s| !s.is_empty()) {
+            slot.filament_type = ftype.clone();
+        }
+        slot.name = format!(
+            "Filament {} ({} {})",
+            idx + 1,
+            slot.filament_type,
+            slot.color_hex
+        );
+        slots.push(slot);
+    }
+    slots
 }
 
 /// Extracts `(width_x, depth_y)` in mm from `"printable_area"` inside `Metadata/project_settings.config`
@@ -1571,6 +2076,52 @@ mod tests {
             "Plate 3 object should be centered near (0, 0), got {:?}",
             report.objects[2].initial_translation
         );
+
+        for obj in &report.objects {
+            let _ = ffi::remove_cad_object(obj.object_id);
+        }
+    }
+
+    #[test]
+    fn test_import_prusa_multicolor_3mf_lizard() {
+        let sample_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../Test Objects/kogi3d_colorful_lizard_prusa.3mf");
+        if !sample_path.exists() {
+            return;
+        }
+
+        let mut report = LoadedBatchReport::default();
+        load_3mf_archive(&sample_path, &mut report);
+
+        assert!(
+            report.errors.is_empty(),
+            "Expected no errors importing kogi3d_colorful_lizard_prusa.3mf, got: {:?}",
+            report.errors
+        );
+        assert_eq!(report.filament_slots.len(), 4, "Expected 4 filament slots");
+        assert_eq!(report.filament_slots[0].color_hex, "#25CC0F");
+        assert_eq!(report.filament_slots[1].color_hex, "#A958CE");
+        assert_eq!(report.filament_slots[2].color_hex, "#000000");
+        assert_eq!(report.filament_slots[3].color_hex, "#F5F5F2");
+
+        assert_eq!(report.objects.len(), 1);
+        let obj = &report.objects[0];
+        assert_eq!(obj.name, "KOGI3D_lizard_purple");
+        assert_eq!(obj.triangle_filament_slots.len(), 1_003_422);
+        assert_eq!(obj.vertex_filament_slots.len(), obj.vertices.len());
+
+        let mut counts = [0usize; 4];
+        for &slot in &obj.triangle_filament_slots {
+            assert!((slot as usize) < 4);
+            counts[slot as usize] += 1;
+        }
+        assert_eq!(counts[0], 80_526);
+        assert_eq!(counts[1], 231_755);
+        assert_eq!(counts[2], 369_889);
+        assert_eq!(counts[3], 321_252);
+
+        let backend_slots = ffi::get_object_triangle_filament_slots(obj.object_id);
+        assert_eq!(backend_slots.len(), 1_003_422);
 
         for obj in &report.objects {
             let _ = ffi::remove_cad_object(obj.object_id);
