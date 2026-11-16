@@ -1328,6 +1328,17 @@ pub fn execute_headless_slice(opts: &SliceCommandOptions) -> Result<HeadlessSlic
     // Start from restored `.3mf` project config (if any), then layer CLI profiles/presets/overrides on top
     let mut config = report.restored_config.unwrap_or_default();
     opts.profile_spec.apply_onto(&mut config, &lib)?;
+    if config.slicing.color_mixing.enabled && config.tools.len() < 2 {
+        config.apply_optical_palette_to_tools(&crate::color_optics::bambu_pla_cmykw_palette());
+        if !opts.quiet {
+            eprintln!(
+                "[Manifold CLI] Optical colour mixing enabled with single default tool; auto-configured 5-tool PLA CMYKW palette (T0..T4)."
+            );
+        }
+    }
+    if !report.filament_slots.is_empty() && config.filament_slots.is_empty() {
+        config.apply_imported_filament_slots(report.filament_slots.clone());
+    }
     sync_config_to_backend(&config);
 
     let plate_names: Vec<String> = if report.plates.is_empty() {
@@ -1665,13 +1676,25 @@ fn slice_single_loaded_object(
             obj.name
         );
     }
-    let toolpaths = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
-    if toolpaths.layers.is_empty() {
+    let raw_toolpaths = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+    if raw_toolpaths.layers.is_empty() {
         return Err(format!(
             "No non-planar toolpath layers were generated for '{}'",
             obj.name
         ));
     }
+    let toolpaths = if config.slicing.color_mixing.enabled && config.tools.len() >= 2 {
+        if !quiet {
+            eprintln!(
+                "  -> Solving Kubelka-Munk optical filament approximation across {} tools ({})...",
+                config.tools.len(),
+                config.slicing.color_mixing.lighting_mode.label()
+            );
+        }
+        crate::field_vis::build_mixed_toolpaths_for_object(obj.object_id, &raw_toolpaths, config)
+    } else {
+        raw_toolpaths
+    };
 
     if !quiet {
         eprintln!(

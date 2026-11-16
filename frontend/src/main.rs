@@ -2,6 +2,7 @@ pub mod arrange;
 pub mod bridge;
 pub mod calibration;
 pub mod cli;
+pub mod color_optics;
 pub mod config;
 pub mod field_vis;
 pub mod gcode;

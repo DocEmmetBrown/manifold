@@ -385,12 +385,14 @@ pub struct FieldVisualizationState {
     pub show_z_hops: bool,
     pub show_toolpath_centerlines: bool,
     pub toolpath_color_mode: ToolpathColorMode,
+    pub cached_unmixed_toolpaths: Option<ObjectToolpathsResult>,
     pub cached_toolpaths: Option<ObjectToolpathsResult>,
     pub cached_planned_gcode: Option<crate::gcode::PlannedGcodeResult>,
     pub toolpaths_entity: Option<Entity>,
     pub toolpaths_mesh_handle: Option<Handle<Mesh>>,
     pub toolpaths_mat_handle: Option<Handle<StandardMaterial>>,
     pub dirty_toolpaths: bool,
+    pub dirty_color_mixing: bool,
     pub dirty_planned_gcode: bool,
     pub dirty_toolpaths_mesh: bool,
 
@@ -487,12 +489,14 @@ impl Default for FieldVisualizationState {
             show_z_hops: false,
             show_toolpath_centerlines: false,
             toolpath_color_mode: ToolpathColorMode::ByFeatureType,
+            cached_unmixed_toolpaths: None,
             cached_toolpaths: None,
             cached_planned_gcode: None,
             toolpaths_entity: None,
             toolpaths_mesh_handle: None,
             toolpaths_mat_handle: None,
             dirty_toolpaths: true,
+            dirty_color_mixing: false,
             dirty_planned_gcode: true,
             dirty_toolpaths_mesh: true,
             show_slice_plane: false,
@@ -523,6 +527,7 @@ impl FieldVisualizationState {
     pub fn mark_all_dirty(&mut self) {
         self.cached_stats = None;
         self.cached_selected_layers = None;
+        self.cached_unmixed_toolpaths = None;
         self.cached_toolpaths = None;
         self.cached_planned_gcode = None;
         self.layer_move_scrub_limit = None;
@@ -530,6 +535,7 @@ impl FieldVisualizationState {
         self.dirty_selected_layers = true;
         self.dirty_selected_layers_mesh = true;
         self.dirty_toolpaths = true;
+        self.dirty_color_mixing = false;
         self.dirty_planned_gcode = true;
         self.dirty_toolpaths_mesh = true;
         self.dirty_slice = true;
@@ -687,11 +693,15 @@ impl FieldVisualizationState {
                     self.selected_layer_max_idx = res.layers.len() - 1;
                 }
                 self.layer_move_scrub_limit = None;
+                self.cached_unmixed_toolpaths = Some(res.clone());
                 self.cached_toolpaths = Some(res);
+                self.dirty_color_mixing = true;
             } else {
                 self.layer_move_scrub_limit = None;
+                self.cached_unmixed_toolpaths = None;
                 self.cached_toolpaths = None;
                 self.cached_planned_gcode = None;
+                self.dirty_color_mixing = false;
             }
             self.dirty_planned_gcode = true;
             self.dirty_toolpaths_mesh = true;
@@ -714,6 +724,35 @@ impl FieldVisualizationState {
             self.cached_stats = Some(stats);
         }
     }
+}
+
+/// Applies Kubelka-Munk optical filament mixing (`config.slicing.color_mixing`) to `raw_toolpaths`
+/// for `object_id` when enabled and at least 2 extrusion tools are configured, or returns a clone
+/// of `raw_toolpaths`.
+pub fn build_mixed_toolpaths_for_object(
+    object_id: u64,
+    raw_toolpaths: &ObjectToolpathsResult,
+    config: &SlicerConfig,
+) -> ObjectToolpathsResult {
+    if !raw_toolpaths.valid || !config.slicing.color_mixing.enabled || config.tools.len() < 2 {
+        return raw_toolpaths.clone();
+    }
+    let tool_optics = config.tool_optical_inputs();
+    let slot_colors = config.imported_slot_colors_srgba();
+    let support_tool = if config.slicing.enable_support_generation {
+        Some(config.support_tool_index_resolved())
+    } else {
+        None
+    };
+    crate::color_optics::apply_optical_color_mixing_to_toolpaths(
+        raw_toolpaths,
+        &config.slicing.color_mixing,
+        &tool_optics,
+        &slot_colors,
+        config.slicing.layer_height.target_mm,
+        support_tool,
+        |flat_xyz| ffi::sample_object_surface_optics(object_id, flat_xyz),
+    )
 }
 
 /// Synchronizes available OpenVDB scalar fields, updates 3D isosurfaces (`volumeToMesh`)
@@ -793,6 +832,7 @@ pub fn sync_field_visualization_system(
                         default_cad_vertex_colors(
                             prev_obj.vertices.len(),
                             &prev_obj.vertex_filament_slots,
+                            &prev_obj.vertex_colors_rgba,
                             &config,
                         ),
                     );
@@ -803,6 +843,7 @@ pub fn sync_field_visualization_system(
         vis_state.available_fields.clear();
         vis_state.cached_stats = None;
         vis_state.cached_selected_layers = None;
+        vis_state.cached_unmixed_toolpaths = None;
         vis_state.cached_toolpaths = None;
         vis_state.cached_planned_gcode = None;
         vis_state.layer_move_scrub_limit = None;
@@ -811,6 +852,7 @@ pub fn sync_field_visualization_system(
         vis_state.dirty_selected_layers = true;
         vis_state.dirty_selected_layers_mesh = true;
         vis_state.dirty_toolpaths = true;
+        vis_state.dirty_color_mixing = false;
         vis_state.dirty_planned_gcode = true;
         vis_state.dirty_toolpaths_mesh = true;
         vis_state.dirty_slice = true;
@@ -997,11 +1039,13 @@ pub fn sync_field_visualization_system(
                 &solved_axes,
             );
         if vis_state.surface_color_mode == ObjectSurfaceColorMode::DefaultCad
-            && !scene_obj.vertex_filament_slots.is_empty()
+            && (!scene_obj.vertex_filament_slots.is_empty()
+                || !scene_obj.vertex_colors_rgba.is_empty())
         {
             colors = default_cad_vertex_colors(
                 scene_obj.vertices.len(),
                 &scene_obj.vertex_filament_slots,
+                &scene_obj.vertex_colors_rgba,
                 &config,
             );
         }
@@ -1384,6 +1428,20 @@ pub fn sync_field_visualization_system(
                     }
                 }
             }
+        }
+    }
+
+    // 2c-ii. Apply Kubelka-Munk optical filament mixing across layers & short extrusions when dirty
+    if vis_state.cached_unmixed_toolpaths.is_some()
+        && (vis_state.dirty_color_mixing || vis_state.cached_toolpaths.is_none())
+        && !vis_state.ui_pointer_down
+    {
+        vis_state.dirty_color_mixing = false;
+        if let Some(ref raw_tp) = vis_state.cached_unmixed_toolpaths {
+            let mixed = build_mixed_toolpaths_for_object(obj_id, raw_tp, &config);
+            vis_state.cached_toolpaths = Some(mixed);
+            vis_state.dirty_planned_gcode = true;
+            vis_state.dirty_toolpaths_mesh = true;
         }
     }
 
@@ -2659,17 +2717,30 @@ pub const BRANCH_PALETTE: [[f32; 3]; 8] = [
 ];
 
 /// Returns per-vertex Linear RGBA colors for a CAD object in `DefaultCad` surface color mode:
-/// uses the 3MF painted filament slot palette if `vertex_filament_slots` is non-empty, or
-/// uniform white (`[1.0, 1.0, 1.0, 1.0]`) so `StandardMaterial.base_color` shows through.
+/// uses the 3MF painted filament slot palette if `vertex_filament_slots` is non-empty, else
+/// true-color/textured 3MF `vertex_colors_rgba`, or uniform white (`[1.0, 1.0, 1.0, 1.0]`).
 pub fn default_cad_vertex_colors(
     vertex_count: usize,
     vertex_filament_slots: &[u8],
+    vertex_colors_rgba: &[[u8; 4]],
     config: &SlicerConfig,
 ) -> Vec<[f32; 4]> {
     if vertex_filament_slots.len() == vertex_count && !vertex_filament_slots.is_empty() {
         vertex_filament_slots
             .iter()
             .map(|&slot| srgba_to_linear_rgba(config.color_srgba_for_filament_slot(slot)))
+            .collect()
+    } else if vertex_colors_rgba.len() == vertex_count && !vertex_colors_rgba.is_empty() {
+        vertex_colors_rgba
+            .iter()
+            .map(|&[r, g, b, a]| {
+                srgba_to_linear_rgba([
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    a as f32 / 255.0,
+                ])
+            })
             .collect()
     } else {
         vec![[1.0f32, 1.0, 1.0, 1.0]; vertex_count]
@@ -7755,6 +7826,130 @@ mod tests {
             "Expected +10s per toolchange ({} toolchanges => +{expected_extra_s}s), got +{actual_extra_s}s",
             planned.toolchange_count
         );
+
+        let default_cfg = SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(part.object_id);
+    }
+
+    #[test]
+    fn test_cmykw_optical_color_mixing_end_to_end() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let positions: [f32; 24] = [
+            -8.0, -8.0, 0.0,
+             8.0, -8.0, 0.0,
+             8.0,  8.0, 0.0,
+            -8.0,  8.0, 0.0,
+            -8.0, -8.0, 4.0,
+             8.0, -8.0, 4.0,
+             8.0,  8.0, 4.0,
+            -8.0,  8.0, 4.0,
+        ];
+        // 12 triangles: 0..2 bottom, 2..4 top, 4..6 front (-Y), 6..8 right (+X), 8..10 back (+Y), 10..12 left (-X)
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2,
+            4, 5, 6, 4, 6, 7,
+            0, 1, 5, 0, 5, 4,
+            1, 2, 6, 1, 6, 5,
+            2, 3, 7, 2, 7, 6,
+            3, 0, 4, 3, 4, 7,
+        ];
+
+        let part = ffi::register_triangle_mesh("test_cmykw_box", &positions, &indices);
+        assert!(part.object_id > 0);
+
+        let green = crate::color_optics::pack_rgba8([20, 185, 45, 255]);   // secondary: Cyan + Yellow
+        let orange = crate::color_optics::pack_rgba8([250, 110, 15, 255]); // secondary: Magenta + Yellow
+        let purple = crate::color_optics::pack_rgba8([115, 25, 210, 255]); // secondary: Cyan + Magenta
+        let white = crate::color_optics::pack_rgba8([244, 244, 244, 255]);
+        let tri_rgba = vec![
+            white, white,   // bottom
+            green, green,   // top
+            green, green,   // front (-Y)
+            orange, orange, // right (+X)
+            purple, purple, // back (+Y)
+            orange, purple, // left (-X)
+        ];
+        ffi::set_object_triangle_colors_rgba(part.object_id, &tri_rgba);
+        assert_eq!(ffi::get_object_triangle_colors_rgba(part.object_id), tri_rgba);
+
+        let mut cfg = SlicerConfig::default();
+        cfg.apply_optical_palette_to_tools(&crate::color_optics::bambu_pla_cmykw_palette());
+        cfg.slicing.color_mixing.enabled = true;
+        cfg.slicing.color_mixing.use_adjacent_layers = true;
+        cfg.slicing.color_mixing.use_short_extrusions = true;
+        cfg.slicing.color_mixing.min_short_extrusion_mm = 2.5;
+        cfg.slicing.color_mixing.optical_shell_layers = 3;
+        cfg.slicing.inner_wall_count = 2;
+        cfg.slicing.shell_thickness_mm = 1.2;
+        cfg.slicing.infill_density_percent = 20.0;
+        cfg.eikonal.auto_voxel_size = false;
+        cfg.eikonal.voxel_size_mm = 0.5;
+        crate::ui::sync_config_to_backend(&cfg);
+
+        assert!(ffi::recompute_object_fields(part.object_id, 0.5, 4.0));
+
+        // Verify C++ `sample_object_surface_optics` projects interior shell points onto nearest coloured face
+        let query_pts: [f32; 9] = [
+            0.0, -7.6, 2.0, // near front (-Y) green wall
+            7.6,  0.0, 2.0, // near right (+X) orange wall
+            0.0,  7.6, 2.0, // near back (+Y) purple wall
+        ];
+        let samples = ffi::sample_object_surface_optics(part.object_id, &query_pts);
+        assert_eq!(samples.len(), 3);
+        assert_eq!(samples[0].rgba_packed, green);
+        assert!(samples[0].surf_ny < -0.7, "Expected -Y outward normal, got {:?}", samples[0]);
+        assert_eq!(samples[1].rgba_packed, orange);
+        assert!(samples[1].surf_nx > 0.7, "Expected +X outward normal, got {:?}", samples[1]);
+        assert_eq!(samples[2].rgba_packed, purple);
+        assert!(samples[2].surf_ny > 0.7, "Expected +Y outward normal, got {:?}", samples[2]);
+
+        let raw_tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(raw_tp.valid && !raw_tp.layers.is_empty());
+
+        let mixed_tp = build_mixed_toolpaths_for_object(part.object_id, &raw_tp, &cfg);
+        assert!(mixed_tp.valid);
+        assert!(
+            mixed_tp.outer_wall_count > raw_tp.outer_wall_count,
+            "Short-extrusion optical mixing should subdivide multi-colour outer perimeters ({} vs {})",
+            mixed_tp.outer_wall_count,
+            raw_tp.outer_wall_count
+        );
+
+        let mut used_tools = std::collections::BTreeSet::new();
+        for layer in &mixed_tp.layers {
+            for p in &layer.paths {
+                let t_idx = cfg.tool_index_for_filament_slot(p.filament_slot);
+                used_tools.insert(t_idx);
+                if p.feature_kind == 4 {
+                    // SparseInfill must use the White core backing filament (T4)
+                    assert_eq!(t_idx, 4, "Sparse infill should use White backing tool T4");
+                }
+            }
+        }
+        // Green, Orange, and Purple require mixing Cyan (T0), Magenta (T1), Yellow (T2) over White (T4)!
+        assert!(
+            used_tools.len() >= 4,
+            "Expected CMYKW solver to mix >= 4 tools across Green/Orange/Purple faces, got {used_tools:?}"
+        );
+
+        let planned = crate::gcode::plan_and_emit_gcode_for_object(
+            "test_cmykw_box",
+            part.object_id,
+            &mixed_tp,
+            Transform::IDENTITY,
+            &cfg,
+        );
+        assert!(planned.toolchange_count >= 3);
+        assert!(planned.gcode_text.contains("T0"));
+        assert!(planned.gcode_text.contains("T1"));
+        assert!(planned.gcode_text.contains("T2"));
+
+        // Also verify Back-Lit Color Lithophane mode (`BackLitTransmittance`, open backlight without core backing)
+        cfg.slicing.color_mixing.lighting_mode =
+            crate::color_optics::OpticalLightingMode::BackLitTransmittance;
+        let backlit_tp = build_mixed_toolpaths_for_object(part.object_id, &raw_tp, &cfg);
+        assert!(backlit_tp.valid && !backlit_tp.layers.is_empty());
 
         let default_cfg = SlicerConfig::default();
         crate::ui::sync_config_to_backend(&default_cfg);

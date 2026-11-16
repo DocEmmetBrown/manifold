@@ -152,6 +152,14 @@ pub struct ToolConfig {
     pub filament_type: String,
     /// Assigned filament preset name for this tool (e.g. `"Generic PLA"`, `"Generic PETG"`).
     pub filament_preset_name: String,
+    /// Actual filament colour in standard `#RRGGBB` / `#RRGGBBAA` hex encoding (e.g. `"#0086D6"`).
+    pub filament_color_hex: String,
+    /// Actual filament colour in sRGBA `[r, g, b, a]` (`0.0..=1.0`).
+    pub filament_color_srgba: [f32; 4],
+    /// Optional explicit Kubelka-Munk filament Transmission Distance (`TD` in mm, HueForge convention).
+    /// When `None`, Manifold2 estimates a researched material- & colour-aware default TD via
+    /// [`crate::color_optics::estimate_default_td_mm`].
+    pub transmission_distance_mm: Option<f32>,
     /// Density of the filament loaded in this tool (`g/cm³`).
     pub filament_density_g_cm3: f32,
     /// Extrusion flow multiplier for the filament loaded in this tool (`1.0` = 100%).
@@ -384,6 +392,11 @@ impl ToolConfig {
         temperature_celsius: f32,
     ) -> Self {
         let tip_outer_r = (nozzle_diameter_mm * 1.25).max(0.4);
+        let (default_hex, default_srgba) = match id {
+            0 => ("#2298FA", [0.133, 0.596, 0.980, 1.0]),
+            1 => ("#F87028", [0.973, 0.439, 0.157, 1.0]),
+            _ => DEFAULT_FILAMENT_SLOT_PALETTE[(id as usize) % DEFAULT_FILAMENT_SLOT_PALETTE.len()],
+        };
         Self {
             id,
             name: name.into(),
@@ -391,6 +404,9 @@ impl ToolConfig {
             temperature_celsius,
             filament_type: "PLA".to_string(),
             filament_preset_name: "Generic PLA".to_string(),
+            filament_color_hex: default_hex.to_string(),
+            filament_color_srgba: default_srgba,
+            transmission_distance_mm: None,
             filament_density_g_cm3: 1.24,
             extrusion_multiplier: 1.0,
             fan_speed_percent: 100.0,
@@ -653,6 +669,58 @@ impl ToolConfig {
             rect_half_angle_x_deg: self.rect_half_angle_x_deg,
             rect_half_angle_y_deg: self.rect_half_angle_y_deg,
             rect_height_mm: self.rect_height_mm,
+        }
+    }
+
+    /// Returns this tool's effective Kubelka-Munk filament Transmission Distance (`TD` in mm),
+    /// using the explicit override if configured or [`crate::color_optics::estimate_default_td_mm`].
+    pub fn effective_transmission_distance_mm(&self) -> f32 {
+        match self.transmission_distance_mm {
+            Some(td) if td.is_finite() => td.clamp(0.05, 50.0),
+            _ => crate::color_optics::estimate_default_td_mm(
+                &self.filament_type,
+                [
+                    self.filament_color_srgba[0],
+                    self.filament_color_srgba[1],
+                    self.filament_color_srgba[2],
+                ],
+            ),
+        }
+    }
+
+    /// Sets `filament_color_srgba` and updates `filament_color_hex` accordingly.
+    pub fn set_color_from_srgba(&mut self, srgba: [f32; 4]) {
+        let clamped = [
+            srgba[0].clamp(0.0, 1.0),
+            srgba[1].clamp(0.0, 1.0),
+            srgba[2].clamp(0.0, 1.0),
+            srgba[3].clamp(0.0, 1.0),
+        ];
+        self.filament_color_srgba = clamped;
+        self.filament_color_hex = crate::color_optics::srgba_to_hex(clamped);
+    }
+
+    /// Parses any standard colour encoding (`#RGB`, `#RRGGBB`, `#RRGGBBAA`, `rgb(...)`, `rgba(...)`,
+    /// or CSS colour name) and updates both `filament_color_srgba` and `filament_color_hex`.
+    pub fn set_color_from_encoding(&mut self, input: &str) -> bool {
+        if let Some(srgba) = crate::color_optics::parse_color_encoding_srgba(input) {
+            self.set_color_from_srgba(srgba);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Builds a [`crate::color_optics::ToolOpticalInput`] descriptor for optical colour mixing.
+    pub fn to_optical_input(&self, tool_index: usize) -> crate::color_optics::ToolOpticalInput {
+        crate::color_optics::ToolOpticalInput {
+            tool_index,
+            color_srgb: [
+                self.filament_color_srgba[0],
+                self.filament_color_srgba[1],
+                self.filament_color_srgba[2],
+            ],
+            td_mm: self.effective_transmission_distance_mm(),
         }
     }
 }
@@ -1052,6 +1120,8 @@ pub struct SlicingProcessConfig {
     /// Maximum angular deviation (degrees, `0.0..=85.0`, default `15.0`) between the reachable clamped
     /// tool axis and the outward surface normal considered "almost parallel" when `orient_outer_surfaces_to_normal` is enabled.
     pub outer_surface_parallel_angle_deg: f32,
+    /// Multi-filament CMYKW & arbitrary-filament Kubelka-Munk optical colour approximation configuration.
+    pub color_mixing: crate::color_optics::ColorMixingConfig,
 }
 
 impl Default for SlicingProcessConfig {
@@ -1098,6 +1168,7 @@ impl Default for SlicingProcessConfig {
             one_perimeter_on_conformal_patches: true,
             orient_outer_surfaces_to_normal: true,
             outer_surface_parallel_angle_deg: 15.0,
+            color_mixing: crate::color_optics::ColorMixingConfig::default(),
         }
     }
 }
@@ -1105,6 +1176,7 @@ impl Default for SlicingProcessConfig {
 impl SlicingProcessConfig {
     pub fn sanitize(&mut self) {
         self.layer_height.sanitize();
+        self.color_mixing.sanitize();
         self.infill_density_percent = self.infill_density_percent.clamp(0.0, 100.0);
         self.infill_angle_deg = self.infill_angle_deg.clamp(0.0, 180.0);
         self.shell_thickness_mm = self.shell_thickness_mm.max(0.05);
@@ -2115,34 +2187,15 @@ impl ThreeMfFilamentSlot {
         }
     }
 
-    /// Parses a `#RRGGBB` or `#RRGGBBAA` hex string into sRGBA `[r, g, b, a]` in `[0.0, 1.0]`.
+    /// Parses any standard colour string (`#RGB`, `#RRGGBB`, `#RRGGBBAA`, `rgb(...)`, `rgba(...)`,
+    /// or CSS colour name) into sRGBA `[r, g, b, a]` in `[0.0, 1.0]`.
     pub fn parse_hex_color(hex: &str) -> Option<[f32; 4]> {
-        let s = hex.trim().trim_start_matches('#');
-        if s.len() != 6 && s.len() != 8 {
-            return None;
-        }
-        let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-        let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-        let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-        let a = if s.len() == 8 {
-            u8::from_str_radix(&s[6..8], 16).ok()?
-        } else {
-            255
-        };
-        Some([
-            (r as f32) / 255.0,
-            (g as f32) / 255.0,
-            (b as f32) / 255.0,
-            (a as f32) / 255.0,
-        ])
+        crate::color_optics::parse_color_encoding_srgba(hex)
     }
 
     /// Formats an sRGBA `[r, g, b, a]` color as `#RRGGBB`.
     pub fn format_hex_color(rgba: [f32; 4]) -> String {
-        let r = (rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8;
-        let g = (rgba[1].clamp(0.0, 1.0) * 255.0).round() as u8;
-        let b = (rgba[2].clamp(0.0, 1.0) * 255.0).round() as u8;
-        format!("#{:02X}{:02X}{:02X}", r, g, b)
+        crate::color_optics::srgba_to_hex(rgba)
     }
 }
 
@@ -2216,12 +2269,15 @@ impl SlicerConfig {
     }
 
     /// Returns the resolved tool index into `self.tools` for a 0-based 3MF `filament_slot`
-    /// (`filament_slots[slot].tool_index` if configured, otherwise `active_tool_index`).
+    /// or direct optical tool assignment (`0x80 | tool_idx`).
     pub fn tool_index_for_filament_slot(&self, slot: u8) -> usize {
         if self.tools.is_empty() {
             return 0;
         }
         let max_idx = self.tools.len() - 1;
+        if let Some(direct_idx) = crate::color_optics::decode_direct_tool_slot(slot) {
+            return direct_idx.min(max_idx);
+        }
         if let Some(entry) = self
             .filament_slots
             .iter()
@@ -2234,7 +2290,7 @@ impl SlicerConfig {
         }
     }
 
-    /// Returns the `ToolConfig` mapped to a 0-based 3MF `filament_slot`.
+    /// Returns the `ToolConfig` mapped to a 0-based 3MF `filament_slot` or direct optical tool slot.
     pub fn tool_for_filament_slot(&self, slot: u8) -> Option<&ToolConfig> {
         if self.tools.is_empty() {
             None
@@ -2243,15 +2299,26 @@ impl SlicerConfig {
         }
     }
 
-    /// Returns the firmware `tool_id` (`T{id}`) mapped to a 0-based 3MF `filament_slot`.
+    /// Returns the firmware `tool_id` (`T{id}`) mapped to a 0-based 3MF `filament_slot` or direct optical tool slot.
     pub fn tool_id_for_filament_slot(&self, slot: u8) -> u32 {
         self.tool_for_filament_slot(slot)
             .map(|t| t.id)
             .unwrap_or(0)
     }
 
-    /// Returns the display sRGB color `[r, g, b, a]` for a 0-based 3MF `filament_slot`.
+    /// Returns the display sRGB color `[r, g, b, a]` for a 0-based 3MF `filament_slot`
+    /// or direct optical tool assignment (`0x80 | tool_idx`).
     pub fn color_srgba_for_filament_slot(&self, slot: u8) -> [f32; 4] {
+        if let Some(direct_idx) = crate::color_optics::decode_direct_tool_slot(slot) {
+            if let Some(tool) = self
+                .tools
+                .get(direct_idx)
+                .or_else(|| self.tools.last())
+            {
+                return tool.filament_color_srgba;
+            }
+            return DEFAULT_FILAMENT_SLOT_PALETTE[direct_idx % DEFAULT_FILAMENT_SLOT_PALETTE.len()].1;
+        }
         if let Some(entry) = self
             .filament_slots
             .iter()
@@ -2259,9 +2326,77 @@ impl SlicerConfig {
             .or_else(|| self.filament_slots.get(slot as usize))
         {
             entry.color_srgba
+        } else if self.filament_slots.is_empty() {
+            self.active_tool()
+                .map(|t| t.filament_color_srgba)
+                .unwrap_or(DEFAULT_FILAMENT_SLOT_PALETTE[0].1)
         } else {
             DEFAULT_FILAMENT_SLOT_PALETTE[(slot as usize) % DEFAULT_FILAMENT_SLOT_PALETTE.len()].1
         }
+    }
+
+    /// Returns [`crate::color_optics::ToolOpticalInput`] descriptors for all configured tools.
+    pub fn tool_optical_inputs(&self) -> Vec<crate::color_optics::ToolOpticalInput> {
+        self.tools
+            .iter()
+            .enumerate()
+            .map(|(idx, t)| t.to_optical_input(idx))
+            .collect()
+    }
+
+    /// Returns the imported 3MF slot sRGBA colours indexed by `slot_index` for optical mixing.
+    pub fn imported_slot_colors_srgba(&self) -> Vec<[f32; 4]> {
+        if self.filament_slots.is_empty() {
+            return Vec::new();
+        }
+        let max_slot = self
+            .filament_slots
+            .iter()
+            .map(|s| s.slot_index as usize)
+            .max()
+            .unwrap_or(0)
+            .max(self.filament_slots.len().saturating_sub(1));
+        let mut out = vec![[0.85, 0.85, 0.85, 1.0]; max_slot + 1];
+        for (pos, entry) in self.filament_slots.iter().enumerate() {
+            let idx = (entry.slot_index as usize).min(max_slot);
+            out[idx] = entry.color_srgba;
+            if pos <= max_slot && out[pos] == [0.85, 0.85, 0.85, 1.0] {
+                out[pos] = entry.color_srgba;
+            }
+        }
+        out
+    }
+
+    /// Configures `self.tools` to match a multi-filament optical palette (e.g. 5-tool CMYKW),
+    /// preserving the active tool's nozzle diameter, rotational kinematics, and clearance geometry
+    /// while leaving `self.filament_slots` intact as input target colours on painted 3MF models.
+    pub fn apply_optical_palette_to_tools(
+        &mut self,
+        palette: &[crate::color_optics::PaletteFilamentEntry],
+    ) {
+        if palette.is_empty() {
+            return;
+        }
+        let template_tool = self
+            .active_tool()
+            .cloned()
+            .unwrap_or_else(ToolConfig::default);
+        let mut new_tools = Vec::with_capacity(palette.len());
+        for (idx, entry) in palette.iter().enumerate() {
+            let mut t = template_tool.clone();
+            t.id = idx as u32;
+            t.apply_filament_type_defaults(entry.filament_type);
+            t.name = format!("T{idx} - {}", entry.name);
+            t.filament_preset_name = entry.name.to_string();
+            if !t.set_color_from_encoding(entry.color_hex) {
+                t.set_color_from_srgba([1.0, 1.0, 1.0, 1.0]);
+            }
+            t.transmission_distance_mm = Some(entry.transmission_distance_mm);
+            new_tools.push(t);
+        }
+        self.tools = new_tools;
+        self.active_tool_index = 0;
+        self.sync_gcode_from_active_tool();
     }
 
     /// Applies a list of 3MF filament/colour slots imported from a `.3mf` archive, ensuring
@@ -2273,6 +2408,17 @@ impl SlicerConfig {
         }
         if self.tools.is_empty() {
             self.tools.push(ToolConfig::default());
+        }
+        // When Kubelka-Munk optical colour mixing is active on a multi-tool palette (e.g. CMYKW),
+        // preserve `self.tools` as the physical printer filaments and record `slots` as the
+        // imported 3MF object's target surface colours.
+        if self.slicing.color_mixing.enabled && self.tools.len() >= 2 {
+            let max_tool_idx = self.tools.len().saturating_sub(1);
+            for (i, slot) in slots.iter_mut().enumerate() {
+                slot.tool_index = i.min(max_tool_idx);
+            }
+            self.filament_slots = slots;
+            return;
         }
         let template_tool = self
             .active_tool()
@@ -2307,6 +2453,7 @@ impl SlicerConfig {
                 if !slot.filament_type.trim().is_empty() {
                     tool.apply_filament_type_defaults(&slot.filament_type);
                 }
+                tool.set_color_from_srgba(slot.color_srgba);
             }
         }
         self.filament_slots = slots;
@@ -3609,6 +3756,53 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         default_value: "(optional)",
         summary: "Optional custom Root/CA certificate PEM for verifying private HTTPS servers and Client Certificate + Key PEMs for mutual TLS (mTLS).",
         details: "Allows connecting securely to Moonraker instances behind an HTTPS reverse proxy requiring client certificate authentication (mTLS) or signed by a private Certificate Authority.",
+    },
+
+    // --- Optical Colour Mixing (CMYKW & Arbitrary Filaments) ---
+    ParameterDoc {
+        key: "tool.transmission_distance_mm",
+        category: "Optical Colour Mixing & Lithophanes",
+        title: "Filament Transmission Distance (TD)",
+        units: "mm",
+        default_value: "Auto (~2.5 mm opaque, 0.6 mm black, 4.0 mm lithophane white)",
+        summary: "HueForge-standard 99% optical opacity thickness (TD in mm) calibrating the Kubelka-Munk scattering/absorption model for this filament.",
+        details: "A filament's TD is the printed thickness (typically 0.4–12.0 mm) required to block ~99% of transmitted light. Leave on `Auto` to estimate TD from filament material and sRGB lightness, or enter a measured HueForge/manufacturer TD (e.g. Bambu CMYK PLA: Cyan 3.5 mm, Magenta 3.0 mm, Yellow 6.0 mm, Lithophane White 5.0 mm; Blending Black ~0.6 mm).",
+    },
+    ParameterDoc {
+        key: "slicing.color_mixing.enabled",
+        category: "Optical Colour Mixing & Lithophanes",
+        title: "Enable Optical Colour Approximation (CMYKW & Arbitrary Filaments)",
+        units: "bool",
+        default_value: "false",
+        summary: "Approximates full-colour/textured or painted 3MF surface colours using any 2+ loaded filaments via Kubelka-Munk optical stacking, adjacent layers, and short extrusions.",
+        details: "Generalises CMYKW colour printing to arbitrary user filament palettes. Evaluates associative Redheffer star-product reflectance & transmittance across outer/inner shell slabs in perceptual Oklab space, using each tool's actual filament colour and Transmission Distance (TD) and local non-planar bead thickness.",
+    },
+    ParameterDoc {
+        key: "slicing.color_mixing.lighting_mode",
+        category: "Optical Colour Mixing & Lithophanes",
+        title: "Optical Lighting Mode (Front-Lit vs. Back-Lit Lithophane)",
+        units: "enum",
+        default_value: "Front-Lit (Reflective 3D Object)",
+        summary: "Selects whether the Kubelka-Munk optical solver optimises diffuse front reflectance, back-lit lithophane transmittance, or a 50/50 blend.",
+        details: "Because `OpticalSlab::stack_over` propagates both diffuse reflectance `R` and diffuse transmittance `T`, switching to `Back-Lit (Transmissive Lithophane)` optimises transmitted colour under D65 backlighting using the exact same filament colours and TDs.",
+    },
+    ParameterDoc {
+        key: "slicing.color_mixing.optical_shell_layers",
+        category: "Optical Colour Mixing & Lithophanes",
+        title: "Optical Shell Slabs & Adjacent-Layer Mixing",
+        units: "1–6 slabs",
+        default_value: "3 slabs, Adjacent Layers = true",
+        summary: "Number of concentric shell wall depths (`OuterWall` + `InnerWall`s) stacked over the core backing filament, plus adjacent-layer phase dithering.",
+        details: "Subsurface light transport through semi-translucent outer slabs over lighter/darker inner slabs produces rich intermediate hues without mid-perimeter tool switches. Enabling `Adjacent Layers` alternates top-vs-second-best optical stacks between neighbouring layers for vertical halftoning.",
+    },
+    ParameterDoc {
+        key: "slicing.color_mixing.min_short_extrusion_mm",
+        category: "Optical Colour Mixing & Lithophanes",
+        title: "Short-Extrusion Along-Path Dithering & Minimum Run Length",
+        units: "mm",
+        default_value: "4.0 mm (Short Extrusions = true)",
+        summary: "Subdivides shell perimeters into short extrusion runs with Oklab error diffusion while coalescing runs shorter than this length to limit tool changes.",
+        details: "Shorter values (e.g. `2.0–4.0 mm`) give finer lateral colour detail and smoother horizontal halftones on multi-toolhead / fast-changer machines; larger values (e.g. `6.0–15.0 mm`) or higher `Tool-Switch Hysteresis` sharply reduce tool swaps on single-nozzle filament changers.",
     },
 ];
 

@@ -37,6 +37,10 @@ pub struct LoadedObjectData {
     pub triangle_filament_slots: Vec<u8>,
     /// Per-vertex 0-based 3MF filament/colour slot indices (`0..255`), or empty for single-colour objects.
     pub vertex_filament_slots: Vec<u8>,
+    /// Per-triangle packed `0xRRGGBBAA` sRGBA colours (from 3MF `<basematerials>`, `<colorgroup>`, or `<texture2dgroup>`), or empty.
+    pub triangle_colors_rgba: Vec<u32>,
+    /// Per-vertex `[R, G, B, A]` sRGBA8 colours for full-colour / textured 3MF viewport rendering, or empty.
+    pub vertex_colors_rgba: Vec<[u8; 4]>,
 }
 
 /// Summary of an asynchronous multi-file import operation.
@@ -196,6 +200,8 @@ pub fn build_loaded_object_from_part(
         triangle_to_patch,
         triangle_filament_slots: Vec::new(),
         vertex_filament_slots: Vec::new(),
+        triangle_colors_rgba: Vec::new(),
+        vertex_colors_rgba: Vec::new(),
     })
 }
 

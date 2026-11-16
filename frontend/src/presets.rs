@@ -500,6 +500,10 @@ pub struct FilamentPreset {
     pub filament_type: String,
     pub filament_diameter_mm: f32,
     pub filament_density_g_cm3: f32,
+    /// Optional explicit filament colour (`#RRGGBB`); empty on colour-neutral generic material presets.
+    pub filament_color_hex: String,
+    /// Optional explicit Kubelka-Munk filament Transmission Distance (`TD` in mm, `None` = Auto TD).
+    pub transmission_distance_mm: Option<f32>,
 
     // Temperatures
     pub nozzle_temperature_celsius: f32,
@@ -549,16 +553,28 @@ impl Default for FilamentPreset {
 
 impl FilamentPreset {
     pub fn from_config(name: impl Into<String>, cfg: &SlicerConfig, is_builtin: bool) -> Self {
-        let nozzle_temp = cfg
-            .active_tool()
-            .map(|t| t.temperature_celsius)
-            .unwrap_or(215.0);
+        let active_tool = cfg.active_tool();
+        let nozzle_temp = active_tool.map(|t| t.temperature_celsius).unwrap_or(215.0);
+        let filament_color_hex = if is_builtin {
+            String::new()
+        } else {
+            active_tool
+                .map(|t| t.filament_color_hex.clone())
+                .unwrap_or_default()
+        };
+        let transmission_distance_mm = if is_builtin {
+            None
+        } else {
+            active_tool.and_then(|t| t.transmission_distance_mm)
+        };
         Self {
             name: name.into(),
             is_builtin,
             filament_type: cfg.gcode.filament_type.clone(),
             filament_diameter_mm: cfg.gcode.filament_diameter_mm,
             filament_density_g_cm3: cfg.gcode.filament_density_g_cm3,
+            filament_color_hex,
+            transmission_distance_mm,
             nozzle_temperature_celsius: nozzle_temp,
             bed_temperature_celsius: cfg.gcode.bed_temperature_celsius,
             extrusion_multiplier: cfg.gcode.extrusion_multiplier,
@@ -596,6 +612,10 @@ impl FilamentPreset {
     pub fn apply_to_tool(&self, tool: &mut ToolConfig) {
         tool.filament_preset_name = self.name.clone();
         tool.filament_type = self.filament_type.clone();
+        if !self.filament_color_hex.trim().is_empty() {
+            tool.set_color_from_encoding(&self.filament_color_hex);
+        }
+        tool.transmission_distance_mm = self.transmission_distance_mm;
         tool.temperature_celsius = self.nozzle_temperature_celsius;
         tool.filament_density_g_cm3 = self.filament_density_g_cm3;
         tool.extrusion_multiplier = self.extrusion_multiplier;
@@ -654,11 +674,26 @@ impl FilamentPreset {
     }
 
     pub fn matches_config(&self, cfg: &SlicerConfig) -> bool {
-        let nozzle_temp = cfg
-            .active_tool()
-            .map(|t| t.temperature_celsius)
-            .unwrap_or(215.0);
-        self.filament_type == cfg.gcode.filament_type
+        let active_tool = cfg.active_tool();
+        let nozzle_temp = active_tool.map(|t| t.temperature_celsius).unwrap_or(215.0);
+        let color_ok = if self.filament_color_hex.trim().is_empty() {
+            true
+        } else {
+            active_tool
+                .map(|t| t.filament_color_hex.eq_ignore_ascii_case(self.filament_color_hex.trim()))
+                .unwrap_or(false)
+        };
+        let td_ok = match (
+            self.transmission_distance_mm,
+            active_tool.and_then(|t| t.transmission_distance_mm),
+        ) {
+            (None, None) => true,
+            (Some(a), Some(b)) => approx_eq(a, b),
+            _ => false,
+        };
+        color_ok
+            && td_ok
+            && self.filament_type == cfg.gcode.filament_type
             && approx_eq(self.filament_diameter_mm, cfg.gcode.filament_diameter_mm)
             && approx_eq(self.filament_density_g_cm3, cfg.gcode.filament_density_g_cm3)
             && approx_eq(self.nozzle_temperature_celsius, nozzle_temp)
@@ -822,6 +857,9 @@ pub struct ProcessPreset {
     pub enable_lever_arm_slowdown: bool,
     pub lever_arm_reference_ratio: f32,
     pub lever_arm_min_speed_fraction: f32,
+
+    // Multi-Filament CMYKW & Arbitrary-Filament Optical Colour Mixing
+    pub color_mixing: crate::color_optics::ColorMixingConfig,
 }
 
 impl Default for ProcessPreset {
@@ -912,6 +950,7 @@ impl ProcessPreset {
             enable_lever_arm_slowdown: cfg.gcode.enable_lever_arm_slowdown,
             lever_arm_reference_ratio: cfg.gcode.lever_arm_reference_ratio,
             lever_arm_min_speed_fraction: cfg.gcode.lever_arm_min_speed_fraction,
+            color_mixing: cfg.slicing.color_mixing.clone(),
         }
     }
 
@@ -972,6 +1011,7 @@ impl ProcessPreset {
         cfg.slicing.tree_tip_diameter_mm = self.tree_tip_diameter_mm;
         cfg.slicing.tree_trunk_max_diameter_mm = self.tree_trunk_max_diameter_mm;
         cfg.slicing.tree_branch_wall_count = self.tree_branch_wall_count;
+        cfg.slicing.color_mixing = self.color_mixing.clone();
 
         cfg.gcode.enable_scarf_joint = self.enable_scarf_joint;
         cfg.gcode.scarf_length_mm = self.scarf_length_mm;
@@ -1161,6 +1201,7 @@ impl ProcessPreset {
                 self.lever_arm_min_speed_fraction,
                 cfg.gcode.lever_arm_min_speed_fraction,
             )
+            && self.color_mixing == cfg.slicing.color_mixing
     }
 }
 
@@ -1389,7 +1430,15 @@ impl PresetLibrary {
         f_tpu.pa_low_flow_s = 0.120;
         f_tpu.pa_high_flow_s = 0.085;
 
-        vec![f_pla, f_plaplus, f_petg, f_abs, f_asa, f_tpu]
+        let mut out = vec![f_pla, f_plaplus, f_petg, f_abs, f_asa, f_tpu];
+        for entry in crate::color_optics::bambu_pla_cmykw_palette() {
+            let mut fp = FilamentPreset::from_config(entry.name, &base_cfg, true);
+            fp.filament_type = entry.filament_type.to_string();
+            fp.filament_color_hex = entry.color_hex.to_string();
+            fp.transmission_distance_mm = Some(entry.transmission_distance_mm);
+            out.push(fp);
+        }
+        out
     }
 
     pub fn builtin_processes() -> Vec<ProcessPreset> {
@@ -1439,7 +1488,24 @@ impl PresetLibrary {
         pr_tree.support_style = SupportStyle::NonPlanarTree;
         pr_tree.support_on_bed_only = true;
 
-        vec![pr_std, pr_fine, pr_draft, pr_planar, pr_tree]
+        let mut pr_cmykw = ProcessPreset::from_config(
+            "0.16mm CMYKW Full-Colour Optical Mixing",
+            &base_cfg,
+            true,
+        );
+        pr_cmykw.layer_height = LayerHeightConfig {
+            target_mm: 0.16,
+            min_mm: 0.08,
+            max_mm: 0.24,
+            first_layer_mm: 0.20,
+            top_layer_mm: 0.14,
+        };
+        pr_cmykw.shell_thickness_mm = 1.60;
+        pr_cmykw.inner_wall_count = 2;
+        pr_cmykw.color_mixing.enabled = true;
+        pr_cmykw.color_mixing.optical_shell_layers = 3;
+
+        vec![pr_std, pr_fine, pr_draft, pr_planar, pr_tree, pr_cmykw]
     }
 
     pub fn presets_root_dir() -> Option<PathBuf> {

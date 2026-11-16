@@ -11,6 +11,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::bridge::ffi::{self, RenderVertex};
+use crate::color_optics;
 use crate::config::{SlicerConfig, ThreeMfFilamentSlot};
 use crate::io::{
     build_loaded_object_from_part, load_step_file_parts, stl, LoadedBatchReport, LoadedObjectData,
@@ -106,6 +107,74 @@ impl ParsedModelSettingsConfig {
     }
 }
 
+/// Compact per-triangle property reference (`pid`, `p1`, `p2`, `p3`) from 3MF Core / Materials.
+#[derive(Clone, Copy, Debug, Default)]
+struct TrianglePropRef {
+    /// 1-based index into `ParsedXmlMesh::prop_pids` (`0` = inherit `<object pid="...">`).
+    pid_idx_one_based: u16,
+    has_p1: bool,
+    p1: u32,
+    p2: u32,
+    p3: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TextureTileStyle {
+    #[default]
+    Wrap,
+    Clamp,
+    Mirror,
+}
+
+impl TextureTileStyle {
+    fn from_attr(val: &str) -> Self {
+        if val.eq_ignore_ascii_case("clamp") || val.eq_ignore_ascii_case("none") {
+            Self::Clamp
+        } else if val.eq_ignore_ascii_case("mirror") {
+            Self::Mirror
+        } else {
+            Self::Wrap
+        }
+    }
+
+    fn apply(self, t: f32) -> f32 {
+        if !t.is_finite() {
+            return 0.0;
+        }
+        match self {
+            Self::Wrap => t.rem_euclid(1.0),
+            Self::Clamp => t.clamp(0.0, 1.0),
+            Self::Mirror => {
+                let period = t.rem_euclid(2.0);
+                if period <= 1.0 {
+                    period
+                } else {
+                    2.0 - period
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ParsedBaseMaterial {
+    name: String,
+    rgba8: [u8; 4],
+}
+
+#[derive(Clone, Debug)]
+struct ParsedTexture2d {
+    path: String,
+    tile_u: TextureTileStyle,
+    tile_v: TextureTileStyle,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ParsedTexture2dGroup {
+    tex_id: String,
+    coords: Vec<[f32; 2]>,
+}
+
 /// Raw `<mesh>` parsed from a `.model` XML inside a `.3mf` archive.
 #[derive(Clone, Debug, Default)]
 struct ParsedXmlMesh {
@@ -114,6 +183,10 @@ struct ParsedXmlMesh {
     /// Per-triangle 1-based MMU extruder state (`0` = unpainted / use volume or object default,
     /// `s >= 1` = 1-based extruder `s`, corresponding to 0-based `filament_slot = s - 1`).
     triangle_mmu_states: Vec<u8>,
+    /// Interned `pid` strings referenced by triangles in this mesh.
+    prop_pids: Vec<String>,
+    /// Populated only when at least one `<triangle>` specifies `pid`/`p1`/`p2`/`p3`.
+    triangle_prop_refs: Vec<TrianglePropRef>,
 }
 
 /// `<component>` reference inside an `<object><components>` block.
@@ -129,6 +202,8 @@ struct ParsedComponentRef {
 struct ParsedXmlObject {
     id: String,
     name: Option<String>,
+    pid: Option<String>,
+    pindex: Option<u32>,
     mesh: Option<ParsedXmlMesh>,
     components: Vec<ParsedComponentRef>,
 }
@@ -141,11 +216,15 @@ struct ParsedBuildItem {
     transform: Mat4,
 }
 
-/// All `<object>` resources and `<build>` items parsed from a single `.model` XML stream.
+/// All `<object>` resources, color/material/texture groups, and `<build>` items parsed from a `.model` XML stream.
 #[derive(Clone, Debug, Default)]
 struct ParsedModelFile {
     objects: HashMap<String, ParsedXmlObject>,
     build_items: Vec<ParsedBuildItem>,
+    base_materials: HashMap<String, Vec<ParsedBaseMaterial>>,
+    color_groups: HashMap<String, Vec<[u8; 4]>>,
+    textures_2d: HashMap<String, ParsedTexture2d>,
+    texture_2d_groups: HashMap<String, ParsedTexture2dGroup>,
 }
 
 /// Loads a `.3mf` OPC/ZIP archive, supporting:
@@ -180,6 +259,7 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
     let mut model_files: HashMap<String, ParsedModelFile> = HashMap::new();
     let mut embedded_step_entries: HashMap<String, Vec<u8>> = HashMap::new();
     let mut embedded_stl_entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut embedded_png_entries: HashMap<String, Vec<u8>> = HashMap::new();
     let mut scene_manifest: Option<SavedSceneManifest> = None;
     let mut model_settings: Option<ParsedModelSettingsConfig> = None;
     let mut project_settings_bed_size: Option<(f32, f32)> = None;
@@ -306,6 +386,14 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
             let mut bytes = Vec::new();
             if entry.read_to_end(&mut bytes).is_ok() {
                 embedded_stl_entries.push((raw_name, bytes));
+            }
+            continue;
+        }
+
+        if lower_name.ends_with(".png") {
+            let mut bytes = Vec::new();
+            if entry.read_to_end(&mut bytes).is_ok() {
+                embedded_png_entries.insert(raw_name, bytes);
             }
             continue;
         }
@@ -471,6 +559,8 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
         .and_then(|s| s.to_str())
         .unwrap_or("3mf_model");
 
+    let mut tex_cache = TextureCache::new(&embedded_png_entries);
+
     if root_model.build_items.is_empty() {
         // Fallback if `<build>` was omitted: instantiate every mesh object directly
         for obj in root_model.objects.values() {
@@ -495,12 +585,16 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                     .unwrap_or(&[]);
                 instantiate_3mf_mesh(
                     &name,
+                    &root_model,
+                    obj,
                     mesh,
                     Mat4::IDENTITY,
                     plate_idx,
                     obj_extruder,
                     vol_ranges,
                     &archive_label,
+                    &mut tex_cache,
+                    &mut imported_filament_slots,
                     report,
                 );
             }
@@ -570,6 +664,8 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                 model_settings.as_ref(),
                 &default_fallback,
                 &archive_label,
+                &mut tex_cache,
+                &mut imported_filament_slots,
                 &mut visited,
                 report,
             );
@@ -731,6 +827,8 @@ fn instantiate_3mf_object_recursive(
     model_settings: Option<&ParsedModelSettingsConfig>,
     fallback_name: &str,
     archive_label: &str,
+    tex_cache: &mut TextureCache<'_>,
+    imported_filament_slots: &mut Vec<ThreeMfFilamentSlot>,
     visited: &mut HashSet<(String, String)>,
     report: &mut LoadedBatchReport,
 ) {
@@ -775,12 +873,16 @@ fn instantiate_3mf_object_recursive(
     if let Some(ref mesh) = xml_obj.mesh {
         instantiate_3mf_mesh(
             obj_name,
+            model_file,
+            xml_obj,
             mesh,
             accumulated_transform,
             plate_index,
             effective_extruder,
             vol_ranges,
             archive_label,
+            tex_cache,
+            imported_filament_slots,
             report,
         );
     }
@@ -808,6 +910,8 @@ fn instantiate_3mf_object_recursive(
             model_settings,
             &child_fallback,
             archive_label,
+            tex_cache,
+            imported_filament_slots,
             visited,
             report,
         );
@@ -817,12 +921,16 @@ fn instantiate_3mf_object_recursive(
 #[allow(clippy::too_many_arguments)]
 fn instantiate_3mf_mesh(
     name: &str,
+    model_file: &ParsedModelFile,
+    xml_obj: &ParsedXmlObject,
     mesh: &ParsedXmlMesh,
     world_transform: Mat4,
     plate_index: usize,
     default_extruder_one_based: u8,
     volume_ranges: &[ParsedVolumeExtruderRange],
     archive_label: &str,
+    tex_cache: &mut TextureCache<'_>,
+    imported_filament_slots: &mut Vec<ThreeMfFilamentSlot>,
     report: &mut LoadedBatchReport,
 ) {
     if mesh.positions.len() < 9 || mesh.indices.len() < 3 {
@@ -854,6 +962,25 @@ fn instantiate_3mf_mesh(
         let base_slot = default_extruder_one_based.saturating_sub(1);
         let has_mmu_paint = mesh.triangle_mmu_states.iter().any(|&s| s > 0);
         let has_volume_extruder = volume_ranges.iter().any(|r| r.extruder_one_based > 0);
+        let has_slicer_slots =
+            has_mmu_paint || has_volume_extruder || base_slot > 0 || !imported_filament_slots.is_empty();
+
+        let (resolved_colors, basemat_tri_slots) = resolve_3mf_mesh_surface_colors(
+            model_file,
+            xml_obj,
+            mesh,
+            obj.vertices.len(),
+            &obj.indices,
+            tex_cache,
+            imported_filament_slots,
+            has_slicer_slots,
+        );
+
+        if let Some((tri_colors_rgba, vert_colors_rgba)) = resolved_colors {
+            ffi::set_object_triangle_colors_rgba(obj.object_id, &tri_colors_rgba);
+            obj.triangle_colors_rgba = tri_colors_rgba;
+            obj.vertex_colors_rgba = vert_colors_rgba;
+        }
 
         if has_mmu_paint || has_volume_extruder || base_slot > 0 {
             let mut tri_slots = vec![base_slot; num_tris];
@@ -880,9 +1007,382 @@ fn instantiate_3mf_mesh(
                 base_slot,
             );
             obj.triangle_filament_slots = tri_slots;
+        } else if let Some(tri_slots) = basemat_tri_slots {
+            ffi::set_object_triangle_filament_slots(obj.object_id, &tri_slots);
+            obj.vertex_filament_slots = compute_vertex_filament_slots_from_triangles(
+                obj.vertices.len(),
+                &obj.indices,
+                &tri_slots,
+                0,
+            );
+            obj.triangle_filament_slots = tri_slots;
         }
 
         report.objects.push(obj);
+    }
+}
+
+struct DecodedRgbaImage {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+impl DecodedRgbaImage {
+    fn decode_png(bytes: &[u8]) -> Option<Self> {
+        let mut decoder = png::Decoder::new(Cursor::new(bytes));
+        decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+        let mut reader = decoder.read_info().ok()?;
+        let buf_len = reader.output_buffer_size()?;
+        let mut raw = vec![0u8; buf_len];
+        let info = reader.next_frame(&mut raw).ok()?;
+        let width = info.width;
+        let height = info.height;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let used = &raw[..info.buffer_size()];
+        let num_px = (width as usize) * (height as usize);
+        let pixels = match info.color_type {
+            png::ColorType::Rgba => {
+                if used.len() < num_px * 4 {
+                    return None;
+                }
+                used[..num_px * 4].to_vec()
+            }
+            png::ColorType::Rgb => {
+                if used.len() < num_px * 3 {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(num_px * 4);
+                for rgb in used[..num_px * 3].chunks_exact(3) {
+                    out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+                }
+                out
+            }
+            png::ColorType::GrayscaleAlpha => {
+                if used.len() < num_px * 2 {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(num_px * 4);
+                for ga in used[..num_px * 2].chunks_exact(2) {
+                    out.extend_from_slice(&[ga[0], ga[0], ga[0], ga[1]]);
+                }
+                out
+            }
+            png::ColorType::Grayscale => {
+                if used.len() < num_px {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(num_px * 4);
+                for &g in &used[..num_px] {
+                    out.extend_from_slice(&[g, g, g, 255]);
+                }
+                out
+            }
+            png::ColorType::Indexed => return None,
+        };
+        Some(Self {
+            width,
+            height,
+            pixels,
+        })
+    }
+
+    fn texel(&self, x: u32, y: u32) -> [u8; 4] {
+        let cx = x.min(self.width.saturating_sub(1)) as usize;
+        let cy = y.min(self.height.saturating_sub(1)) as usize;
+        let off = (cy * (self.width as usize) + cx) * 4;
+        [
+            self.pixels[off],
+            self.pixels[off + 1],
+            self.pixels[off + 2],
+            self.pixels[off + 3],
+        ]
+    }
+
+    fn sample_bilinear_srgba8(
+        &self,
+        u: f32,
+        v: f32,
+        tile_u: TextureTileStyle,
+        tile_v: TextureTileStyle,
+    ) -> [u8; 4] {
+        let uw = tile_u.apply(u);
+        // 3MF texture V=0 is the bottom row of the image; PNG row 0 is the top row.
+        let vw = 1.0 - tile_v.apply(v);
+
+        let fx = uw * (self.width.saturating_sub(1) as f32);
+        let fy = vw * (self.height.saturating_sub(1) as f32);
+        let x0 = (fx.floor() as u32).min(self.width.saturating_sub(1));
+        let y0 = (fy.floor() as u32).min(self.height.saturating_sub(1));
+        let x1 = (x0 + 1).min(self.width.saturating_sub(1));
+        let y1 = (y0 + 1).min(self.height.saturating_sub(1));
+        let tx = (fx - (x0 as f32)).clamp(0.0, 1.0);
+        let ty = (fy - (y0 as f32)).clamp(0.0, 1.0);
+
+        let c00 = self.texel(x0, y0);
+        let c10 = self.texel(x1, y0);
+        let c01 = self.texel(x0, y1);
+        let c11 = self.texel(x1, y1);
+
+        let mut out = [0u8; 4];
+        for ch in 0..4 {
+            let top = (c00[ch] as f32) * (1.0 - tx) + (c10[ch] as f32) * tx;
+            let bot = (c01[ch] as f32) * (1.0 - tx) + (c11[ch] as f32) * tx;
+            let val = top * (1.0 - ty) + bot * ty;
+            out[ch] = val.round().clamp(0.0, 255.0) as u8;
+        }
+        out
+    }
+}
+
+struct TextureCache<'a> {
+    raw_pngs: &'a HashMap<String, Vec<u8>>,
+    decoded: HashMap<String, Option<DecodedRgbaImage>>,
+}
+
+impl<'a> TextureCache<'a> {
+    fn new(raw_pngs: &'a HashMap<String, Vec<u8>>) -> Self {
+        Self {
+            raw_pngs,
+            decoded: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, raw_path: &str) -> Option<&DecodedRgbaImage> {
+        let key = raw_path.trim_start_matches('/').to_string();
+        if !self.decoded.contains_key(&key) {
+            let bytes = self.raw_pngs.get(&key).or_else(|| {
+                self.raw_pngs
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                    .map(|(_, v)| v)
+            });
+            let img = bytes.and_then(|b| DecodedRgbaImage::decode_png(b));
+            self.decoded.insert(key.clone(), img);
+        }
+        self.decoded.get(&key).and_then(|opt| opt.as_ref())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_3mf_mesh_surface_colors(
+    model_file: &ParsedModelFile,
+    xml_obj: &ParsedXmlObject,
+    mesh: &ParsedXmlMesh,
+    num_vertices: usize,
+    indices: &[u32],
+    tex_cache: &mut TextureCache<'_>,
+    imported_filament_slots: &mut Vec<ThreeMfFilamentSlot>,
+    has_slicer_slots: bool,
+) -> (Option<(Vec<u32>, Vec<[u8; 4]>)>, Option<Vec<u8>>) {
+    let num_tris = indices.len() / 3;
+    if num_tris == 0 || num_vertices == 0 {
+        return (None, None);
+    }
+    if mesh.triangle_prop_refs.is_empty() && xml_obj.pid.is_none() {
+        return (None, None);
+    }
+    if model_file.base_materials.is_empty()
+        && model_file.color_groups.is_empty()
+        && model_file.texture_2d_groups.is_empty()
+    {
+        return (None, None);
+    }
+
+    let obj_pid = xml_obj.pid.as_deref();
+    let obj_pindex = xml_obj.pindex.unwrap_or(0);
+
+    let mut tri_rgba = vec![0u32; num_tris];
+    let mut vert_accum = vec![[0u32; 5]; num_vertices]; // [r_sum, g_sum, b_sum, a_sum, count]
+    let mut any_color = false;
+
+    let mut single_basemat_pid: Option<&str> = None;
+    let mut basemat_mixed_pids = false;
+    let mut tri_basemat_slots = Vec::new();
+
+    for (t_idx, tri) in indices.chunks_exact(3).enumerate() {
+        let prop = mesh
+            .triangle_prop_refs
+            .get(t_idx)
+            .copied()
+            .unwrap_or_default();
+        let pid_opt = if prop.pid_idx_one_based > 0 {
+            mesh.prop_pids
+                .get((prop.pid_idx_one_based - 1) as usize)
+                .map(String::as_str)
+        } else {
+            obj_pid
+        };
+        let Some(pid) = pid_opt else {
+            continue;
+        };
+
+        let (p1, p2, p3) = if prop.has_p1 {
+            (prop.p1 as usize, prop.p2 as usize, prop.p3 as usize)
+        } else {
+            let idx = obj_pindex as usize;
+            (idx, idx, idx)
+        };
+
+        if let Some(mats) = model_file.base_materials.get(pid) {
+            if let Some(m1) = mats.get(p1) {
+                let c0 = m1.rgba8;
+                let c1 = mats.get(p2).map(|m| m.rgba8).unwrap_or(c0);
+                let c2 = mats.get(p3).map(|m| m.rgba8).unwrap_or(c0);
+                let avg = average_three_rgba8(c0, c1, c2);
+                tri_rgba[t_idx] =
+                    color_optics::pack_rgba8([avg[0], avg[1], avg[2], avg[3].max(1)]);
+                accumulate_tri_vertex_colors(&mut vert_accum, tri, [c0, c1, c2]);
+                any_color = true;
+
+                if !has_slicer_slots && mats.len() <= 16 {
+                    match single_basemat_pid {
+                        None => {
+                            single_basemat_pid = Some(pid);
+                            tri_basemat_slots.resize(num_tris, 0);
+                        }
+                        Some(prev) if prev != pid => {
+                            basemat_mixed_pids = true;
+                        }
+                        _ => {}
+                    }
+                    if !basemat_mixed_pids && p1 < 16 {
+                        tri_basemat_slots[t_idx] = p1 as u8;
+                    }
+                }
+            }
+        } else if let Some(colors) = model_file.color_groups.get(pid) {
+            if let Some(&c0) = colors.get(p1) {
+                let c1 = colors.get(p2).copied().unwrap_or(c0);
+                let c2 = colors.get(p3).copied().unwrap_or(c0);
+                let avg = average_three_rgba8(c0, c1, c2);
+                tri_rgba[t_idx] =
+                    color_optics::pack_rgba8([avg[0], avg[1], avg[2], avg[3].max(1)]);
+                accumulate_tri_vertex_colors(&mut vert_accum, tri, [c0, c1, c2]);
+                any_color = true;
+            }
+        } else if let Some(tex_grp) = model_file.texture_2d_groups.get(pid) {
+            if let Some(tex_meta) = model_file.textures_2d.get(&tex_grp.tex_id) {
+                if let Some(img) = tex_cache.get(&tex_meta.path) {
+                    if let Some(&uv0) = tex_grp.coords.get(p1) {
+                        let uv1 = tex_grp.coords.get(p2).copied().unwrap_or(uv0);
+                        let uv2 = tex_grp.coords.get(p3).copied().unwrap_or(uv0);
+                        let c0 = img.sample_bilinear_srgba8(
+                            uv0[0],
+                            uv0[1],
+                            tex_meta.tile_u,
+                            tex_meta.tile_v,
+                        );
+                        let c1 = img.sample_bilinear_srgba8(
+                            uv1[0],
+                            uv1[1],
+                            tex_meta.tile_u,
+                            tex_meta.tile_v,
+                        );
+                        let c2 = img.sample_bilinear_srgba8(
+                            uv2[0],
+                            uv2[1],
+                            tex_meta.tile_u,
+                            tex_meta.tile_v,
+                        );
+                        let uc = (uv0[0] + uv1[0] + uv2[0]) / 3.0;
+                        let vc = (uv0[1] + uv1[1] + uv2[1]) / 3.0;
+                        let center =
+                            img.sample_bilinear_srgba8(uc, vc, tex_meta.tile_u, tex_meta.tile_v);
+                        tri_rgba[t_idx] = color_optics::pack_rgba8([
+                            center[0],
+                            center[1],
+                            center[2],
+                            center[3].max(1),
+                        ]);
+                        accumulate_tri_vertex_colors(&mut vert_accum, tri, [c0, c1, c2]);
+                        any_color = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !any_color {
+        return (None, None);
+    }
+
+    let default_rgba = [214u8, 217, 224, 255];
+    let mut vert_rgba = vec![default_rgba; num_vertices];
+    for (v_idx, acc) in vert_accum.iter().enumerate() {
+        if acc[4] > 0 {
+            let cnt = acc[4];
+            vert_rgba[v_idx] = [
+                ((acc[0] + cnt / 2) / cnt).min(255) as u8,
+                ((acc[1] + cnt / 2) / cnt).min(255) as u8,
+                ((acc[2] + cnt / 2) / cnt).min(255) as u8,
+                ((acc[3] + cnt / 2) / cnt).clamp(1, 255) as u8,
+            ];
+        }
+    }
+
+    let basemat_slots_out = if !has_slicer_slots && !basemat_mixed_pids {
+        if let Some(pid) = single_basemat_pid {
+            if let Some(mats) = model_file.base_materials.get(pid) {
+                if imported_filament_slots.is_empty() {
+                    for (idx, mat) in mats.iter().enumerate() {
+                        let mut slot = ThreeMfFilamentSlot::default_for_slot(idx, idx);
+                        let srgba = [
+                            mat.rgba8[0] as f32 / 255.0,
+                            mat.rgba8[1] as f32 / 255.0,
+                            mat.rgba8[2] as f32 / 255.0,
+                            mat.rgba8[3] as f32 / 255.0,
+                        ];
+                        slot.color_srgba = srgba;
+                        slot.color_hex = ThreeMfFilamentSlot::format_hex_color(srgba);
+                        slot.name = if mat.name.trim().is_empty() {
+                            format!("Material {} ({})", idx + 1, slot.color_hex)
+                        } else {
+                            format!("{} ({})", mat.name.trim(), slot.color_hex)
+                        };
+                        imported_filament_slots.push(slot);
+                    }
+                }
+                Some(tri_basemat_slots)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    (Some((tri_rgba, vert_rgba)), basemat_slots_out)
+}
+
+fn average_three_rgba8(a: [u8; 4], b: [u8; 4], c: [u8; 4]) -> [u8; 4] {
+    [
+        ((a[0] as u16 + b[0] as u16 + c[0] as u16 + 1) / 3) as u8,
+        ((a[1] as u16 + b[1] as u16 + c[1] as u16 + 1) / 3) as u8,
+        ((a[2] as u16 + b[2] as u16 + c[2] as u16 + 1) / 3) as u8,
+        ((a[3] as u16 + b[3] as u16 + c[3] as u16 + 1) / 3) as u8,
+    ]
+}
+
+fn accumulate_tri_vertex_colors(
+    vert_accum: &mut [[u32; 5]],
+    tri: &[u32],
+    corners: [[u8; 4]; 3],
+) {
+    for (corner_idx, &v_u32) in tri.iter().enumerate().take(3) {
+        let v = v_u32 as usize;
+        if let Some(acc) = vert_accum.get_mut(v) {
+            let c = corners[corner_idx];
+            acc[0] += c[0] as u32;
+            acc[1] += c[1] as u32;
+            acc[2] += c[2] as u32;
+            acc[3] += c[3] as u32;
+            acc[4] += 1;
+        }
     }
 }
 
@@ -1137,6 +1637,7 @@ pub fn save_project_to_3mf(
 }
 
 /// Parses a 3MF `.model` XML buffer using `quick-xml`, extracting `<object>` meshes,
+/// `<basematerials>`, `<m:colorgroup>`, `<m:texture2d>`, `<m:texture2dgroup>`,
 /// `<components>`, and `<build><item>` entries while ignoring unknown slicer tags.
 fn parse_3mf_model_xml(xml_bytes: &[u8]) -> Result<ParsedModelFile, String> {
     let mut reader = Reader::from_reader(xml_bytes);
@@ -1146,6 +1647,9 @@ fn parse_3mf_model_xml(xml_bytes: &[u8]) -> Result<ParsedModelFile, String> {
     let mut model_file = ParsedModelFile::default();
     let mut current_object: Option<ParsedXmlObject> = None;
     let mut current_mesh: Option<ParsedXmlMesh> = None;
+    let mut current_base_materials: Option<(String, Vec<ParsedBaseMaterial>)> = None;
+    let mut current_color_group: Option<(String, Vec<[u8; 4]>)> = None;
+    let mut current_tex2d_group: Option<(String, ParsedTexture2dGroup)> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -1156,6 +1660,8 @@ fn parse_3mf_model_xml(xml_bytes: &[u8]) -> Result<ParsedModelFile, String> {
                     b"object" => {
                         let mut id = String::new();
                         let mut name = None;
+                        let mut pid = None;
+                        let mut pindex = None;
                         for attr in e.attributes().flatten() {
                             match local_tag_name(attr.key.as_ref()) {
                                 b"id" => {
@@ -1164,15 +1670,58 @@ fn parse_3mf_model_xml(xml_bytes: &[u8]) -> Result<ParsedModelFile, String> {
                                 b"name" => {
                                     name = Some(String::from_utf8_lossy(&attr.value).into_owned());
                                 }
+                                b"pid" => {
+                                    pid = Some(String::from_utf8_lossy(&attr.value).into_owned());
+                                }
+                                b"pindex" => {
+                                    pindex = std::str::from_utf8(&attr.value)
+                                        .ok()
+                                        .and_then(|s| s.trim().parse::<u32>().ok());
+                                }
                                 _ => {}
                             }
                         }
                         current_object = Some(ParsedXmlObject {
                             id,
                             name,
+                            pid,
+                            pindex,
                             mesh: None,
                             components: Vec::new(),
                         });
+                    }
+                    b"basematerials" => {
+                        if let Some(id) = extract_xml_id_attr(e) {
+                            current_base_materials = Some((id, Vec::new()));
+                        }
+                    }
+                    b"base" => {
+                        if let Some((_, ref mut list)) = current_base_materials {
+                            parse_base_material_element(e, list);
+                        }
+                    }
+                    b"colorgroup" => {
+                        if let Some(id) = extract_xml_id_attr(e) {
+                            current_color_group = Some((id, Vec::new()));
+                        }
+                    }
+                    b"color" => {
+                        if let Some((_, ref mut list)) = current_color_group {
+                            parse_color_element(e, list);
+                        }
+                    }
+                    b"texture2d" => {
+                        parse_texture2d_element(e, &mut model_file.textures_2d);
+                    }
+                    b"texture2dgroup" => {
+                        if let Some((id, grp)) = parse_texture2dgroup_start(e) {
+                            current_tex2d_group = Some((id, grp));
+                        }
+                    }
+                    b"tex2coord" => {
+                        if let Some((_, ref mut grp)) = current_tex2d_group {
+                            parse_tex2coord_element(e, grp);
+                        }
                     }
                     b"mesh" => {
                         current_mesh = Some(ParsedXmlMesh::default());
@@ -1206,6 +1755,24 @@ fn parse_3mf_model_xml(xml_bytes: &[u8]) -> Result<ParsedModelFile, String> {
                 let qname = e.name();
                 let local = local_tag_name(qname.as_ref());
                 match local {
+                    b"base" => {
+                        if let Some((_, ref mut list)) = current_base_materials {
+                            parse_base_material_element(e, list);
+                        }
+                    }
+                    b"color" => {
+                        if let Some((_, ref mut list)) = current_color_group {
+                            parse_color_element(e, list);
+                        }
+                    }
+                    b"texture2d" => {
+                        parse_texture2d_element(e, &mut model_file.textures_2d);
+                    }
+                    b"tex2coord" => {
+                        if let Some((_, ref mut grp)) = current_tex2d_group {
+                            parse_tex2coord_element(e, grp);
+                        }
+                    }
                     b"vertex" => {
                         if let Some(ref mut mesh) = current_mesh {
                             parse_vertex_element(e, mesh);
@@ -1235,6 +1802,27 @@ fn parse_3mf_model_xml(xml_bytes: &[u8]) -> Result<ParsedModelFile, String> {
                 let qname = e.name();
                 let local = local_tag_name(qname.as_ref());
                 match local {
+                    b"basematerials" => {
+                        if let Some((id, list)) = current_base_materials.take() {
+                            if !id.is_empty() && !list.is_empty() {
+                                model_file.base_materials.insert(id, list);
+                            }
+                        }
+                    }
+                    b"colorgroup" => {
+                        if let Some((id, list)) = current_color_group.take() {
+                            if !id.is_empty() && !list.is_empty() {
+                                model_file.color_groups.insert(id, list);
+                            }
+                        }
+                    }
+                    b"texture2dgroup" => {
+                        if let Some((id, grp)) = current_tex2d_group.take() {
+                            if !id.is_empty() && !grp.coords.is_empty() {
+                                model_file.texture_2d_groups.insert(id, grp);
+                            }
+                        }
+                    }
                     b"mesh" => {
                         if let (Some(ref mut obj), Some(mesh)) =
                             (&mut current_object, current_mesh.take())
@@ -1260,6 +1848,125 @@ fn parse_3mf_model_xml(xml_bytes: &[u8]) -> Result<ParsedModelFile, String> {
     }
 
     Ok(model_file)
+}
+
+fn extract_xml_id_attr(e: &quick_xml::events::BytesStart<'_>) -> Option<String> {
+    for attr in e.attributes().flatten() {
+        if local_tag_name(attr.key.as_ref()) == b"id" {
+            let id = String::from_utf8_lossy(&attr.value).trim().to_string();
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+fn parse_base_material_element(
+    e: &quick_xml::events::BytesStart<'_>,
+    out: &mut Vec<ParsedBaseMaterial>,
+) {
+    let mut name = String::new();
+    let mut rgba8 = [214u8, 217, 224, 255];
+    for attr in e.attributes().flatten() {
+        let val = String::from_utf8_lossy(&attr.value);
+        match local_tag_name(attr.key.as_ref()) {
+            b"name" => name = val.into_owned(),
+            b"displaycolor" => {
+                if let Some(parsed) = color_optics::parse_color_encoding_rgba8(&val) {
+                    rgba8 = parsed;
+                }
+            }
+            _ => {}
+        }
+    }
+    out.push(ParsedBaseMaterial { name, rgba8 });
+}
+
+fn parse_color_element(e: &quick_xml::events::BytesStart<'_>, out: &mut Vec<[u8; 4]>) {
+    let mut rgba8 = [214u8, 217, 224, 255];
+    for attr in e.attributes().flatten() {
+        if local_tag_name(attr.key.as_ref()) == b"color" {
+            let val = String::from_utf8_lossy(&attr.value);
+            if let Some(parsed) = color_optics::parse_color_encoding_rgba8(&val) {
+                rgba8 = parsed;
+            }
+        }
+    }
+    out.push(rgba8);
+}
+
+fn parse_texture2d_element(
+    e: &quick_xml::events::BytesStart<'_>,
+    out: &mut HashMap<String, ParsedTexture2d>,
+) {
+    let mut id = String::new();
+    let mut path = String::new();
+    let mut tile_u = TextureTileStyle::Wrap;
+    let mut tile_v = TextureTileStyle::Wrap;
+    for attr in e.attributes().flatten() {
+        let val = String::from_utf8_lossy(&attr.value);
+        match local_tag_name(attr.key.as_ref()) {
+            b"id" => id = val.trim().to_string(),
+            b"path" => path = val.trim().trim_start_matches('/').to_string(),
+            b"tilestyleu" => tile_u = TextureTileStyle::from_attr(val.trim()),
+            b"tilestylev" => tile_v = TextureTileStyle::from_attr(val.trim()),
+            _ => {}
+        }
+    }
+    if !id.is_empty() && !path.is_empty() {
+        out.insert(
+            id,
+            ParsedTexture2d {
+                path,
+                tile_u,
+                tile_v,
+            },
+        );
+    }
+}
+
+fn parse_texture2dgroup_start(
+    e: &quick_xml::events::BytesStart<'_>,
+) -> Option<(String, ParsedTexture2dGroup)> {
+    let mut id = String::new();
+    let mut tex_id = String::new();
+    for attr in e.attributes().flatten() {
+        let val = String::from_utf8_lossy(&attr.value);
+        match local_tag_name(attr.key.as_ref()) {
+            b"id" => id = val.trim().to_string(),
+            b"texid" => tex_id = val.trim().to_string(),
+            _ => {}
+        }
+    }
+    if id.is_empty() || tex_id.is_empty() {
+        None
+    } else {
+        Some((
+            id,
+            ParsedTexture2dGroup {
+                tex_id,
+                coords: Vec::new(),
+            },
+        ))
+    }
+}
+
+fn parse_tex2coord_element(
+    e: &quick_xml::events::BytesStart<'_>,
+    grp: &mut ParsedTexture2dGroup,
+) {
+    let mut u = 0.0_f32;
+    let mut v = 0.0_f32;
+    for attr in e.attributes().flatten() {
+        let val = std::str::from_utf8(&attr.value).unwrap_or("0");
+        match local_tag_name(attr.key.as_ref()) {
+            b"u" => u = val.trim().parse().unwrap_or(0.0),
+            b"v" => v = val.trim().parse().unwrap_or(0.0),
+            _ => {}
+        }
+    }
+    grp.coords.push([u, v]);
 }
 
 fn local_tag_name(raw: &[u8]) -> &[u8] {
@@ -1288,12 +1995,28 @@ fn parse_vertex_element(e: &quick_xml::events::BytesStart<'_>, mesh: &mut Parsed
     mesh.positions.push(z);
 }
 
+fn intern_mesh_prop_pid(mesh: &mut ParsedXmlMesh, pid: &str) -> u16 {
+    if let Some(pos) = mesh.prop_pids.iter().position(|s| s == pid) {
+        return (pos as u16).saturating_add(1);
+    }
+    if mesh.prop_pids.len() >= (u16::MAX as usize) - 1 {
+        return 0;
+    }
+    mesh.prop_pids.push(pid.to_string());
+    mesh.prop_pids.len() as u16
+}
+
 fn parse_triangle_element(e: &quick_xml::events::BytesStart<'_>, mesh: &mut ParsedXmlMesh) {
+    let prev_tri_count = mesh.indices.len() / 3;
     let mut v1 = 0_u32;
     let mut v2 = 0_u32;
     let mut v3 = 0_u32;
     let mut mmu_seg_bytes: Option<Vec<u8>> = None;
-    let mut pid_state = 0_u8;
+    let mut tri_pid: Option<String> = None;
+    let mut p1_opt: Option<u32> = None;
+    let mut p2_opt: Option<u32> = None;
+    let mut p3_opt: Option<u32> = None;
+
     for attr in e.attributes().flatten() {
         let val_str = std::str::from_utf8(&attr.value).unwrap_or("0");
         match local_tag_name(attr.key.as_ref()) {
@@ -1306,11 +2029,15 @@ fn parse_triangle_element(e: &quick_xml::events::BytesStart<'_>, mesh: &mut Pars
                     mmu_seg_bytes = Some(trimmed.to_vec());
                 }
             }
-            b"p1" | b"pid" => {
-                if let Ok(idx) = val_str.parse::<u8>() {
-                    pid_state = idx.saturating_add(1);
+            b"pid" => {
+                let s = val_str.trim();
+                if !s.is_empty() {
+                    tri_pid = Some(s.to_string());
                 }
             }
+            b"p1" => p1_opt = val_str.trim().parse::<u32>().ok(),
+            b"p2" => p2_opt = val_str.trim().parse::<u32>().ok(),
+            b"p3" => p3_opt = val_str.trim().parse::<u32>().ok(),
             _ => {}
         }
     }
@@ -1322,7 +2049,38 @@ fn parse_triangle_element(e: &quick_xml::events::BytesStart<'_>, mesh: &mut Pars
         mesh.indices.push(v1);
         mesh.indices.push(v2);
         mesh.indices.push(v3);
-        mesh.triangle_mmu_states.push(pid_state);
+        mesh.triangle_mmu_states.push(0);
+    }
+
+    let has_prop = tri_pid.is_some() || p1_opt.is_some() || p2_opt.is_some() || p3_opt.is_some();
+    if has_prop || !mesh.triangle_prop_refs.is_empty() {
+        if mesh.triangle_prop_refs.len() < prev_tri_count {
+            mesh.triangle_prop_refs
+                .resize(prev_tri_count, TrianglePropRef::default());
+        }
+        let pid_idx_one_based = tri_pid
+            .as_deref()
+            .map(|pid| intern_mesh_prop_pid(mesh, pid))
+            .unwrap_or(0);
+        let prop_ref = if let Some(p1) = p1_opt {
+            TrianglePropRef {
+                pid_idx_one_based,
+                has_p1: true,
+                p1,
+                p2: p2_opt.unwrap_or(p1),
+                p3: p3_opt.unwrap_or(p1),
+            }
+        } else {
+            TrianglePropRef {
+                pid_idx_one_based,
+                has_p1: false,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+            }
+        };
+        let new_tri_count = mesh.indices.len() / 3;
+        mesh.triangle_prop_refs.resize(new_tri_count, prop_ref);
     }
 }
 
@@ -2126,5 +2884,110 @@ mod tests {
         for obj in &report.objects {
             let _ = ffi::remove_cad_object(obj.object_id);
         }
+    }
+
+    #[test]
+    fn test_import_3mf_colorgroup_and_png_texture2d() {
+        let temp_3mf = std::env::temp_dir().join(format!(
+            "manifold2_textured_3mf_test_{}.3mf",
+            std::process::id()
+        ));
+        let file = File::create(&temp_3mf).expect("create temp 3mf");
+        let mut zip = ZipWriter::new(file);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+        // Encode a 2x2 RGBA PNG:
+        // Top-left (u=0, v=1): Pure Cyan (0, 174, 239)
+        // Top-right (u=1, v=1): Pure Magenta (236, 0, 140)
+        // Bottom-left (u=0, v=0): Pure Yellow (255, 242, 0)
+        // Bottom-right (u=1, v=0): Pure White (255, 255, 255)
+        let mut png_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, 2, 2);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            let px: [u8; 16] = [
+                0, 174, 239, 255, 236, 0, 140, 255, // top row (v=1)
+                255, 242, 0, 255, 255, 255, 255, 255, // bottom row (v=0)
+            ];
+            writer.write_image_data(&px).expect("png data");
+        }
+        zip.start_file("3D/Textures/palette.png", opts).unwrap();
+        zip.write_all(&png_bytes).unwrap();
+
+        let model_xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:m="http://schemas.microsoft.com/3dmanufacturing/material/2015/02">
+  <resources>
+    <m:colorgroup id="10">
+      <m:color color="#FF4020"/>
+      <m:color color="#20A0FF"/>
+    </m:colorgroup>
+    <m:texture2d id="20" path="/3D/Textures/palette.png" contenttype="image/png" tilestyleu="clamp" tilestylev="clamp"/>
+    <m:texture2dgroup id="21" texid="20">
+      <m:tex2coord u="0.0" v="1.0"/>
+      <m:tex2coord u="1.0" v="1.0"/>
+      <m:tex2coord u="0.0" v="0.0"/>
+    </m:texture2dgroup>
+    <object id="1" name="TexturedTetra" type="model">
+      <mesh>
+        <vertices>
+          <vertex x="0" y="0" z="0"/>
+          <vertex x="12" y="0" z="0"/>
+          <vertex x="0" y="12" z="0"/>
+          <vertex x="0" y="0" z="12"/>
+        </vertices>
+        <triangles>
+          <triangle v1="0" v2="2" v3="1" pid="10" p1="0"/>
+          <triangle v1="0" v2="1" v3="3" pid="10" p1="1"/>
+          <triangle v1="0" v2="3" v3="2" pid="21" p1="0" p2="0" p3="0"/>
+          <triangle v1="1" v2="2" v3="3" pid="21" p1="2" p2="2" p3="2"/>
+        </triangles>
+      </mesh>
+    </object>
+  </resources>
+  <build>
+    <item objectid="1"/>
+  </build>
+</model>"##;
+        zip.start_file("3D/3dmodel.model", opts).unwrap();
+        zip.write_all(model_xml.as_bytes()).unwrap();
+        zip.finish().unwrap();
+
+        let mut report = LoadedBatchReport::default();
+        load_3mf_archive(&temp_3mf, &mut report);
+        let _ = std::fs::remove_file(&temp_3mf);
+
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert_eq!(report.objects.len(), 1);
+        let obj = &report.objects[0];
+        assert_eq!(obj.triangle_colors_rgba.len(), 4);
+        assert_eq!(obj.vertex_colors_rgba.len(), 4);
+
+        // Triangle 0: #FF4020 from colorgroup
+        assert_eq!(
+            color_optics::unpack_rgba8(obj.triangle_colors_rgba[0]),
+            [255, 64, 32, 255]
+        );
+        // Triangle 1: #20A0FF from colorgroup
+        assert_eq!(
+            color_optics::unpack_rgba8(obj.triangle_colors_rgba[1]),
+            [32, 160, 255, 255]
+        );
+        // Triangle 2: UV (0, 1) -> top-left of PNG = Cyan (0, 174, 239)
+        assert_eq!(
+            color_optics::unpack_rgba8(obj.triangle_colors_rgba[2]),
+            [0, 174, 239, 255]
+        );
+        // Triangle 3: UV (0, 0) -> bottom-left of PNG = Yellow (255, 242, 0)
+        assert_eq!(
+            color_optics::unpack_rgba8(obj.triangle_colors_rgba[3]),
+            [255, 242, 0, 255]
+        );
+
+        let backend_colors = ffi::get_object_triangle_colors_rgba(obj.object_id);
+        assert_eq!(backend_colors, obj.triangle_colors_rgba);
+
+        let _ = ffi::remove_cad_object(obj.object_id);
     }
 }

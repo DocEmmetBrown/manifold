@@ -343,6 +343,21 @@ pub mod ffi {
         pub layers: Vec<LayerToolpaths>,
     }
 
+    /// Nearest-surface optical sample at a 3D query point in object-local bed coordinates.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct SurfaceOpticalSample {
+        /// Signed distance $\phi_{\text{sdf}}(\mathbf{x})$ (mm, negative inside the object).
+        pub sdf_mm: f32,
+        /// Unit outward surface normal $\hat{\mathbf{n}}_{\text{surf}} = \nabla\phi_{\text{sdf}} / \|\nabla\phi_{\text{sdf}}\|$.
+        pub surf_nx: f32,
+        pub surf_ny: f32,
+        pub surf_nz: f32,
+        /// Packed `0xRRGGBBAA` sRGBA color of the nearest surface triangle (`0` if unassigned).
+        pub rgba_packed: u32,
+        /// Nearest-surface 0-based 3MF filament slot (`0..127`).
+        pub filament_slot: u8,
+    }
+
     unsafe extern "C++" {
         include!("slicer_backend.h");
 
@@ -383,6 +398,19 @@ pub mod ffi {
         /// Retrieves the per-triangle 0-based 3MF filament/colour slot indices for `object_id`
         /// (empty for single-filament objects).
         pub fn get_object_triangle_filament_slots(object_id: u64) -> Vec<u8>;
+
+        /// Assigns per-triangle packed `0xRRGGBBAA` sRGBA surface colours for `object_id`.
+        pub fn set_object_triangle_colors_rgba(object_id: u64, triangle_rgba: &[u32]);
+
+        /// Retrieves the per-triangle packed `0xRRGGBBAA` sRGBA surface colours for `object_id`.
+        pub fn get_object_triangle_colors_rgba(object_id: u64) -> Vec<u32>;
+
+        /// Batch-samples SDF depth, outward surface normal, nearest-surface `0xRRGGBBAA` colour,
+        /// and 3MF filament slot at `points_xyz` (`[x0, y0, z0, x1, y1, z1, ...]` in object-local coordinates).
+        pub fn sample_object_surface_optics(
+            object_id: u64,
+            points_xyz: &[f32],
+        ) -> Vec<SurfaceOpticalSample>;
 
         /// Retrieves the solved 3D unit tool axis (`[ax, ay, az]` per vertex in local object
         /// coordinates, length `3 * vertex_count`) sampled on the object's surface mesh from

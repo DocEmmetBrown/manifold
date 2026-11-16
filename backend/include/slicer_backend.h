@@ -32,6 +32,7 @@ struct ToolpathPoint;
 struct ExtrusionPath;
 struct LayerToolpaths;
 struct ObjectToolpathsResult;
+struct SurfaceOpticalSample;
 
 /// Core C++20 compute engine handling CAD B-Rep ingestion (OCCT), assembly
 /// decomposition, surface tessellation, STL/3MF triangle mesh registration,
@@ -95,6 +96,22 @@ public:
 
     /// Returns the per-triangle 0-based 3MF filament/colour slot indices for `objectId`.
     std::vector<std::uint8_t> objectTriangleFilamentSlots(std::uint64_t objectId) const;
+
+    /// Assigns per-triangle packed `0xRRGGBBAA` sRGBA surface colours for `objectId`.
+    void setObjectTriangleColorsRgba(
+        std::uint64_t objectId,
+        const std::uint32_t* colorsRgba,
+        std::size_t count);
+
+    /// Returns the per-triangle packed `0xRRGGBBAA` sRGBA surface colours for `objectId`.
+    std::vector<std::uint32_t> objectTriangleColorsRgba(std::uint64_t objectId) const;
+
+    /// Batch-samples SDF depth, outward surface normal, nearest-surface `0xRRGGBBAA` colour,
+    /// and 3MF filament slot at `pointsXyz` (`3 * N` floats in object-local coordinates).
+    std::vector<SurfaceOpticalSample> sampleObjectSurfaceOptics(
+        std::uint64_t objectId,
+        const float* pointsXyz,
+        std::size_t floatCount) const;
 
     /// Returns the solved 3D unit tool axis (`3 * vertexBuffer.size()` floats `[ax, ay, az, ...]`)
     /// sampled at each surface vertex of `objectId` from `toolAxisGrid` (or empty if unavailable).
@@ -260,6 +277,13 @@ void set_object_triangle_filament_slots(
     std::uint64_t object_id,
     rust::Slice<const std::uint8_t> triangle_slots);
 rust::Vec<std::uint8_t> get_object_triangle_filament_slots(std::uint64_t object_id);
+void set_object_triangle_colors_rgba(
+    std::uint64_t object_id,
+    rust::Slice<const std::uint32_t> triangle_rgba);
+rust::Vec<std::uint32_t> get_object_triangle_colors_rgba(std::uint64_t object_id);
+rust::Vec<SurfaceOpticalSample> sample_object_surface_optics(
+    std::uint64_t object_id,
+    rust::Slice<const float> points_xyz);
 rust::Vec<float> get_object_vertex_tool_axes(std::uint64_t object_id);
 rust::Vec<float> get_object_vertex_support_needed(std::uint64_t object_id);
 bool remove_cad_object(std::uint64_t object_id);

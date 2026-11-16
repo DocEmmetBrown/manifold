@@ -72,12 +72,17 @@ struct ObjectRecord {
     std::vector<std::uint32_t> triangleFaceIds;
     /// Per-triangle 0-based 3MF filament/colour slot index (1 entry per triangle when present).
     std::vector<std::uint8_t> triangleFilamentSlots;
+    /// Per-triangle packed `0xRRGGBBAA` sRGBA surface colour (1 entry per triangle when present).
+    std::vector<std::uint32_t> triangleColorsRgba;
     /// Generic dictionary of named scalar fields (e.g., "sdf", "eikonal", "overhang", "tool_tilt_deg").
     std::map<std::string, openvdb::FloatGrid::Ptr> scalarFields;
+    /// Nearest-surface packed `0xRRGGBBAA` sRGBA colour grid (stored as `Int32Grid` bit-cast).
+    openvdb::Int32Grid::Ptr surfaceColorGrid;
     /// Solved 3D unit tool axis field \hat{a}(x) in bed coordinates.
     openvdb::Vec3SGrid::Ptr toolAxisGrid;
     /// Coarse full-interior grids when `isMultiResolution == true`.
     std::map<std::string, openvdb::FloatGrid::Ptr> coarseScalarFields;
+    openvdb::Int32Grid::Ptr coarseSurfaceColorGrid;
     openvdb::Vec3SGrid::Ptr coarseToolAxisGrid;
     bool isMultiResolution = false;
     float fineShellInnerDepthMm = 0.0f;
@@ -585,7 +590,9 @@ void extractWeldedWatertightMesh(
     std::vector<openvdb::Vec3I>& outTriangles,
     std::vector<openvdb::Vec3I>* outPatchTriangles = nullptr,
     const std::vector<std::uint8_t>* inTriangleFilamentSlots = nullptr,
-    std::vector<std::uint8_t>* outTriangleFilamentSlots = nullptr)
+    std::vector<std::uint8_t>* outTriangleFilamentSlots = nullptr,
+    const std::vector<std::uint32_t>* inTriangleColorsRgba = nullptr,
+    std::vector<std::uint32_t>* outTriangleColorsRgba = nullptr)
 {
     outPoints.clear();
     outTriangles.clear();
@@ -594,6 +601,9 @@ void extractWeldedWatertightMesh(
     }
     if (outTriangleFilamentSlots != nullptr) {
         outTriangleFilamentSlots->clear();
+    }
+    if (outTriangleColorsRgba != nullptr) {
+        outTriangleColorsRgba->clear();
     }
     if (vertexBuffer.empty() || indexBuffer.size() < 3) {
         return;
@@ -624,6 +634,9 @@ void extractWeldedWatertightMesh(
     if (outTriangleFilamentSlots != nullptr) {
         outTriangleFilamentSlots->reserve(indexBuffer.size() / 3);
     }
+    if (outTriangleColorsRgba != nullptr) {
+        outTriangleColorsRgba->reserve(indexBuffer.size() / 3);
+    }
     struct EdgeDirCounts {
         std::uint32_t forwardCount = 0; // u -> v (u < v)
         std::uint32_t reverseCount = 0; // v -> u (u < v)
@@ -645,13 +658,20 @@ void extractWeldedWatertightMesh(
             continue;
         }
         outTriangles.emplace_back(w0, w1, w2);
+        const std::size_t triIdx = t / 3;
         if (outTriangleFilamentSlots != nullptr) {
-            const std::size_t triIdx = t / 3;
             const std::uint8_t slot =
                 (inTriangleFilamentSlots != nullptr && triIdx < inTriangleFilamentSlots->size())
                     ? (*inTriangleFilamentSlots)[triIdx]
                     : 0u;
             outTriangleFilamentSlots->push_back(slot);
+        }
+        if (outTriangleColorsRgba != nullptr) {
+            const std::uint32_t rgba =
+                (inTriangleColorsRgba != nullptr && triIdx < inTriangleColorsRgba->size())
+                    ? (*inTriangleColorsRgba)[triIdx]
+                    : 0u;
+            outTriangleColorsRgba->push_back(rgba);
         }
 
         const std::array<std::pair<std::uint32_t, std::uint32_t>, 3> halfEdges{{
@@ -793,6 +813,12 @@ void extractWeldedWatertightMesh(
                 patchTris.size(),
                 0u);
         }
+        if (outTriangleColorsRgba != nullptr) {
+            outTriangleColorsRgba->insert(
+                outTriangleColorsRgba->end(),
+                patchTris.size(),
+                0u);
+        }
         if (outPatchTriangles != nullptr) {
             *outPatchTriangles = std::move(patchTris);
         }
@@ -826,12 +852,20 @@ openvdb::FloatGrid::Ptr buildSdfAndFilamentSlotGrids(
     float inBandVoxels,
     const std::vector<std::uint8_t>& triangleFilamentSlots,
     bool hasMultiFilament,
-    openvdb::FloatGrid::Ptr* outFilamentSlotGrid)
+    openvdb::FloatGrid::Ptr* outFilamentSlotGrid,
+    const std::vector<std::uint32_t>& triangleColorsRgba,
+    bool hasSurfaceColors,
+    openvdb::Int32Grid::Ptr* outSurfaceColorGrid)
 {
     if (outFilamentSlotGrid != nullptr) {
         outFilamentSlotGrid->reset();
     }
-    if (!hasMultiFilament || outFilamentSlotGrid == nullptr || points.empty() || triangles.empty()) {
+    if (outSurfaceColorGrid != nullptr) {
+        outSurfaceColorGrid->reset();
+    }
+    const bool wantSlotGrid = hasMultiFilament && (outFilamentSlotGrid != nullptr);
+    const bool wantColorGrid = hasSurfaceColors && (outSurfaceColorGrid != nullptr);
+    if ((!wantSlotGrid && !wantColorGrid) || points.empty() || triangles.empty()) {
         std::vector<openvdb::Vec4I> quads;
         return openvdb::tools::meshToSignedDistanceField<openvdb::FloatGrid>(
             xform, points, triangles, quads, exBandVoxels, inBandVoxels);
@@ -859,20 +893,66 @@ openvdb::FloatGrid::Ptr buildSdfAndFilamentSlotGrids(
         0,
         polyIdxGrid.get());
 
-    openvdb::FloatGrid::Ptr slotGrid = openvdb::FloatGrid::create(0.0f);
-    slotGrid->setTransform(xform.copy());
-    slotGrid->setName("filament_slot");
-    auto slotAcc = slotGrid->getAccessor();
+    openvdb::FloatGrid::Ptr slotGrid;
+    if (wantSlotGrid) {
+        slotGrid = openvdb::FloatGrid::create(0.0f);
+        slotGrid->setTransform(xform.copy());
+        slotGrid->setName("filament_slot");
+    }
+    openvdb::Int32Grid::Ptr colorGrid;
+    if (wantColorGrid) {
+        colorGrid = openvdb::Int32Grid::create(0);
+        colorGrid->setTransform(xform.copy());
+        colorGrid->setName("surface_color_rgba");
+    }
 
-    for (auto iter = polyIdxGrid->cbeginValueOn(); iter; ++iter) {
-        const std::int32_t triIdx = *iter;
-        if (triIdx >= 0 && static_cast<std::size_t>(triIdx) < triangleFilamentSlots.size()) {
-            slotAcc.setValueOn(
-                iter.getCoord(),
-                static_cast<float>(triangleFilamentSlots[static_cast<std::size_t>(triIdx)]));
+    if (wantSlotGrid && wantColorGrid) {
+        auto slotAcc = slotGrid->getAccessor();
+        auto colorAcc = colorGrid->getAccessor();
+        for (auto iter = polyIdxGrid->cbeginValueOn(); iter; ++iter) {
+            const std::int32_t triIdx = *iter;
+            if (triIdx >= 0) {
+                const std::size_t uIdx = static_cast<std::size_t>(triIdx);
+                const openvdb::Coord coord = iter.getCoord();
+                if (uIdx < triangleFilamentSlots.size()) {
+                    slotAcc.setValueOn(coord, static_cast<float>(triangleFilamentSlots[uIdx]));
+                }
+                if (uIdx < triangleColorsRgba.size() && triangleColorsRgba[uIdx] != 0u) {
+                    colorAcc.setValueOn(
+                        coord,
+                        static_cast<std::int32_t>(triangleColorsRgba[uIdx]));
+                }
+            }
+        }
+    } else if (wantSlotGrid) {
+        auto slotAcc = slotGrid->getAccessor();
+        for (auto iter = polyIdxGrid->cbeginValueOn(); iter; ++iter) {
+            const std::int32_t triIdx = *iter;
+            if (triIdx >= 0 && static_cast<std::size_t>(triIdx) < triangleFilamentSlots.size()) {
+                slotAcc.setValueOn(
+                    iter.getCoord(),
+                    static_cast<float>(triangleFilamentSlots[static_cast<std::size_t>(triIdx)]));
+            }
+        }
+    } else if (wantColorGrid) {
+        auto colorAcc = colorGrid->getAccessor();
+        for (auto iter = polyIdxGrid->cbeginValueOn(); iter; ++iter) {
+            const std::int32_t triIdx = *iter;
+            if (triIdx >= 0 && static_cast<std::size_t>(triIdx) < triangleColorsRgba.size()) {
+                const std::uint32_t rgba = triangleColorsRgba[static_cast<std::size_t>(triIdx)];
+                if (rgba != 0u) {
+                    colorAcc.setValueOn(iter.getCoord(), static_cast<std::int32_t>(rgba));
+                }
+            }
         }
     }
-    *outFilamentSlotGrid = slotGrid;
+
+    if (wantSlotGrid) {
+        *outFilamentSlotGrid = slotGrid;
+    }
+    if (wantColorGrid) {
+        *outSurfaceColorGrid = colorGrid;
+    }
     return sdfGrid;
 }
 
@@ -892,8 +972,10 @@ void buildObjectScalarFields(
     float narrowBandVoxels = 6.0f)
 {
     rec.scalarFields.clear();
+    rec.surfaceColorGrid.reset();
     rec.toolAxisGrid.reset();
     rec.coarseScalarFields.clear();
+    rec.coarseSurfaceColorGrid.reset();
     rec.coarseToolAxisGrid.reset();
     rec.isMultiResolution = false;
     rec.fineShellInnerDepthMm = 0.0f;
@@ -914,7 +996,9 @@ void buildObjectScalarFields(
     std::vector<openvdb::Vec3s> points;
     std::vector<openvdb::Vec3I> triangles;
     std::vector<std::uint8_t> weldedTriFilamentSlots;
+    std::vector<std::uint32_t> weldedTriColorsRgba;
     const bool hasInputFilamentSlots = !rec.triangleFilamentSlots.empty();
+    const bool hasInputColorsRgba = !rec.triangleColorsRgba.empty();
     extractWeldedWatertightMesh(
         rec.vertexBuffer,
         rec.indexBuffer,
@@ -922,7 +1006,9 @@ void buildObjectScalarFields(
         triangles,
         nullptr,
         hasInputFilamentSlots ? &rec.triangleFilamentSlots : nullptr,
-        hasInputFilamentSlots ? &weldedTriFilamentSlots : nullptr);
+        hasInputFilamentSlots ? &weldedTriFilamentSlots : nullptr,
+        hasInputColorsRgba ? &rec.triangleColorsRgba : nullptr,
+        hasInputColorsRgba ? &weldedTriColorsRgba : nullptr);
     if (points.empty() || triangles.empty()) {
         return;
     }
@@ -934,6 +1020,13 @@ void buildObjectScalarFields(
                 hasMultiFilament = true;
                 break;
             }
+        }
+    }
+    bool hasSurfaceColors = false;
+    for (const std::uint32_t rgba : weldedTriColorsRgba) {
+        if (rgba != 0u) {
+            hasSurfaceColors = true;
+            break;
         }
     }
     std::vector<openvdb::Vec4I> quads;
@@ -1045,6 +1138,7 @@ void buildObjectScalarFields(
             openvdb::math::Transform::Ptr fineXform =
                 openvdb::math::Transform::createLinearTransform(fineVoxelSize);
             openvdb::FloatGrid::Ptr fineFilamentSlotGrid;
+            openvdb::Int32Grid::Ptr fineSurfaceColorGrid;
             openvdb::FloatGrid::Ptr fineSdfGrid = buildSdfAndFilamentSlotGrids(
                 *fineXform,
                 points,
@@ -1053,7 +1147,10 @@ void buildObjectScalarFields(
                 inBandFineVoxels,
                 weldedTriFilamentSlots,
                 hasMultiFilament,
-                &fineFilamentSlotGrid);
+                &fineFilamentSlotGrid,
+                weldedTriColorsRgba,
+                hasSurfaceColors,
+                &fineSurfaceColorGrid);
             fineSdfGrid->setName("sdf");
 
             // Check whether the part actually has a deep interior core beyond `inBandFineMm`.
@@ -1076,6 +1173,7 @@ void buildObjectScalarFields(
                 if (fineFilamentSlotGrid) {
                     rec.scalarFields["filament_slot"] = fineFilamentSlotGrid;
                 }
+                rec.surfaceColorGrid = fineSurfaceColorGrid;
                 EikonalSolveResult fineDirectSolved = solveConstrainedEikonal(
                     *fineSdfGrid,
                     rec.minZ,
@@ -1115,6 +1213,7 @@ void buildObjectScalarFields(
                 openvdb::math::Transform::Ptr coarseXform =
                     openvdb::math::Transform::createLinearTransform(coarseVoxelSize);
                 openvdb::FloatGrid::Ptr coarseFilamentSlotGrid;
+                openvdb::Int32Grid::Ptr coarseSurfaceColorGrid;
                 openvdb::FloatGrid::Ptr coarseSdfGrid = buildSdfAndFilamentSlotGrids(
                     *coarseXform,
                     points,
@@ -1123,12 +1222,16 @@ void buildObjectScalarFields(
                     inBandCoarseVoxels,
                     weldedTriFilamentSlots,
                     hasMultiFilament,
-                    &coarseFilamentSlotGrid);
+                    &coarseFilamentSlotGrid,
+                    weldedTriColorsRgba,
+                    hasSurfaceColors,
+                    &coarseSurfaceColorGrid);
                 coarseSdfGrid->setName("sdf");
                 rec.coarseScalarFields["sdf"] = coarseSdfGrid;
                 if (coarseFilamentSlotGrid) {
                     rec.coarseScalarFields["filament_slot"] = coarseFilamentSlotGrid;
                 }
+                rec.coarseSurfaceColorGrid = coarseSurfaceColorGrid;
 
                 EikonalSolverContext coarseCtx = ctx;
                 coarseCtx.reportProgress = [](float frac, const char* msg) {
@@ -1152,6 +1255,7 @@ void buildObjectScalarFields(
                 if (fineFilamentSlotGrid) {
                     rec.scalarFields["filament_slot"] = fineFilamentSlotGrid;
                 }
+                rec.surfaceColorGrid = fineSurfaceColorGrid;
 
                 EikonalSolveResult fineSolved = solveFineShellWithCoarseGuidance(
                     *fineSdfGrid,
@@ -1201,6 +1305,7 @@ void buildObjectScalarFields(
 
     // 1. Compute full-interior + exterior Signed Distance Field ("sdf")
     openvdb::FloatGrid::Ptr filamentSlotGrid;
+    openvdb::Int32Grid::Ptr surfaceColorGrid;
     openvdb::FloatGrid::Ptr sdfGrid = buildSdfAndFilamentSlotGrids(
         *xform,
         points,
@@ -1209,12 +1314,16 @@ void buildObjectScalarFields(
         inBandVoxels,
         weldedTriFilamentSlots,
         hasMultiFilament,
-        &filamentSlotGrid);
+        &filamentSlotGrid,
+        weldedTriColorsRgba,
+        hasSurfaceColors,
+        &surfaceColorGrid);
     sdfGrid->setName("sdf");
     rec.scalarFields["sdf"] = sdfGrid;
     if (filamentSlotGrid) {
         rec.scalarFields["filament_slot"] = filamentSlotGrid;
     }
+    rec.surfaceColorGrid = surfaceColorGrid;
 
     // 2. Solve iterative constrained 3D Eikonal + tool orientation fields
     EikonalSolveResult solved = solveConstrainedEikonal(
@@ -1713,6 +1822,7 @@ std::uint64_t SlicerBackend::cloneObject(
     rec.indexBuffer = src.indexBuffer;
     rec.triangleFaceIds = src.triangleFaceIds;
     rec.triangleFilamentSlots = src.triangleFilamentSlots;
+    rec.triangleColorsRgba = src.triangleColorsRgba;
     rec.isMultiResolution = src.isMultiResolution;
     rec.fineShellInnerDepthMm = src.fineShellInnerDepthMm;
     rec.coarseToFineRatio = src.coarseToFineRatio;
@@ -1726,6 +1836,9 @@ std::uint64_t SlicerBackend::cloneObject(
             rec.scalarFields[kv.first] = kv.second->deepCopy();
         }
     }
+    if (src.surfaceColorGrid) {
+        rec.surfaceColorGrid = src.surfaceColorGrid->deepCopy();
+    }
     if (src.toolAxisGrid) {
         rec.toolAxisGrid = src.toolAxisGrid->deepCopy();
     }
@@ -1733,6 +1846,9 @@ std::uint64_t SlicerBackend::cloneObject(
         if (kv.second) {
             rec.coarseScalarFields[kv.first] = kv.second->deepCopy();
         }
+    }
+    if (src.coarseSurfaceColorGrid) {
+        rec.coarseSurfaceColorGrid = src.coarseSurfaceColorGrid->deepCopy();
     }
     if (src.coarseToolAxisGrid) {
         rec.coarseToolAxisGrid = src.coarseToolAxisGrid->deepCopy();
@@ -1807,6 +1923,240 @@ std::vector<std::uint8_t> SlicerBackend::objectTriangleFilamentSlots(std::uint64
         return {};
     }
     return it->second.triangleFilamentSlots;
+}
+
+void SlicerBackend::setObjectTriangleColorsRgba(
+    std::uint64_t objectId,
+    const std::uint32_t* colorsRgba,
+    std::size_t count)
+{
+    const auto it = impl_->objects.find(objectId);
+    if (it == impl_->objects.end()) {
+        return;
+    }
+    if (colorsRgba != nullptr && count > 0) {
+        it->second.triangleColorsRgba.assign(colorsRgba, colorsRgba + count);
+    } else {
+        it->second.triangleColorsRgba.clear();
+    }
+}
+
+std::vector<std::uint32_t> SlicerBackend::objectTriangleColorsRgba(std::uint64_t objectId) const {
+    const auto it = impl_->objects.find(objectId);
+    if (it == impl_->objects.end()) {
+        return {};
+    }
+    return it->second.triangleColorsRgba;
+}
+
+std::vector<SurfaceOpticalSample> SlicerBackend::sampleObjectSurfaceOptics(
+    std::uint64_t objectId,
+    const float* pointsXyz,
+    std::size_t floatCount) const
+{
+    const std::size_t numPts = floatCount / 3;
+    std::vector<SurfaceOpticalSample> out(numPts);
+    if (pointsXyz == nullptr || numPts == 0) {
+        return out;
+    }
+
+    const auto it = impl_->objects.find(objectId);
+    if (it == impl_->objects.end()) {
+        return out;
+    }
+    const ObjectRecord& rec = it->second;
+    const auto sdfIt = rec.scalarFields.find("sdf");
+    if (sdfIt == rec.scalarFields.end() || !sdfIt->second) {
+        return out;
+    }
+
+    const openvdb::FloatGrid& sdfGrid = *sdfIt->second;
+    const float voxelSize = static_cast<float>(sdfGrid.transform().voxelSize()[0]);
+    const float fineBgLimit = sdfGrid.background() - std::max(0.5f * voxelSize, 0.25f);
+
+    const openvdb::FloatGrid* coarseSdfPtr = nullptr;
+    if (rec.isMultiResolution) {
+        const auto cSdfIt = rec.coarseScalarFields.find("sdf");
+        if (cSdfIt != rec.coarseScalarFields.end() && cSdfIt->second) {
+            coarseSdfPtr = cSdfIt->second.get();
+        }
+    }
+
+    const openvdb::FloatGrid* slotGridPtr = nullptr;
+    {
+        const auto slotIt = rec.scalarFields.find("filament_slot");
+        if (slotIt != rec.scalarFields.end() && slotIt->second) {
+            slotGridPtr = slotIt->second.get();
+        }
+    }
+    const openvdb::FloatGrid* coarseSlotGridPtr = nullptr;
+    if (rec.isMultiResolution) {
+        const auto cSlotIt = rec.coarseScalarFields.find("filament_slot");
+        if (cSlotIt != rec.coarseScalarFields.end() && cSlotIt->second) {
+            coarseSlotGridPtr = cSlotIt->second.get();
+        }
+    }
+
+    const openvdb::Int32Grid* colorGridPtr = rec.surfaceColorGrid ? rec.surfaceColorGrid.get() : nullptr;
+    const openvdb::Int32Grid* coarseColorGridPtr =
+        (rec.isMultiResolution && rec.coarseSurfaceColorGrid)
+            ? rec.coarseSurfaceColorGrid.get()
+            : nullptr;
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, numPts, 256),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            auto sdfAcc = sdfGrid.getConstAccessor();
+            openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+                sdfSampler(sdfAcc, sdfGrid.transform());
+
+            const openvdb::FloatGrid* fbSdf = (coarseSdfPtr != nullptr) ? coarseSdfPtr : &sdfGrid;
+            auto coarseSdfAcc = fbSdf->getConstAccessor();
+            openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+                coarseSdfSampler(coarseSdfAcc, fbSdf->transform());
+
+            std::unique_ptr<openvdb::Int32Grid::ConstAccessor> colorAcc;
+            if (colorGridPtr != nullptr) {
+                colorAcc = std::make_unique<openvdb::Int32Grid::ConstAccessor>(colorGridPtr->getConstAccessor());
+            }
+            std::unique_ptr<openvdb::Int32Grid::ConstAccessor> coarseColorAcc;
+            if (coarseColorGridPtr != nullptr) {
+                coarseColorAcc = std::make_unique<openvdb::Int32Grid::ConstAccessor>(
+                    coarseColorGridPtr->getConstAccessor());
+            }
+            std::unique_ptr<openvdb::FloatGrid::ConstAccessor> slotAcc;
+            if (slotGridPtr != nullptr) {
+                slotAcc = std::make_unique<openvdb::FloatGrid::ConstAccessor>(slotGridPtr->getConstAccessor());
+            }
+            std::unique_ptr<openvdb::FloatGrid::ConstAccessor> coarseSlotAcc;
+            if (coarseSlotGridPtr != nullptr) {
+                coarseSlotAcc = std::make_unique<openvdb::FloatGrid::ConstAccessor>(
+                    coarseSlotGridPtr->getConstAccessor());
+            }
+
+            auto sampleSdf = [&](const openvdb::Vec3d& wp) -> float {
+                const float fVal = sdfSampler.wsSample(wp);
+                if (std::isfinite(fVal) && std::abs(fVal) < fineBgLimit) {
+                    return fVal;
+                }
+                if (coarseSdfPtr != nullptr) {
+                    return coarseSdfSampler.wsSample(wp);
+                }
+                return fVal;
+            };
+
+            const double h = 0.5 * static_cast<double>(voxelSize);
+
+            for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                const double px = static_cast<double>(pointsXyz[i * 3 + 0]);
+                const double py = static_cast<double>(pointsXyz[i * 3 + 1]);
+                const double pz = static_cast<double>(pointsXyz[i * 3 + 2]);
+                const openvdb::Vec3d wp(px, py, pz);
+
+                const float sdfVal = sampleSdf(wp);
+                const float gx =
+                    sampleSdf(wp + openvdb::Vec3d(h, 0.0, 0.0)) -
+                    sampleSdf(wp - openvdb::Vec3d(h, 0.0, 0.0));
+                const float gy =
+                    sampleSdf(wp + openvdb::Vec3d(0.0, h, 0.0)) -
+                    sampleSdf(wp - openvdb::Vec3d(0.0, h, 0.0));
+                const float gz =
+                    sampleSdf(wp + openvdb::Vec3d(0.0, 0.0, h)) -
+                    sampleSdf(wp - openvdb::Vec3d(0.0, 0.0, h));
+                const float gLen = std::sqrt(gx * gx + gy * gy + gz * gz);
+
+                float nx = 0.0f, ny = 0.0f, nz = 1.0f;
+                if (gLen > 1.0e-6f) {
+                    nx = gx / gLen;
+                    ny = gy / gLen;
+                    nz = gz / gLen;
+                }
+
+                // Project query point to its nearest surface footpoint \phi_sdf = 0 so inner walls
+                // and deeper conformal layers sample the exact same surface triangle colour!
+                const openvdb::Vec3d wpSurf(
+                    px - static_cast<double>(sdfVal * nx),
+                    py - static_cast<double>(sdfVal * ny),
+                    pz - static_cast<double>(sdfVal * nz));
+
+                std::uint32_t packedRgba = 0u;
+                if (colorAcc && colorGridPtr != nullptr) {
+                    const openvdb::Coord cSurf =
+                        colorGridPtr->transform().worldToIndexCellCentered(wpSurf);
+                    std::int32_t raw = 0;
+                    if (colorAcc->probeValue(cSurf, raw) && raw != 0) {
+                        packedRgba = static_cast<std::uint32_t>(raw);
+                    } else {
+                        const openvdb::Coord c0 =
+                            colorGridPtr->transform().worldToIndexCellCentered(wp);
+                        if (colorAcc->probeValue(c0, raw) && raw != 0) {
+                            packedRgba = static_cast<std::uint32_t>(raw);
+                        } else {
+                            int bestD2 = 100;
+                            for (int dz = -1; dz <= 1; ++dz) {
+                                for (int dy = -1; dy <= 1; ++dy) {
+                                    for (int dx = -1; dx <= 1; ++dx) {
+                                        const int d2 = dx * dx + dy * dy + dz * dz;
+                                        if (d2 >= bestD2) {
+                                            continue;
+                                        }
+                                        if (colorAcc->probeValue(
+                                                cSurf + openvdb::Coord(dx, dy, dz), raw) &&
+                                            raw != 0) {
+                                            bestD2 = d2;
+                                            packedRgba = static_cast<std::uint32_t>(raw);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (packedRgba == 0u && coarseColorAcc && coarseColorGridPtr != nullptr) {
+                    const openvdb::Coord cCoarse =
+                        coarseColorGridPtr->transform().worldToIndexCellCentered(wpSurf);
+                    std::int32_t raw = 0;
+                    if (coarseColorAcc->probeValue(cCoarse, raw) && raw != 0) {
+                        packedRgba = static_cast<std::uint32_t>(raw);
+                    }
+                }
+
+                std::uint8_t slotVal = 0u;
+                if (slotAcc && slotGridPtr != nullptr) {
+                    const openvdb::Coord cSurf =
+                        slotGridPtr->transform().worldToIndexCellCentered(wpSurf);
+                    float sv = 0.0f;
+                    if (slotAcc->probeValue(cSurf, sv)) {
+                        slotVal = static_cast<std::uint8_t>(std::clamp(std::lround(sv), 0L, 127L));
+                    } else {
+                        const openvdb::Coord c0 =
+                            slotGridPtr->transform().worldToIndexCellCentered(wp);
+                        if (slotAcc->probeValue(c0, sv)) {
+                            slotVal =
+                                static_cast<std::uint8_t>(std::clamp(std::lround(sv), 0L, 127L));
+                        }
+                    }
+                } else if (coarseSlotAcc && coarseSlotGridPtr != nullptr) {
+                    const openvdb::Coord cCoarse =
+                        coarseSlotGridPtr->transform().worldToIndexCellCentered(wpSurf);
+                    float sv = 0.0f;
+                    if (coarseSlotAcc->probeValue(cCoarse, sv)) {
+                        slotVal = static_cast<std::uint8_t>(std::clamp(std::lround(sv), 0L, 127L));
+                    }
+                }
+
+                SurfaceOpticalSample sample{};
+                sample.sdf_mm = sdfVal;
+                sample.surf_nx = nx;
+                sample.surf_ny = ny;
+                sample.surf_nz = nz;
+                sample.rgba_packed = packedRgba;
+                sample.filament_slot = slotVal;
+                out[i] = sample;
+            }
+        });
+
+    return out;
 }
 
 std::vector<float> SlicerBackend::objectVertexToolAxes(std::uint64_t objectId) const {
@@ -2184,6 +2534,7 @@ bool SlicerBackend::recomputeObjectFields(
         workingRec.vertexBuffer = it->second.vertexBuffer;
         workingRec.indexBuffer = it->second.indexBuffer;
         workingRec.triangleFilamentSlots = it->second.triangleFilamentSlots;
+        workingRec.triangleColorsRgba = it->second.triangleColorsRgba;
 
         snapshotBackend.impl_->nozzleAxisBed = impl_->nozzleAxisBed;
         snapshotBackend.impl_->gravityDirectionBed = impl_->gravityDirectionBed;
@@ -2209,8 +2560,10 @@ bool SlicerBackend::recomputeObjectFields(
         const auto it = impl_->objects.find(objectId);
         if (it != impl_->objects.end()) {
             it->second.scalarFields = std::move(workingRec.scalarFields);
+            it->second.surfaceColorGrid = std::move(workingRec.surfaceColorGrid);
             it->second.toolAxisGrid = std::move(workingRec.toolAxisGrid);
             it->second.coarseScalarFields = std::move(workingRec.coarseScalarFields);
+            it->second.coarseSurfaceColorGrid = std::move(workingRec.coarseSurfaceColorGrid);
             it->second.coarseToolAxisGrid = std::move(workingRec.coarseToolAxisGrid);
             it->second.isMultiResolution = workingRec.isMultiResolution;
             it->second.fineShellInnerDepthMm = workingRec.fineShellInnerDepthMm;
@@ -2818,6 +3171,45 @@ rust::Vec<std::uint8_t> get_object_triangle_filament_slots(std::uint64_t object_
     out.reserve(src.size());
     for (const std::uint8_t slot : src) {
         out.push_back(slot);
+    }
+    return out;
+}
+
+void set_object_triangle_colors_rgba(
+    std::uint64_t object_id,
+    rust::Slice<const std::uint32_t> triangle_rgba)
+{
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    globalBackend().setObjectTriangleColorsRgba(
+        object_id,
+        triangle_rgba.data(),
+        triangle_rgba.size());
+}
+
+rust::Vec<std::uint32_t> get_object_triangle_colors_rgba(std::uint64_t object_id) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    const auto src = globalBackend().objectTriangleColorsRgba(object_id);
+    rust::Vec<std::uint32_t> out;
+    out.reserve(src.size());
+    for (const std::uint32_t c : src) {
+        out.push_back(c);
+    }
+    return out;
+}
+
+rust::Vec<SurfaceOpticalSample> sample_object_surface_optics(
+    std::uint64_t object_id,
+    rust::Slice<const float> points_xyz)
+{
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    const auto src = globalBackend().sampleObjectSurfaceOptics(
+        object_id,
+        points_xyz.data(),
+        points_xyz.size());
+    rust::Vec<SurfaceOpticalSample> out;
+    out.reserve(src.size());
+    for (const auto& s : src) {
+        out.push_back(s);
     }
     return out;
 }

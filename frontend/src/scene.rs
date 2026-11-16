@@ -105,6 +105,8 @@ pub struct SceneObject {
     pub triangle_to_patch: Vec<u32>,
     pub triangle_filament_slots: Vec<u8>,
     pub vertex_filament_slots: Vec<u8>,
+    pub triangle_colors_rgba: Vec<u32>,
+    pub vertex_colors_rgba: Vec<[u8; 4]>,
     pub vertex_buffer: Option<wgpu::Buffer>,
     pub index_buffer: Option<wgpu::Buffer>,
     pub visible: bool,
@@ -558,7 +560,18 @@ pub fn spawn_loaded_objects(
 
         let mut positions = Vec::with_capacity(data.vertices.len());
         let mut normals = Vec::with_capacity(data.vertices.len());
-        let colors = vec![[1.0f32, 1.0, 1.0, 1.0]; data.vertices.len()];
+        let colors: Vec<[f32; 4]> = if data.vertex_colors_rgba.len() == data.vertices.len() {
+            data.vertex_colors_rgba
+                .iter()
+                .map(|&rgba| {
+                    let srgba = crate::color_optics::rgba8_to_srgba(rgba);
+                    let lin = crate::color_optics::srgb_to_linear_rgb([srgba[0], srgba[1], srgba[2]]);
+                    [lin[0] as f32, lin[1] as f32, lin[2] as f32, 1.0]
+                })
+                .collect()
+        } else {
+            vec![[1.0f32, 1.0, 1.0, 1.0]; data.vertices.len()]
+        };
         for v in &data.vertices {
             positions.push([v.x, v.y, v.z]);
             normals.push([v.nx, v.ny, v.nz]);
@@ -575,7 +588,8 @@ pub fn spawn_loaded_objects(
 
         let mesh_handle = meshes.add(bevy_mesh);
 
-        let has_filament_colors = !data.vertex_filament_slots.is_empty();
+        let has_filament_colors =
+            !data.vertex_filament_slots.is_empty() || !data.vertex_colors_rgba.is_empty();
         let mat_handle = materials.add(StandardMaterial {
             base_color: if has_filament_colors {
                 Color::srgb(1.0, 1.0, 1.0)
@@ -635,6 +649,8 @@ pub fn spawn_loaded_objects(
             triangle_to_patch: data.triangle_to_patch,
             triangle_filament_slots: data.triangle_filament_slots,
             vertex_filament_slots: data.vertex_filament_slots,
+            triangle_colors_rgba: data.triangle_colors_rgba,
+            vertex_colors_rgba: data.vertex_colors_rgba,
             vertex_buffer,
             index_buffer,
             visible: true,
@@ -767,6 +783,8 @@ pub fn clone_object_on_plate(
     let src_tri_to_patch = plate.objects[src_idx].triangle_to_patch.clone();
     let src_tri_filament_slots = plate.objects[src_idx].triangle_filament_slots.clone();
     let src_vert_filament_slots = plate.objects[src_idx].vertex_filament_slots.clone();
+    let src_tri_colors_rgba = plate.objects[src_idx].triangle_colors_rgba.clone();
+    let src_vert_colors_rgba = plate.objects[src_idx].vertex_colors_rgba.clone();
 
     let src_surface_hints: Vec<SurfaceFaceHint> = config
         .eikonal
@@ -873,6 +891,8 @@ pub fn clone_object_on_plate(
             triangle_to_patch: src_tri_to_patch.clone(),
             triangle_filament_slots: src_tri_filament_slots.clone(),
             vertex_filament_slots: src_vert_filament_slots.clone(),
+            triangle_colors_rgba: src_tri_colors_rgba.clone(),
+            vertex_colors_rgba: src_vert_colors_rgba.clone(),
         });
     }
 
@@ -995,7 +1015,8 @@ pub fn update_selection_materials_system(
                 };
                 let use_vertex_colormap = vis_state.surface_color_mode
                     != crate::field_vis::ObjectSurfaceColorMode::DefaultCad
-                    || !obj.vertex_filament_slots.is_empty();
+                    || !obj.vertex_filament_slots.is_empty()
+                    || !obj.vertex_colors_rgba.is_empty();
                 if alpha < 0.02 {
                     mat.base_color = Color::srgba(0.55, 0.60, 0.68, 0.0);
                     mat.alpha_mode = AlphaMode::Mask(1.0);
@@ -1036,7 +1057,7 @@ pub fn update_selection_materials_system(
                     mat.double_sided = true;
                 }
             } else {
-                if !obj.vertex_filament_slots.is_empty() {
+                if !obj.vertex_filament_slots.is_empty() || !obj.vertex_colors_rgba.is_empty() {
                     mat.base_color = Color::srgb(0.92, 0.92, 0.92);
                     mat.metallic = 0.04;
                     mat.perceptual_roughness = 0.62;

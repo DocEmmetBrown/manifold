@@ -803,7 +803,16 @@ fn render_toolpath_color_legend(
 
     if vis_state.toolpath_color_mode == ToolpathColorMode::ByToolOrFilament {
         let mut owned_items: Vec<(String, [f32; 4])> = Vec::new();
-        if !config.filament_slots.is_empty() {
+        if config.slicing.color_mixing.enabled && config.tools.len() >= 2 {
+            for tool in &config.tools {
+                let td_mm = tool.effective_transmission_distance_mm();
+                let label = format!(
+                    "T{} ({}, {}, TD {:.1} mm)",
+                    tool.id, tool.name, tool.filament_color_hex, td_mm
+                );
+                owned_items.push((label, tool.filament_color_srgba));
+            }
+        } else if !config.filament_slots.is_empty() {
             for slot in &config.filament_slots {
                 let tool_id = config.tool_id_for_filament_slot(slot.slot_index as u8);
                 let label = format!(
@@ -817,11 +826,15 @@ fn render_toolpath_color_legend(
             }
         } else {
             for (idx, tool) in config.tools.iter().enumerate() {
-                let (_, srgba) = crate::config::DEFAULT_FILAMENT_SLOT_PALETTE
-                    [idx % crate::config::DEFAULT_FILAMENT_SLOT_PALETTE.len()];
                 owned_items.push((
-                    format!("Slot {} → T{} ({})", idx + 1, tool.id, tool.name),
-                    srgba,
+                    format!(
+                        "Slot {} → T{} ({}, {})",
+                        idx + 1,
+                        tool.id,
+                        tool.name,
+                        tool.filament_color_hex
+                    ),
+                    tool.filament_color_srgba,
                 ));
             }
         }
@@ -4287,6 +4300,13 @@ fn render_tool_config_tab(
                 param_help_button(ui, "tools.temperature_celsius");
             });
 
+            if render_tool_optical_properties_controls(ui, tool) {
+                vis_state.dirty_color_mixing = true;
+                vis_state.dirty_toolpaths_mesh = true;
+                vis_state.dirty_surface_colors = true;
+                dirty_gcode = true;
+            }
+
             ui.horizontal(|ui| {
                 if ui
                     .checkbox(
@@ -4329,6 +4349,8 @@ fn render_tool_config_tab(
                 preset_lib.selected_filament = p_name;
                 dirty_backend = true;
                 dirty_gcode = true;
+                vis_state.dirty_color_mixing = true;
+                vis_state.dirty_toolpaths_mesh = true;
             }
         } else if sync_active_to_gcode {
             config.sync_gcode_from_active_tool();
@@ -4775,6 +4797,131 @@ fn render_tool_config_tab(
     }
 }
 
+/// Renders per-tool filament colour (sRGB swatch + standard `#RRGGBB` / `rgb(...)` / CSS encoding)
+/// and Kubelka-Munk Transmission Distance (`TD` in mm, with Auto default estimation).
+/// Returns `true` if any optical property was modified.
+fn render_tool_optical_properties_controls(ui: &mut egui::Ui, tool: &mut ToolConfig) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Colour & TD:");
+        let mut c32 = egui::Color32::from_rgba_unmultiplied(
+            (tool.filament_color_srgba[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (tool.filament_color_srgba[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (tool.filament_color_srgba[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+            255,
+        );
+        if ui
+            .color_edit_button_srgba(&mut c32)
+            .on_hover_text(format!(
+                "Actual opaque filament colour R_∞ for T{} ({})",
+                tool.id, tool.filament_color_hex
+            ))
+            .changed()
+        {
+            tool.set_color_from_srgba([
+                c32.r() as f32 / 255.0,
+                c32.g() as f32 / 255.0,
+                c32.b() as f32 / 255.0,
+                1.0,
+            ]);
+            changed = true;
+        }
+
+        let mut color_text = tool.filament_color_hex.clone();
+        let resp = ui
+            .add(
+                egui::TextEdit::singleline(&mut color_text)
+                    .desired_width(74.0)
+                    .hint_text("#RRGGBB"),
+            )
+            .on_hover_text(
+                "Standard colour encoding (#RGB, #RRGGBB, rgb(r,g,b), or CSS colour name like 'cyan', 'magenta', 'yellow', 'white', 'black')",
+            );
+        if (resp.lost_focus() || resp.changed()) && color_text != tool.filament_color_hex {
+            if tool.set_color_from_encoding(&color_text) {
+                changed = true;
+            }
+        }
+
+        let auto_est_td = crate::color_optics::estimate_default_td_mm(
+            &tool.filament_type,
+            [
+                tool.filament_color_srgba[0],
+                tool.filament_color_srgba[1],
+                tool.filament_color_srgba[2],
+            ],
+        );
+        let mut is_auto_td = tool.transmission_distance_mm.is_none();
+        let auto_lbl = if is_auto_td {
+            format!("Auto TD ({auto_est_td:.1} mm)")
+        } else {
+            "Auto TD".to_string()
+        };
+        if ui
+            .checkbox(&mut is_auto_td, auto_lbl)
+            .on_hover_text(
+                "Estimate default Kubelka-Munk Transmission Distance (TD) from filament material & pigment lightness (~2.5 mm standard opaque baseline)",
+            )
+            .changed()
+        {
+            if is_auto_td {
+                tool.transmission_distance_mm = None;
+            } else {
+                tool.transmission_distance_mm = Some(auto_est_td);
+            }
+            changed = true;
+        }
+        if let Some(ref mut td_mm) = tool.transmission_distance_mm {
+            if ui
+                .add(
+                    egui::DragValue::new(td_mm)
+                        .speed(0.1)
+                        .range(0.1..=30.0)
+                        .prefix("TD: ")
+                        .suffix(" mm"),
+                )
+                .on_hover_text(
+                    "HueForge / Kubelka-Munk Transmission Distance (mm to ~99% optical opacity)",
+                )
+                .changed()
+            {
+                changed = true;
+            }
+        }
+        param_help_button(ui, "tool.transmission_distance_mm");
+    });
+    changed
+}
+
+/// Applies a multi-filament optical palette (e.g. 5-tool CMYKW) to `config`, enables optical
+/// colour mixing, ensures shell wall count supports `optical_shell_layers`, and refreshes preview flags.
+fn apply_quick_cmykw_palette_setup(
+    config: &mut SlicerConfig,
+    vis_state: &mut FieldVisualizationState,
+    palette: &[crate::color_optics::PaletteFilamentEntry],
+) -> bool {
+    config.apply_optical_palette_to_tools(palette);
+    config.slicing.color_mixing.enabled = true;
+    let needed_inner = config
+        .slicing
+        .color_mixing
+        .optical_shell_layers
+        .saturating_sub(1);
+    let mut need_reslice = false;
+    if config.slicing.inner_wall_count < needed_inner {
+        config.slicing.inner_wall_count = needed_inner;
+        need_reslice = true;
+    }
+    vis_state.toolpath_color_mode = ToolpathColorMode::ByToolOrFilament;
+    vis_state.dirty_color_mixing = true;
+    vis_state.dirty_planned_gcode = true;
+    vis_state.dirty_toolpaths_mesh = true;
+    if need_reslice {
+        vis_state.dirty_toolpaths = true;
+    }
+    need_reslice
+}
+
 /// Renders the 3MF Colour / Filament Slot -> Machine Tool mapping card in the Project Setup tab,
 /// updating both `SlicerConfig` and any unselected multi-colour `SceneObject` meshes when colours change.
 fn render_3mf_filament_slot_mapping_section(
@@ -4801,13 +4948,14 @@ fn render_3mf_filament_slot_mapping_section(
 
     if vis_state.dirty_surface_colors && !prev_surface_dirty {
         for obj in &plate.objects {
-            if !obj.vertex_filament_slots.is_empty() {
+            if !obj.vertex_filament_slots.is_empty() || !obj.vertex_colors_rgba.is_empty() {
                 if let Some(mesh) = meshes.get_mut(&obj.mesh_handle) {
                     mesh.insert_attribute(
                         Mesh::ATTRIBUTE_COLOR,
                         crate::field_vis::default_cad_vertex_colors(
                             obj.vertices.len(),
                             &obj.vertex_filament_slots,
+                            &obj.vertex_colors_rgba,
                             config,
                         ),
                     );
@@ -4986,6 +5134,65 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                     .changed();
                 param_help_button(ui, "gcode.tool_change_approach_after");
             });
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .checkbox(
+                        &mut config.slicing.color_mixing.enabled,
+                        "Optical Colour Mixing (CMYKW / N-Tool)",
+                    )
+                    .on_hover_text(
+                        "Approximate input surface colours via Kubelka-Munk optical filament stacking & short extrusions across loaded tools (T0..Tn)",
+                    )
+                    .changed()
+                {
+                    if config.slicing.color_mixing.enabled {
+                        vis_state.toolpath_color_mode = ToolpathColorMode::ByToolOrFilament;
+                    }
+                    vis_state.dirty_color_mixing = true;
+                    vis_state.dirty_toolpaths_mesh = true;
+                    *dirty_gcode = true;
+                }
+                if ui
+                    .small_button("Setup PLA CMYKW (5 Tools)")
+                    .on_hover_text(
+                        "Configure T0..T4 as Cyan, Magenta, Yellow, Black & White PLA with calibrated Kubelka-Munk Transmission Distances and enable optical colour mixing",
+                    )
+                    .clicked()
+                {
+                    apply_quick_cmykw_palette_setup(
+                        config,
+                        vis_state,
+                        &crate::color_optics::bambu_pla_cmykw_palette(),
+                    );
+                    *dirty_backend = true;
+                    *dirty_gcode = true;
+                }
+                if ui
+                    .small_button("Setup Translucent CMYKW")
+                    .on_hover_text(
+                        "Configure T0..T4 as high-TD translucent Cyan, Magenta, Yellow, Black & opaque White backing",
+                    )
+                    .clicked()
+                {
+                    apply_quick_cmykw_palette_setup(
+                        config,
+                        vis_state,
+                        &crate::color_optics::translucent_cmykw_palette(),
+                    );
+                    *dirty_backend = true;
+                    *dirty_gcode = true;
+                }
+                param_help_button(ui, "slicing.color_mixing.enabled");
+            });
+            if config.slicing.color_mixing.enabled {
+                ui.small(
+                    egui::RichText::new(format!(
+                        "Optical Mixing Active: 3MF colours/textures act as target surface colours approximated across {} loaded tools (configure full Kubelka-Munk & lithophane settings in Process tab).",
+                        config.tools.len()
+                    ))
+                    .color(egui::Color32::from_rgb(120, 215, 255)),
+                );
+            }
 
             if config.filament_slots.is_empty() {
                 ui.small(
@@ -5053,6 +5260,7 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                         slot.color_hex =
                             format!("#{:02X}{:02X}{:02X}", c32.r(), c32.g(), c32.b());
                         vis_state.dirty_surface_colors = true;
+                        vis_state.dirty_color_mixing = true;
                         vis_state.dirty_toolpaths_mesh = true;
                     }
 
@@ -5317,6 +5525,12 @@ fn render_filament_config_tab(
                 }
                 param_help_button(ui, "tools.temperature_celsius");
             });
+            if render_tool_optical_properties_controls(ui, tool) {
+                vis_state.dirty_color_mixing = true;
+                vis_state.dirty_toolpaths_mesh = true;
+                vis_state.dirty_surface_colors = true;
+                gc_changed = true;
+            }
         }
         ui.horizontal(|ui| {
             gc_changed |= ui
@@ -6701,6 +6915,252 @@ fn render_process_config_tab(
         }
     });
 
+    // 4b. Optical Colour Approximation (CMYKW & Arbitrary Filaments / Lithophane Optics)
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new(
+        egui::RichText::new("Optical Colour Approximation (CMYKW & Arbitrary Filaments)").strong(),
+    )
+    .id_source("process_optical_color_mixing_section")
+    .default_open(config.slicing.color_mixing.enabled || config.tools.len() >= 2)
+    .show(ui, |ui| {
+        let mut mix_changed = false;
+        let mut need_backend_sync = false;
+
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .checkbox(
+                    &mut config.slicing.color_mixing.enabled,
+                    "Enable Kubelka-Munk Optical Colour Mixing",
+                )
+                .on_hover_text(
+                    "Approximate 3MF surface colours & PNG textures by stacking translucent filaments across outer shell layers/walls and subdividing perimeters into short extrusions.",
+                )
+                .changed()
+            {
+                if config.slicing.color_mixing.enabled {
+                    vis_state.toolpath_color_mode = ToolpathColorMode::ByToolOrFilament;
+                }
+                mix_changed = true;
+            }
+            param_help_button(ui, "slicing.color_mixing.enabled");
+
+            if ui
+                .small_button("Setup PLA CMYKW (5 Tools)")
+                .on_hover_text(
+                    "Configure T0..T4 as Cyan, Magenta, Yellow, Black & White PLA with calibrated Transmission Distances",
+                )
+                .clicked()
+            {
+                apply_quick_cmykw_palette_setup(
+                    config,
+                    vis_state,
+                    &crate::color_optics::bambu_pla_cmykw_palette(),
+                );
+                need_backend_sync = true;
+                mix_changed = true;
+            }
+            if ui
+                .small_button("Setup Translucent CMYKW")
+                .on_hover_text(
+                    "Configure T0..T4 as high-TD translucent Cyan, Magenta, Yellow, Black & opaque White backing",
+                )
+                .clicked()
+            {
+                apply_quick_cmykw_palette_setup(
+                    config,
+                    vis_state,
+                    &crate::color_optics::translucent_cmykw_palette(),
+                );
+                need_backend_sync = true;
+                mix_changed = true;
+            }
+        });
+
+        if config.slicing.color_mixing.enabled && config.tools.len() < 2 {
+            ui.small(
+                egui::RichText::new(
+                    "Add at least 2 extrusion tools in the Tool tab (or click 'Setup PLA CMYKW (5 Tools)') to mix colours across multiple filaments.",
+                )
+                .color(egui::Color32::from_rgb(255, 195, 90)),
+            );
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Illumination:");
+            egui::ComboBox::from_id_source("color_mixing_lighting_mode_combo")
+                .selected_text(config.slicing.color_mixing.lighting_mode.label())
+                .width(215.0)
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        crate::color_optics::OpticalLightingMode::FrontLitReflectance,
+                        crate::color_optics::OpticalLightingMode::BackLitTransmittance,
+                        crate::color_optics::OpticalLightingMode::MixedFrontAndBack,
+                    ] {
+                        mix_changed |= ui
+                            .selectable_value(
+                                &mut config.slicing.color_mixing.lighting_mode,
+                                mode,
+                                mode.label(),
+                            )
+                            .changed();
+                    }
+                });
+            param_help_button(ui, "slicing.color_mixing.lighting_mode");
+        });
+
+        ui.horizontal(|ui| {
+            mix_changed |= ui
+                .checkbox(
+                    &mut config.slicing.color_mixing.use_adjacent_layers,
+                    "Adjacent-Layer Blending",
+                )
+                .on_hover_text(
+                    "Blend out-of-gamut colours across consecutive layers in addition to through-depth Kubelka-Munk stacking.",
+                )
+                .changed();
+            mix_changed |= ui
+                .add(
+                    egui::DragValue::new(&mut config.slicing.color_mixing.optical_shell_layers)
+                        .speed(0.1)
+                        .range(1..=6)
+                        .prefix("Shell Slabs: "),
+                )
+                .on_hover_text(
+                    "Number of outer shell slabs (walls / top-bottom skin layers) stacked optically over the internal backing core.",
+                )
+                .changed();
+            let total_walls = config.slicing.inner_wall_count + 1;
+            if config.slicing.color_mixing.enabled
+                && total_walls < config.slicing.color_mixing.optical_shell_layers
+                && ui
+                    .small_button(format!(
+                        "Set {} Walls",
+                        config.slicing.color_mixing.optical_shell_layers
+                    ))
+                    .on_hover_text(
+                        "Increase perimeter wall count so side walls have enough concentric shells for full through-depth optical stacking.",
+                    )
+                    .clicked()
+            {
+                config.slicing.inner_wall_count =
+                    config.slicing.color_mixing.optical_shell_layers.saturating_sub(1);
+                need_backend_sync = true;
+                vis_state.dirty_toolpaths = true;
+            }
+            param_help_button(ui, "slicing.color_mixing.optical_shell_layers");
+        });
+
+        ui.horizontal(|ui| {
+            mix_changed |= ui
+                .checkbox(
+                    &mut config.slicing.color_mixing.use_short_extrusions,
+                    "Short Extrusions Along Path",
+                )
+                .on_hover_text(
+                    "Subdivide perimeter & skin extrusions into short segments with Oklab error diffusion along the path.",
+                )
+                .changed();
+            if config.slicing.color_mixing.use_short_extrusions {
+                mix_changed |= ui
+                    .add(
+                        egui::DragValue::new(
+                            &mut config.slicing.color_mixing.min_short_extrusion_mm,
+                        )
+                        .speed(0.1)
+                        .range(0.8..=30.0)
+                        .prefix("Min Len: ")
+                        .suffix(" mm"),
+                    )
+                    .on_hover_text(
+                        "Minimum physical extrusion segment length (mm) between colour swaps along a perimeter/skin path.",
+                    )
+                    .changed();
+            }
+            param_help_button(ui, "slicing.color_mixing.min_short_extrusion_mm");
+        });
+
+        if config.slicing.color_mixing.lighting_mode.uses_opaque_core_backing() {
+            ui.horizontal(|ui| {
+                ui.label("Core Backing:");
+                let backing_lbl = match config.slicing.color_mixing.backing_tool_index {
+                    None => "Auto (Brightest Neutral / White)".to_string(),
+                    Some(idx) => config
+                        .tools
+                        .get(idx)
+                        .map(|t| format!("T{} — {} ({})", t.id, t.name, t.filament_color_hex))
+                        .unwrap_or_else(|| format!("Tool #{idx}")),
+                };
+                egui::ComboBox::from_id_source("color_mixing_backing_tool_combo")
+                    .selected_text(backing_lbl)
+                    .width(215.0)
+                    .show_ui(ui, |ui| {
+                        mix_changed |= ui
+                            .selectable_value(
+                                &mut config.slicing.color_mixing.backing_tool_index,
+                                None,
+                                "Auto (Brightest Neutral / White)",
+                            )
+                            .changed();
+                        for (idx, t) in config.tools.iter().enumerate() {
+                            let lbl =
+                                format!("T{} — {} ({})", t.id, t.name, t.filament_color_hex);
+                            mix_changed |= ui
+                                .selectable_value(
+                                    &mut config.slicing.color_mixing.backing_tool_index,
+                                    Some(idx),
+                                    lbl,
+                                )
+                                .changed();
+                        }
+                    });
+            });
+        }
+
+        ui.horizontal(|ui| {
+            mix_changed |= ui
+                .add(
+                    egui::Slider::new(&mut config.slicing.color_mixing.dither_strength, 0.0..=1.0)
+                        .text("Oklab Dither"),
+                )
+                .on_hover_text(
+                    "Strength of Oklab perceptual error diffusion & adjacent-layer spatial dithering (0 = nearest optical stack, 1 = full dithering).",
+                )
+                .changed();
+            mix_changed |= ui
+                .add(
+                    egui::DragValue::new(&mut config.slicing.color_mixing.tool_switch_penalty)
+                        .speed(0.002)
+                        .range(0.0..=0.10)
+                        .prefix("Hysteresis: "),
+                )
+                .on_hover_text(
+                    "Oklab ΔE hysteresis penalty discouraging marginal filament switches along continuous paths.",
+                )
+                .changed();
+        });
+
+        if !config.tools.is_empty() {
+            ui.separator();
+            ui.small(egui::RichText::new("Loaded Tool Optical Palette (Colour R_∞ & TD):").strong());
+            for tool in &mut config.tools {
+                if render_tool_optical_properties_controls(ui, tool) {
+                    mix_changed = true;
+                    vis_state.dirty_surface_colors = true;
+                }
+            }
+        }
+
+        if need_backend_sync && !is_computing {
+            sync_config_to_backend(config);
+        }
+        if mix_changed {
+            config.slicing.color_mixing.sanitize();
+            vis_state.dirty_color_mixing = true;
+            vis_state.dirty_planned_gcode = true;
+            vis_state.dirty_toolpaths_mesh = true;
+        }
+    });
+
     // 5. 3D Conformal Scarf Joint & Feature Print Speeds
     ui.add_space(4.0);
     egui::CollapsingHeader::new(
@@ -7903,15 +8363,20 @@ pub fn poll_io_tasks_system(
                     &mut plate,
                     report.objects,
                 );
-                // Populate initial painted filament vertex colors on all multi-colour objects
+                // Populate initial painted filament / true-colour vertex colors on multi-colour objects
+                let any_true_color = plate.objects.iter().any(|o| !o.vertex_colors_rgba.is_empty());
+                if any_true_color && config.slicing.color_mixing.enabled {
+                    vis_state.toolpath_color_mode = ToolpathColorMode::ByToolOrFilament;
+                }
                 for obj in &plate.objects {
-                    if !obj.vertex_filament_slots.is_empty() {
+                    if !obj.vertex_filament_slots.is_empty() || !obj.vertex_colors_rgba.is_empty() {
                         if let Some(mesh) = meshes.get_mut(&obj.mesh_handle) {
                             mesh.insert_attribute(
                                 Mesh::ATTRIBUTE_COLOR,
                                 crate::field_vis::default_cad_vertex_colors(
                                     obj.vertices.len(),
                                     &obj.vertex_filament_slots,
+                                    &obj.vertex_colors_rgba,
                                     &config,
                                 ),
                             );
