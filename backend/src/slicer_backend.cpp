@@ -2072,8 +2072,11 @@ std::vector<SurfaceOpticalSample> SlicerBackend::sampleObjectSurfaceOptics(
                     nz = gz / gLen;
                 }
 
-                // Project query point to its nearest surface footpoint \phi_sdf = 0 so inner walls
-                // and deeper conformal layers sample the exact same surface triangle colour!
+                // Query the closest surface triangle colour stored by OpenVDB's exact
+                // closest-point transform (`polyIdxGrid`) at the shell voxel `c0` first,
+                // and fall back to the SDF gradient footpoint `cSurf` (`\phi_sdf = 0`)
+                // and coarse grid so inner walls and solid shell infill carry surface colour
+                // through the entire 3D shell.
                 const openvdb::Vec3d wpSurf(
                     px - static_cast<double>(sdfVal * nx),
                     py - static_cast<double>(sdfVal * ny),
@@ -2081,31 +2084,32 @@ std::vector<SurfaceOpticalSample> SlicerBackend::sampleObjectSurfaceOptics(
 
                 std::uint32_t packedRgba = 0u;
                 if (colorAcc && colorGridPtr != nullptr) {
+                    const openvdb::Coord c0 =
+                        colorGridPtr->transform().worldToIndexCellCentered(wp);
                     const openvdb::Coord cSurf =
                         colorGridPtr->transform().worldToIndexCellCentered(wpSurf);
                     std::int32_t raw = 0;
-                    if (colorAcc->probeValue(cSurf, raw) && raw != 0) {
+                    if (colorAcc->probeValue(c0, raw) && raw != 0) {
+                        packedRgba = static_cast<std::uint32_t>(raw);
+                    } else if (colorAcc->probeValue(cSurf, raw) && raw != 0) {
                         packedRgba = static_cast<std::uint32_t>(raw);
                     } else {
-                        const openvdb::Coord c0 =
-                            colorGridPtr->transform().worldToIndexCellCentered(wp);
-                        if (colorAcc->probeValue(c0, raw) && raw != 0) {
-                            packedRgba = static_cast<std::uint32_t>(raw);
-                        } else {
-                            int bestD2 = 100;
-                            for (int dz = -1; dz <= 1; ++dz) {
-                                for (int dy = -1; dy <= 1; ++dy) {
-                                    for (int dx = -1; dx <= 1; ++dx) {
-                                        const int d2 = dx * dx + dy * dy + dz * dz;
-                                        if (d2 >= bestD2) {
-                                            continue;
-                                        }
-                                        if (colorAcc->probeValue(
-                                                cSurf + openvdb::Coord(dx, dy, dz), raw) &&
-                                            raw != 0) {
-                                            bestD2 = d2;
-                                            packedRgba = static_cast<std::uint32_t>(raw);
-                                        }
+                        int bestD2 = 100;
+                        for (int dz = -1; dz <= 1; ++dz) {
+                            for (int dy = -1; dy <= 1; ++dy) {
+                                for (int dx = -1; dx <= 1; ++dx) {
+                                    const int d2 = dx * dx + dy * dy + dz * dz;
+                                    if (d2 >= bestD2) {
+                                        continue;
+                                    }
+                                    if ((colorAcc->probeValue(
+                                             c0 + openvdb::Coord(dx, dy, dz), raw) &&
+                                         raw != 0) ||
+                                        (colorAcc->probeValue(
+                                             cSurf + openvdb::Coord(dx, dy, dz), raw) &&
+                                         raw != 0)) {
+                                        bestD2 = d2;
+                                        packedRgba = static_cast<std::uint32_t>(raw);
                                     }
                                 }
                             }
@@ -2113,34 +2117,39 @@ std::vector<SurfaceOpticalSample> SlicerBackend::sampleObjectSurfaceOptics(
                     }
                 }
                 if (packedRgba == 0u && coarseColorAcc && coarseColorGridPtr != nullptr) {
-                    const openvdb::Coord cCoarse =
+                    const openvdb::Coord cCoarse0 =
+                        coarseColorGridPtr->transform().worldToIndexCellCentered(wp);
+                    const openvdb::Coord cCoarseSurf =
                         coarseColorGridPtr->transform().worldToIndexCellCentered(wpSurf);
                     std::int32_t raw = 0;
-                    if (coarseColorAcc->probeValue(cCoarse, raw) && raw != 0) {
+                    if (coarseColorAcc->probeValue(cCoarse0, raw) && raw != 0) {
+                        packedRgba = static_cast<std::uint32_t>(raw);
+                    } else if (coarseColorAcc->probeValue(cCoarseSurf, raw) && raw != 0) {
                         packedRgba = static_cast<std::uint32_t>(raw);
                     }
                 }
 
                 std::uint8_t slotVal = 0u;
                 if (slotAcc && slotGridPtr != nullptr) {
+                    const openvdb::Coord c0 =
+                        slotGridPtr->transform().worldToIndexCellCentered(wp);
                     const openvdb::Coord cSurf =
                         slotGridPtr->transform().worldToIndexCellCentered(wpSurf);
                     float sv = 0.0f;
-                    if (slotAcc->probeValue(cSurf, sv)) {
+                    if (slotAcc->probeValue(c0, sv)) {
                         slotVal = static_cast<std::uint8_t>(std::clamp(std::lround(sv), 0L, 127L));
-                    } else {
-                        const openvdb::Coord c0 =
-                            slotGridPtr->transform().worldToIndexCellCentered(wp);
-                        if (slotAcc->probeValue(c0, sv)) {
-                            slotVal =
-                                static_cast<std::uint8_t>(std::clamp(std::lround(sv), 0L, 127L));
-                        }
+                    } else if (slotAcc->probeValue(cSurf, sv)) {
+                        slotVal =
+                            static_cast<std::uint8_t>(std::clamp(std::lround(sv), 0L, 127L));
                     }
                 } else if (coarseSlotAcc && coarseSlotGridPtr != nullptr) {
-                    const openvdb::Coord cCoarse =
+                    const openvdb::Coord cCoarse0 =
+                        coarseSlotGridPtr->transform().worldToIndexCellCentered(wp);
+                    const openvdb::Coord cCoarseSurf =
                         coarseSlotGridPtr->transform().worldToIndexCellCentered(wpSurf);
                     float sv = 0.0f;
-                    if (coarseSlotAcc->probeValue(cCoarse, sv)) {
+                    if (coarseSlotAcc->probeValue(cCoarse0, sv) ||
+                        coarseSlotAcc->probeValue(cCoarseSurf, sv)) {
                         slotVal = static_cast<std::uint8_t>(std::clamp(std::lround(sv), 0L, 127L));
                     }
                 }

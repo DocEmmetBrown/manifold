@@ -5060,7 +5060,21 @@ fn render_3mf_filament_slot_mapping_section(
     );
 
     if vis_state.dirty_surface_colors && !prev_surface_dirty {
-        for obj in &plate.objects {
+        let slot_colors = config.imported_slot_colors_srgba();
+        for obj in &mut plate.objects {
+            if !obj.triangle_colors_rgba.is_empty()
+                && obj.vertex_filament_slots.is_empty()
+                && !slot_colors.is_empty()
+            {
+                let remapped = crate::color_optics::map_triangle_colors_to_slot_colors(
+                    &obj.triangle_colors_rgba,
+                    &slot_colors,
+                );
+                if remapped.len() == obj.indices.len() / 3 {
+                    ffi::set_object_triangle_filament_slots(obj.object_id, &remapped);
+                    obj.triangle_filament_slots = remapped;
+                }
+            }
             if !obj.vertex_filament_slots.is_empty() || !obj.vertex_colors_rgba.is_empty() {
                 if let Some(mesh) = meshes.get_mut(&obj.mesh_handle) {
                     mesh.insert_attribute(
@@ -5171,6 +5185,7 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                             slot.tool_index = t_idx;
                             if let Some(tool) = config.tools.get_mut(t_idx) {
                                 tool.apply_filament_type_defaults(&slot.filament_type);
+                                tool.set_color_from_srgba(slot.color_srgba);
                             }
                         }
                         config.sync_gcode_from_active_tool();

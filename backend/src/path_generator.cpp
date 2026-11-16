@@ -5509,21 +5509,56 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     };
 
                     const float minColorRunMm = std::max(1.20f, 2.50f * nozzleDiameterMm);
+                    const float subdivStepMm = std::max(0.80f, 0.65f * minColorRunMm);
                     rust::Vec<ExtrusionPath> segmentedPaths;
                     segmentedPaths.reserve(layerOut.paths.size());
 
                     for (auto& srcPath : layerOut.paths) {
-                        const std::size_t nPts = srcPath.points.size();
-                        if (nPts < 2) {
-                            srcPath.filament_slot = (nPts == 1) ? sampleFilamentSlot(srcPath.points[0]) : 0;
+                        // SparseInfill (`kFeatureSparseInfill == 4`) lies deep inside the core
+                        // (`\phi_sdf < -shellThicknessMm`); keep it on a single filament so toolchanges
+                        // only occur in the visible 3D shell (`OuterWall`, `InnerWall`, `SolidInfill`, etc.).
+                        if (srcPath.feature_kind == kFeatureSparseInfill) {
+                            srcPath.filament_slot = 0;
                             segmentedPaths.push_back(std::move(srcPath));
                             continue;
                         }
 
+                        const std::size_t rawNPts = srcPath.points.size();
+                        if (rawNPts < 2) {
+                            srcPath.filament_slot =
+                                (rawNPts == 1) ? sampleFilamentSlot(srcPath.points[0]) : 0;
+                            segmentedPaths.push_back(std::move(srcPath));
+                            continue;
+                        }
+
+                        // Pre-subdivide long straight segments (such as SolidInfill scanlines or
+                        // straight wall spans) so colour transitions across the shell interior are
+                        // sampled at `<= subdivStepMm` resolution.
+                        std::vector<ToolpathPoint> densePts;
+                        densePts.reserve(rawNPts * 2);
+                        for (std::size_t i = 0; i + 1 < rawNPts; ++i) {
+                            const ToolpathPoint& a = srcPath.points[i];
+                            const ToolpathPoint& b = srcPath.points[i + 1];
+                            densePts.push_back(a);
+                            const float edgeLen = ptDist(a, b);
+                            if (edgeLen > 1.35f * subdivStepMm) {
+                                const std::size_t nDiv = std::clamp<std::size_t>(
+                                    static_cast<std::size_t>(std::ceil(edgeLen / subdivStepMm)),
+                                    2,
+                                    128);
+                                for (std::size_t k = 1; k < nDiv; ++k) {
+                                    const float t = static_cast<float>(k) / static_cast<float>(nDiv);
+                                    densePts.push_back(lerpToolpathPt(a, b, t));
+                                }
+                            }
+                        }
+                        densePts.push_back(srcPath.points.back());
+
+                        const std::size_t nPts = densePts.size();
                         std::vector<std::uint8_t> ptSlots(nPts, 0);
                         bool allSame = true;
                         for (std::size_t i = 0; i < nPts; ++i) {
-                            ptSlots[i] = sampleFilamentSlot(srcPath.points[i]);
+                            ptSlots[i] = sampleFilamentSlot(densePts[i]);
                             if (ptSlots[i] != ptSlots[0]) {
                                 allSame = false;
                             }
@@ -5535,7 +5570,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             continue;
                         }
 
-                        std::vector<ToolpathPoint> pts(srcPath.points.begin(), srcPath.points.end());
+                        std::vector<ToolpathPoint> pts = std::move(densePts);
                         if (srcPath.is_closed && pts.size() >= 3) {
                             if (ptDist(pts.front(), pts.back()) < 1.0e-3f) {
                                 pts.pop_back();

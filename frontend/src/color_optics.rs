@@ -972,6 +972,9 @@ pub struct CandidateOpticalStack {
     pub oklab: [f64; 3],
     /// Number of distinct internal layer transitions inside the stack (used as a mild tie-breaker).
     pub transition_count: u8,
+    /// Mean Oklab deviation of the individual shell slabs from the composite `oklab`
+    /// (encourages carrying the surface colour through inner shell layers when optical reflectance ties).
+    pub shell_color_spread: f64,
 }
 
 /// Precomputed Kubelka-Munk optical lookup table for any user-loaded set of filaments.
@@ -1033,6 +1036,10 @@ impl OpticalPaletteLut {
 
         let single_slabs: Vec<OpticalSlab> =
             models.iter().map(|m| m.slab_response(slab_d)).collect();
+        let model_oklabs: Vec<[f64; 3]> = models
+            .iter()
+            .map(|m| linear_rgb_to_oklab(m.r_inf_linear))
+            .collect();
 
         // Build stacks from innermost (m = M - 1) outward to outermost (m = 0).
         // When N^M > 1536 (e.g. 8+ filaments across 5 layers), prune perceptually redundant
@@ -1106,11 +1113,22 @@ impl OpticalPaletteLut {
             let transitions = count_transitions(&p.tools_inner_to_outer);
             let linear_rgb = p.slab.evaluate_lighting(&lighting);
             let oklab = linear_rgb_to_oklab(linear_rgb);
+            let spread = if p.tools_inner_to_outer.is_empty() {
+                0.0
+            } else {
+                let sum_dev: f64 = p
+                    .tools_inner_to_outer
+                    .iter()
+                    .map(|&fi| oklab_delta_e(model_oklabs[fi], oklab))
+                    .sum();
+                sum_dev / (p.tools_inner_to_outer.len() as f64)
+            };
             stacks.push(CandidateOpticalStack {
                 tools_outer_to_inner: p.tools_inner_to_outer,
                 linear_rgb,
                 oklab,
                 transition_count: transitions,
+                shell_color_spread: spread,
             });
         }
 
@@ -1169,7 +1187,8 @@ impl OpticalPaletteLut {
             let mut best_cost = f64::INFINITY;
             for (i, st) in self.stacks.iter().enumerate() {
                 let mut cost = oklab_delta_e(st.oklab, target_oklab)
-                    + 0.0015 * (st.transition_count as f64);
+                    + 0.0020 * (st.transition_count as f64)
+                    + 0.0150 * st.shell_color_spread;
                 if let Some(pref) = preferred_model_idx {
                     if st.tools_outer_to_inner[depth_clamped] != pref {
                         cost += switch_penalty;
@@ -1183,10 +1202,11 @@ impl OpticalPaletteLut {
             return best_idx;
         }
 
-        const K_SHORTLIST: usize = 12;
+        const K_SHORTLIST: usize = 16;
         let mut top_k: [(usize, f64); K_SHORTLIST] = [(0, f64::INFINITY); K_SHORTLIST];
         for (i, st) in self.stacks.iter().enumerate() {
-            let approx_d = oklab_distance_sq(st.oklab, target_oklab);
+            let approx_d = oklab_distance_sq(st.oklab, target_oklab)
+                + 0.0004 * st.shell_color_spread;
             if approx_d < top_k[K_SHORTLIST - 1].1 {
                 top_k[K_SHORTLIST - 1] = (i, approx_d);
                 let mut k = K_SHORTLIST - 1;
@@ -1205,8 +1225,9 @@ impl OpticalPaletteLut {
             }
             let exact_lab = self.evaluate_stack_oklab_at_thickness(cand_idx, local_slab_mm);
             let st = &self.stacks[cand_idx];
-            let mut cost =
-                oklab_delta_e(exact_lab, target_oklab) + 0.0015 * (st.transition_count as f64);
+            let mut cost = oklab_delta_e(exact_lab, target_oklab)
+                + 0.0020 * (st.transition_count as f64)
+                + 0.0150 * st.shell_color_spread;
             if let Some(pref) = preferred_model_idx {
                 if st.tools_outer_to_inner[depth_clamped] != pref {
                     cost += switch_penalty;
@@ -1521,12 +1542,9 @@ where
             }
             // SparseInfill (4): always print in the internal backing filament (e.g. White)
             // so translucent outer shells reflect cleanly off a uniform bright core with zero extra toolchanges!
+            // All 3D shell features (OuterWall=0, InnerWall=1, SolidInfill=2, GapFill=3, Bridge=5, WaveOverhang=6)
+            // carry colour through the entire 3D shell.
             if path.feature_kind == 4 {
-                prep_paths.push(PreparedPath::CoreFixedTool(path.clone(), backing_tool_slot));
-                continue;
-            }
-            // Inner walls deeper than `optical_shell_layers` also belong to the core backing.
-            if path.feature_kind == 1 && (path.wall_index as usize) >= lut.shell_layers {
                 prep_paths.push(PreparedPath::CoreFixedTool(path.clone(), backing_tool_slot));
                 continue;
             }
@@ -1629,9 +1647,87 @@ where
 
     let dither_gain = (mix_cfg.dither_strength as f64).clamp(0.0, 1.0);
     let switch_pen = (mix_cfg.tool_switch_penalty as f64).clamp(0.0, 0.25);
+    let foot_cell_mm = (0.65 * min_seg_mm).clamp(0.75, 4.0);
+    let quant_foot = |foot: [f32; 3]| -> (i32, i32, i32) {
+        (
+            (foot[0] / foot_cell_mm).round() as i32,
+            (foot[1] / foot_cell_mm).round() as i32,
+            (foot[2] / foot_cell_mm).round() as i32,
+        )
+    };
 
     for (layer_index, branch_id, isovalue, prep_paths) in prepared_layers {
         let mut out_paths: Vec<ExtrusionPath> = Vec::with_capacity(prep_paths.len());
+        // Cache of `(footpoint_cell -> chosen_stack_idx)` populated by OuterWall (`feature_kind == 0`)
+        // segments on this layer so that InnerWall (`1`) and SolidInfill (`2`) segments directly behind
+        // them along `-n_surf` execute the exact same M-slab optical stack through the whole shell.
+        let mut layer_footpoint_stacks: std::collections::HashMap<(i32, i32, i32), usize> =
+            std::collections::HashMap::new();
+
+        // Pre-pass: solve and cache `OuterWall` (`feature_kind == 0`) footpoint stacks first
+        // even when `wall_print_order` places inner walls earlier in `prep_paths`.
+        if allow_short {
+            for prep in &prep_paths {
+                let PreparedPath::OpticalShell { template, sub_segs } = prep else {
+                    continue;
+                };
+                if template.feature_kind != 0 {
+                    continue;
+                }
+                let mut err_lab = [0.0_f64; 3];
+                let mut prev_target_lab: Option<[f64; 3]> = None;
+                let mut prev_model_idx: Option<usize> = None;
+
+                for seg in sub_segs {
+                    let sample = samples.get(seg.sample_idx).copied().unwrap_or_default();
+                    let mid = interpolate_point(&seg.p0, &seg.p1, 0.5);
+                    let n_surf = normalize_surf_normal(&sample, &mid);
+                    let (t_slab_mm, cos_theta) = directional_slab_thickness_mm(&mid, n_surf);
+                    let Some(target_srgb) = resolve_sample_target_srgb(
+                        &sample,
+                        template.filament_slot,
+                        imported_slot_colors_srgba,
+                    ) else {
+                        continue;
+                    };
+                    let target_lab = srgb_to_oklab(target_srgb);
+                    if let Some(prev_t) = prev_target_lab {
+                        if oklab_delta_e(prev_t, target_lab) > 0.10 {
+                            err_lab = [0.0; 3];
+                        }
+                    }
+                    prev_target_lab = Some(target_lab);
+
+                    let foot = [
+                        mid.x - sample.sdf_mm * n_surf[0],
+                        mid.y - sample.sdf_mm * n_surf[1],
+                        mid.z - sample.sdf_mm * n_surf[2],
+                    ];
+                    let chosen_stack_idx = select_optical_stack_for_sample(
+                        &lut,
+                        target_lab,
+                        t_slab_mm as f64,
+                        cos_theta,
+                        0,
+                        foot,
+                        layer_index,
+                        mix_cfg.use_adjacent_layers,
+                        dither_gain,
+                        err_lab,
+                        prev_model_idx,
+                        switch_pen,
+                    );
+                    let chosen_lab =
+                        lut.evaluate_stack_oklab_at_thickness(chosen_stack_idx, t_slab_mm as f64);
+                    prev_model_idx = Some(lut.stacks[chosen_stack_idx].tools_outer_to_inner[0]);
+                    for c in 0..3 {
+                        let raw_e = (target_lab[c] + dither_gain * err_lab[c]) - chosen_lab[c];
+                        err_lab[c] = (0.85 * raw_e).clamp(-0.16, 0.16);
+                    }
+                    layer_footpoint_stacks.insert(quant_foot(foot), chosen_stack_idx);
+                }
+            }
+        }
 
         for prep in prep_paths {
             match prep {
@@ -1666,6 +1762,7 @@ where
                     }
 
                     // Short-extrusion along-path optical solver with Oklab error diffusion
+                    // and radial surface-footpoint locking across the entire 3D shell.
                     let mut seg_model_choices: Vec<usize> = Vec::with_capacity(sub_segs.len());
                     let mut err_lab = [0.0_f64; 3];
                     let mut prev_target_lab: Option<[f64; 3]> = None;
@@ -1680,22 +1777,17 @@ where
                         let n_surf = normalize_surf_normal(&sample, &mid);
                         let (t_slab_mm, cos_theta) = directional_slab_thickness_mm(&mid, n_surf);
 
-                        // Determine depth index `m` (0 = outer surface, >= shell_layers = internal core)
-                        let depth_m = compute_shell_depth_index(
+                        // Determine depth index `m` inside the 3D shell (`0` = outer surface) and
+                        // clamp to `0..lut.shell_layers - 1` so deeper inner walls and SolidInfill
+                        // carry the innermost shell pigment all the way to `-shell_thickness_mm`.
+                        let raw_depth_m = compute_shell_depth_index(
                             template.feature_kind,
                             template.wall_index,
                             sample.sdf_mm,
                             t_slab_mm,
                             cos_theta,
                         );
-
-                        if depth_m >= lut.shell_layers {
-                            let back_m = lut.backing_model_idx.unwrap_or(0);
-                            seg_model_choices.push(back_m);
-                            prev_model_idx = Some(back_m);
-                            err_lab = [0.0; 3];
-                            continue;
-                        }
+                        let depth_m = raw_depth_m.min(lut.shell_layers.saturating_sub(1));
 
                         let Some(target_srgb) = resolve_sample_target_srgb(
                             &sample,
@@ -1718,80 +1810,51 @@ where
                         }
                         prev_target_lab = Some(target_lab);
 
-                        // Apply adjacent-layer phase selection when beneficial on walls/slopes
-                        let chosen_stack_idx = if mix_cfg.use_adjacent_layers && cos_theta < 0.85 {
-                            let (st_a, st_b, ratio_num_6) = lut.find_adjacent_layer_pair(
+                        let foot = [
+                            mid.x - sample.sdf_mm * n_surf[0],
+                            mid.y - sample.sdf_mm * n_surf[1],
+                            mid.z - sample.sdf_mm * n_surf[2],
+                        ];
+                        let qf = quant_foot(foot);
+
+                        // For inner walls and solid shell infill (`depth_m > 0`), check if the outer wall
+                        // directly in front of this surface footpoint already locked an optical stack.
+                        let cached_outer_stack = if template.feature_kind != 0 {
+                            layer_footpoint_stacks.get(&qf).copied().or_else(|| {
+                                for &(dx, dy, dz) in &[
+                                    (1, 0, 0),
+                                    (-1, 0, 0),
+                                    (0, 1, 0),
+                                    (0, -1, 0),
+                                    (0, 0, 1),
+                                    (0, 0, -1),
+                                ] {
+                                    if let Some(&st) =
+                                        layer_footpoint_stacks.get(&(qf.0 + dx, qf.1 + dy, qf.2 + dz))
+                                    {
+                                        return Some(st);
+                                    }
+                                }
+                                None
+                            })
+                        } else {
+                            layer_footpoint_stacks.get(&qf).copied()
+                        };
+
+                        let chosen_stack_idx = if let Some(st_idx) = cached_outer_stack {
+                            st_idx
+                        } else {
+                            select_optical_stack_for_sample(
+                                &lut,
                                 target_lab,
                                 t_slab_mm as f64,
-                                dither_gain,
-                            );
-                            if ratio_num_6 > 0 && st_a != st_b {
-                                let foot = [
-                                    mid.x - sample.sdf_mm * n_surf[0],
-                                    mid.y - sample.sdf_mm * n_surf[1],
-                                    mid.z - sample.sdf_mm * n_surf[2],
-                                ];
-                                let phase = footpoint_phase_hash(foot, layer_index);
-                                // Spread ratio_num_6 across the 6-layer period without clumping
-                                let use_b = match ratio_num_6 {
-                                    2 => phase == 1 || phase == 4,
-                                    3 => (phase & 1) == 1,
-                                    _ => false,
-                                };
-                                let layer_stack = if use_b { st_b } else { st_a };
-                                let layer_lab = lut.evaluate_stack_oklab_at_thickness(
-                                    layer_stack,
-                                    t_slab_mm as f64,
-                                );
-                                // Diffuse the remaining residual (after two-layer average) along the path
-                                let avg_w = (ratio_num_6 as f64) / 6.0;
-                                let pair_avg_lab = [
-                                    (1.0 - avg_w) * lut.stacks[st_a].oklab[0]
-                                        + avg_w * lut.stacks[st_b].oklab[0],
-                                    (1.0 - avg_w) * lut.stacks[st_a].oklab[1]
-                                        + avg_w * lut.stacks[st_b].oklab[1],
-                                    (1.0 - avg_w) * lut.stacks[st_a].oklab[2]
-                                        + avg_w * lut.stacks[st_b].oklab[2],
-                                ];
-                                let desired_lab = [
-                                    (layer_lab[0] + (target_lab[0] - pair_avg_lab[0]) + dither_gain * err_lab[0])
-                                        .clamp(0.0, 1.0),
-                                    (layer_lab[1] + (target_lab[1] - pair_avg_lab[1]) + dither_gain * err_lab[1])
-                                        .clamp(-0.5, 0.5),
-                                    (layer_lab[2] + (target_lab[2] - pair_avg_lab[2]) + dither_gain * err_lab[2])
-                                        .clamp(-0.5, 0.5),
-                                ];
-                                lut.find_best_stack(
-                                    desired_lab,
-                                    t_slab_mm as f64,
-                                    depth_m,
-                                    prev_model_idx,
-                                    switch_pen,
-                                )
-                            } else {
-                                let desired_lab = [
-                                    (target_lab[0] + dither_gain * err_lab[0]).clamp(0.0, 1.0),
-                                    (target_lab[1] + dither_gain * err_lab[1]).clamp(-0.5, 0.5),
-                                    (target_lab[2] + dither_gain * err_lab[2]).clamp(-0.5, 0.5),
-                                ];
-                                lut.find_best_stack(
-                                    desired_lab,
-                                    t_slab_mm as f64,
-                                    depth_m,
-                                    prev_model_idx,
-                                    switch_pen,
-                                )
-                            }
-                        } else {
-                            let desired_lab = [
-                                (target_lab[0] + dither_gain * err_lab[0]).clamp(0.0, 1.0),
-                                (target_lab[1] + dither_gain * err_lab[1]).clamp(-0.5, 0.5),
-                                (target_lab[2] + dither_gain * err_lab[2]).clamp(-0.5, 0.5),
-                            ];
-                            lut.find_best_stack(
-                                desired_lab,
-                                t_slab_mm as f64,
+                                cos_theta,
                                 depth_m,
+                                foot,
+                                layer_index,
+                                mix_cfg.use_adjacent_layers,
+                                dither_gain,
+                                err_lab,
                                 prev_model_idx,
                                 switch_pen,
                             )
@@ -1843,6 +1906,65 @@ where
         .map(|l| l.paths.len() as u32)
         .sum();
     out
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn select_optical_stack_for_sample(
+    lut: &OpticalPaletteLut,
+    target_lab: [f64; 3],
+    t_slab_mm: f64,
+    cos_theta: f32,
+    depth_m: usize,
+    foot: [f32; 3],
+    layer_index: u32,
+    use_adjacent_layers: bool,
+    dither_gain: f64,
+    err_lab: [f64; 3],
+    prev_model_idx: Option<usize>,
+    switch_pen: f64,
+) -> usize {
+    if use_adjacent_layers && cos_theta < 0.85 {
+        let (st_a, st_b, ratio_num_6) =
+            lut.find_adjacent_layer_pair(target_lab, t_slab_mm, dither_gain);
+        if ratio_num_6 > 0 && st_a != st_b {
+            let phase = footpoint_phase_hash(foot, layer_index);
+            let use_b = match ratio_num_6 {
+                2 => phase == 1 || phase == 4,
+                3 => (phase & 1) == 1,
+                _ => false,
+            };
+            let layer_stack = if use_b { st_b } else { st_a };
+            let layer_lab = lut.evaluate_stack_oklab_at_thickness(layer_stack, t_slab_mm);
+            let avg_w = (ratio_num_6 as f64) / 6.0;
+            let pair_avg_lab = [
+                (1.0 - avg_w) * lut.stacks[st_a].oklab[0] + avg_w * lut.stacks[st_b].oklab[0],
+                (1.0 - avg_w) * lut.stacks[st_a].oklab[1] + avg_w * lut.stacks[st_b].oklab[1],
+                (1.0 - avg_w) * lut.stacks[st_a].oklab[2] + avg_w * lut.stacks[st_b].oklab[2],
+            ];
+            let desired_lab = [
+                (layer_lab[0] + (target_lab[0] - pair_avg_lab[0]) + dither_gain * err_lab[0])
+                    .clamp(0.0, 1.0),
+                (layer_lab[1] + (target_lab[1] - pair_avg_lab[1]) + dither_gain * err_lab[1])
+                    .clamp(-0.5, 0.5),
+                (layer_lab[2] + (target_lab[2] - pair_avg_lab[2]) + dither_gain * err_lab[2])
+                    .clamp(-0.5, 0.5),
+            ];
+            return lut.find_best_stack(
+                desired_lab,
+                t_slab_mm,
+                depth_m,
+                prev_model_idx,
+                switch_pen,
+            );
+        }
+    }
+    let desired_lab = [
+        (target_lab[0] + dither_gain * err_lab[0]).clamp(0.0, 1.0),
+        (target_lab[1] + dither_gain * err_lab[1]).clamp(-0.5, 0.5),
+        (target_lab[2] + dither_gain * err_lab[2]).clamp(-0.5, 0.5),
+    ];
+    lut.find_best_stack(desired_lab, t_slab_mm, depth_m, prev_model_idx, switch_pen)
 }
 
 #[inline]
@@ -1940,16 +2062,14 @@ fn choose_whole_path_tool_slot(
     let avg_slab = sum_slab / total_w;
     let avg_cos = (sum_cos / total_w) as f32;
     let avg_sdf = sum_sdf / (total_w as f32);
-    let depth_m = compute_shell_depth_index(
+    let raw_depth_m = compute_shell_depth_index(
         template.feature_kind,
         template.wall_index,
         avg_sdf,
         avg_slab as f32,
         avg_cos,
     );
-    if depth_m >= lut.shell_layers {
-        return backing_tool_slot;
-    }
+    let depth_m = raw_depth_m.min(lut.shell_layers.saturating_sub(1));
 
     let stack_idx = if use_adjacent_layers && avg_cos < 0.85 {
         let (st_a, st_b, ratio_num_6) =
@@ -2347,6 +2467,226 @@ pub fn compute_planned_optical_composite_colors(
     out_layers
 }
 
+/// Maps each packed `0xRRGGBBAA` triangle colour in `triangle_colors_rgba` to the index (`0..slot_colors_srgba.len()`)
+/// of the perceptually closest slot colour in **Oklab** space.
+pub fn map_triangle_colors_to_slot_colors(
+    triangle_colors_rgba: &[u32],
+    slot_colors_srgba: &[[f32; 4]],
+) -> Vec<u8> {
+    if triangle_colors_rgba.is_empty() || slot_colors_srgba.is_empty() {
+        return Vec::new();
+    }
+    let slot_labs: Vec<[f64; 3]> = slot_colors_srgba
+        .iter()
+        .map(|&c| srgb_to_oklab([c[0], c[1], c[2]]))
+        .collect();
+
+    triangle_colors_rgba
+        .iter()
+        .map(|&packed| {
+            if packed == 0 {
+                return 0u8;
+            }
+            let [r, g, b, a] = unpack_rgba8(packed);
+            if a == 0 {
+                return 0u8;
+            }
+            let lab = srgb_to_oklab([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]);
+            let mut best_idx = 0usize;
+            let mut best_d2 = f64::INFINITY;
+            for (i, s_lab) in slot_labs.iter().enumerate() {
+                let d2 = oklab_distance_sq(lab, *s_lab);
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best_idx = i;
+                }
+            }
+            best_idx.min(127) as u8
+        })
+        .collect()
+}
+
+/// Quantizes continuous per-triangle `0xRRGGBBAA` surface colours (from a UV-mapped `.obj`/`.3mf`
+/// texture or vertex-colour scan) into discrete [`crate::config::ThreeMfFilamentSlot`] entries
+/// using deterministic **Oklab k-means++** clustering (`max_new_slots` $\in 2..=8$, default `6`),
+/// and returns the per-triangle 0-based `filament_slot` assignment (`Vec<u8>`) so the C++ OpenVDB
+/// backend builds `filamentSlotGrid` across the entire 3D shell.
+pub fn quantize_texture_triangles_to_filament_slots(
+    triangle_colors_rgba: &[u32],
+    filament_slots: &mut Vec<crate::config::ThreeMfFilamentSlot>,
+    max_new_slots: usize,
+) -> Option<Vec<u8>> {
+    if triangle_colors_rgba.is_empty() {
+        return None;
+    }
+
+    // If filament slots are already populated, map triangles directly to those slots.
+    if !filament_slots.is_empty() {
+        let slot_colors: Vec<[f32; 4]> = filament_slots.iter().map(|s| s.color_srgba).collect();
+        return Some(map_triangle_colors_to_slot_colors(
+            triangle_colors_rgba,
+            &slot_colors,
+        ));
+    }
+
+    // Sample up to 16,384 non-zero triangles deterministically for fast (< 2 ms) Oklab k-means++.
+    const MAX_SAMPLES: usize = 16_384;
+    let step = (triangle_colors_rgba.len() / MAX_SAMPLES).max(1);
+    let mut samples_lab: Vec<[f64; 3]> = Vec::with_capacity(MAX_SAMPLES.min(triangle_colors_rgba.len()));
+    for &packed in triangle_colors_rgba.iter().step_by(step) {
+        if packed == 0 {
+            continue;
+        }
+        let [r, g, b, a] = unpack_rgba8(packed);
+        if a == 0 {
+            continue;
+        }
+        samples_lab.push(srgb_to_oklab([
+            r as f32 / 255.0,
+            g as f32 / 255.0,
+            b as f32 / 255.0,
+        ]));
+    }
+    if samples_lab.is_empty() {
+        return None;
+    }
+
+    let k_target = max_new_slots.clamp(2, 8);
+    const MIN_CLUSTER_DELTA_E: f64 = 0.042;
+    const MIN_CLUSTER_D2: f64 = MIN_CLUSTER_DELTA_E * MIN_CLUSTER_DELTA_E;
+
+    // 1. Deterministic farthest-point (k-means++) seeding in Oklab space:
+    //    Seed 0 is the sample closest to the global mean colour (dominant body tone).
+    let inv_n = 1.0 / (samples_lab.len() as f64);
+    let mut mean_lab = [0.0_f64; 3];
+    for s in &samples_lab {
+        mean_lab[0] += s[0] * inv_n;
+        mean_lab[1] += s[1] * inv_n;
+        mean_lab[2] += s[2] * inv_n;
+    }
+    let mut seed0_idx = 0usize;
+    let mut seed0_d2 = f64::INFINITY;
+    for (i, s) in samples_lab.iter().enumerate() {
+        let d2 = oklab_distance_sq(*s, mean_lab);
+        if d2 < seed0_d2 {
+            seed0_d2 = d2;
+            seed0_idx = i;
+        }
+    }
+
+    let mut centroids: Vec<[f64; 3]> = vec![samples_lab[seed0_idx]];
+    let mut min_dist_sq: Vec<f64> = samples_lab
+        .iter()
+        .map(|s| oklab_distance_sq(*s, centroids[0]))
+        .collect();
+
+    while centroids.len() < k_target {
+        let mut farthest_idx = 0usize;
+        let mut farthest_d2 = -1.0_f64;
+        for (i, &d2) in min_dist_sq.iter().enumerate() {
+            if d2 > farthest_d2 {
+                farthest_d2 = d2;
+                farthest_idx = i;
+            }
+        }
+        if farthest_d2 < MIN_CLUSTER_D2 {
+            break;
+        }
+        let next_c = samples_lab[farthest_idx];
+        for (s, d2) in samples_lab.iter().zip(min_dist_sq.iter_mut()) {
+            let new_d2 = oklab_distance_sq(*s, next_c);
+            if new_d2 < *d2 {
+                *d2 = new_d2;
+            }
+        }
+        centroids.push(next_c);
+    }
+
+    // 2. Run 10 Lloyd refinement iterations on `samples_lab`.
+    let mut counts = vec![0usize; centroids.len()];
+    let mut sums = vec![[0.0_f64; 3]; centroids.len()];
+    for _iter in 0..10 {
+        counts.fill(0);
+        sums.fill([0.0; 3]);
+        for s in &samples_lab {
+            let mut best_c = 0usize;
+            let mut best_d2 = f64::INFINITY;
+            for (ci, c) in centroids.iter().enumerate() {
+                let d2 = oklab_distance_sq(*s, *c);
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best_c = ci;
+                }
+            }
+            counts[best_c] += 1;
+            sums[best_c][0] += s[0];
+            sums[best_c][1] += s[1];
+            sums[best_c][2] += s[2];
+        }
+        let mut max_shift_d2 = 0.0_f64;
+        for ci in 0..centroids.len() {
+            if counts[ci] > 0 {
+                let inv = 1.0 / (counts[ci] as f64);
+                let next = [sums[ci][0] * inv, sums[ci][1] * inv, sums[ci][2] * inv];
+                max_shift_d2 = max_shift_d2.max(oklab_distance_sq(centroids[ci], next));
+                centroids[ci] = next;
+            }
+        }
+        if max_shift_d2 < 1.0e-7 {
+            break;
+        }
+    }
+
+    // 3. Filter out empty clusters, sort by descending population, and merge perceptually close centroids.
+    let mut ranked: Vec<([f64; 3], usize)> = centroids
+        .into_iter()
+        .zip(counts)
+        .filter(|&(_, cnt)| cnt > 0)
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut merged_centroids: Vec<[f64; 3]> = Vec::with_capacity(ranked.len());
+    for (c, _cnt) in ranked {
+        if merged_centroids
+            .iter()
+            .all(|existing| oklab_distance_sq(*existing, c) >= MIN_CLUSTER_D2)
+        {
+            merged_centroids.push(c);
+        }
+    }
+    if merged_centroids.is_empty() {
+        merged_centroids.push(mean_lab);
+    }
+
+    // 4. Populate `filament_slots` and map all triangles.
+    let mut slot_colors_srgba = Vec::with_capacity(merged_centroids.len());
+    for (idx, &lab) in merged_centroids.iter().enumerate() {
+        let srgb = oklab_to_srgb(lab);
+        let rgba8 = [
+            (srgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (srgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (srgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+            255,
+        ];
+        let hex = format_hex_rgba(rgba8);
+        let srgba = rgba8_to_srgba(rgba8);
+        slot_colors_srgba.push(srgba);
+        filament_slots.push(crate::config::ThreeMfFilamentSlot {
+            slot_index: idx as u32,
+            name: format!("Filament #{} (Texture {})", idx + 1, hex),
+            filament_type: "PLA".to_string(),
+            color_hex: hex,
+            color_srgba: srgba,
+            tool_index: idx,
+        });
+    }
+
+    Some(map_triangle_colors_to_slot_colors(
+        triangle_colors_rgba,
+        &slot_colors_srgba,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2566,6 +2906,98 @@ mod tests {
                 decode_direct_tool_slot(p.filament_slot).is_some(),
                 "Expected direct tool slot encoding"
             );
+        }
+
+        // Verify that colour carries through the ENTIRE shell (OuterWall, InnerWalls 1..4, and SolidInfill),
+        // while SparseInfill remains on the backing/core filament.
+        let make_line = |feature_kind: u8, wall_index: u32, y_depth_mm: f32| ExtrusionPath {
+            feature_kind,
+            filament_slot: 0,
+            wall_index,
+            is_closed: false,
+            total_length_mm: 12.0,
+            mean_width_mm: 0.4,
+            points: vec![
+                ToolpathPoint {
+                    x: 0.0,
+                    y: y_depth_mm,
+                    z: 0.6,
+                    nx: 0.0,
+                    ny: 0.0,
+                    nz: 1.0,
+                    width_mm: 0.4,
+                    height_mm: 0.2,
+                    ..Default::default()
+                },
+                ToolpathPoint {
+                    x: 12.0,
+                    y: y_depth_mm,
+                    z: 0.6,
+                    nx: 0.0,
+                    ny: 0.0,
+                    nz: 1.0,
+                    width_mm: 0.4,
+                    height_mm: 0.2,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let full_shell_raw = ObjectToolpathsResult {
+            valid: true,
+            total_path_count: 5,
+            outer_wall_count: 1,
+            layers: vec![crate::bridge::ffi::LayerToolpaths {
+                layer_index: 1,
+                branch_id: 0,
+                isovalue: 0.4,
+                paths: vec![
+                    make_line(0, 0, 0.2), // OuterWall
+                    make_line(1, 1, 0.6), // InnerWall 1
+                    make_line(1, 4, 1.4), // Deep InnerWall 4 (wall_index >= optical_shell_layers)
+                    make_line(2, 0, 1.5), // SolidInfill inside the 1.6mm shell
+                    make_line(4, 0, 4.0), // SparseInfill deep inside the core
+                ],
+            }],
+            ..Default::default()
+        };
+
+        let full_shell_mixed = apply_optical_color_mixing_to_toolpaths(
+            &full_shell_raw,
+            &cfg,
+            &tools,
+            &[],
+            0.2,
+            None,
+            |xyz| {
+                xyz.chunks_exact(3)
+                    .map(|p| SurfaceOpticalSample {
+                        sdf_mm: -p[1],
+                        surf_nx: 0.0,
+                        surf_ny: -1.0,
+                        surf_nz: 0.0,
+                        // Pure Cyan surface colour -> Tool 0 (Cyan), never Tool 3 (White backing)
+                        rgba_packed: pack_rgba8([0, 134, 214, 255]),
+                        filament_slot: 0,
+                    })
+                    .collect()
+            },
+        );
+
+        for p in &full_shell_mixed.layers[0].paths {
+            let tool = decode_direct_tool_slot(p.filament_slot).expect("direct tool slot");
+            if p.feature_kind == 4 {
+                assert_eq!(
+                    tool, 4,
+                    "SparseInfill (feature_kind == 4) should use White backing/core tool (T4)"
+                );
+            } else {
+                assert_eq!(
+                    tool, 0,
+                    "Full shell feature_kind={} (wall_index={}) should carry Cyan surface colour (T0) through the entire shell, got T{}",
+                    p.feature_kind, p.wall_index, tool
+                );
+            }
         }
     }
 }

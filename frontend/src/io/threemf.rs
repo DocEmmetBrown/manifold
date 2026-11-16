@@ -1093,6 +1093,23 @@ fn instantiate_3mf_mesh(
                 0,
             );
             obj.triangle_filament_slots = tri_slots;
+        } else if !obj.triangle_colors_rgba.is_empty() {
+            // Automatically quantize UV-textured (`<m:texture2d>`) or `<m:colorgroup>` triangles into
+            // perceptual Oklab filament slots (`imported_filament_slots` + C++ `filamentSlotGrid`) so
+            // textured 3MF objects print in multi-colour through the entire 3D shell, while keeping
+            // `obj.vertex_filament_slots` empty so the 3D CAD mesh displays the full continuous texture.
+            if let Some(quantized_slots) =
+                crate::color_optics::quantize_texture_triangles_to_filament_slots(
+                    &obj.triangle_colors_rgba,
+                    imported_filament_slots,
+                    6,
+                )
+            {
+                if quantized_slots.len() == obj.indices.len() / 3 {
+                    ffi::set_object_triangle_filament_slots(obj.object_id, &quantized_slots);
+                    obj.triangle_filament_slots = quantized_slots;
+                }
+            }
         }
 
         report.objects.push(obj);

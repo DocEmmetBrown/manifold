@@ -365,6 +365,23 @@ where
             0,
         );
         obj.triangle_filament_slots = tri_slots;
+    } else if !obj.triangle_colors_rgba.is_empty() {
+        // Automatically quantize continuous texture / vertex-colour triangles into perceptual Oklab
+        // filament slots (`report.filament_slots` + C++ `filamentSlotGrid`) so textured objects
+        // print in multi-colour through the entire 3D shell even when `color_mixing.enabled = false`,
+        // while keeping `obj.vertex_filament_slots` empty so the 3D CAD mesh renders the full continuous texture.
+        if let Some(quantized_slots) =
+            crate::color_optics::quantize_texture_triangles_to_filament_slots(
+                &obj.triangle_colors_rgba,
+                &mut report.filament_slots,
+                6,
+            )
+        {
+            if quantized_slots.len() == obj.indices.len() / 3 {
+                ffi::set_object_triangle_filament_slots(obj.object_id, &quantized_slots);
+                obj.triangle_filament_slots = quantized_slots;
+            }
+        }
     }
 
     Ok(obj)
@@ -647,7 +664,16 @@ f 1/1 3/3 4/4
 
             assert!(
                 tex_loaded.vertex_filament_slots.is_empty(),
-                "Textured OBJ with Kd 1 1 1 should not create a dummy white filament slot"
+                "Textured OBJ with Kd 1 1 1 should keep vertex_filament_slots empty so CAD viewport shows continuous texture"
+            );
+            assert!(
+                !tex_report.filament_slots.is_empty(),
+                "Textured OBJ should automatically populate quantized filament_slots for multi-tool slicing"
+            );
+            assert_eq!(
+                tex_loaded.triangle_filament_slots.len(),
+                tex_loaded.indices.len() / 3,
+                "Textured OBJ should assign a quantized filament_slot to every triangle"
             );
             assert_eq!(tex_loaded.vertex_colors_rgba.len(), tex_loaded.vertices.len());
             assert_eq!(
