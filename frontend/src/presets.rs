@@ -4,9 +4,10 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    BedShape, ClearancePointXZ, ClearanceProfileMode, FiveAxisKinematicsMode, GcodeDialect,
-    LayerHeightConfig, LineWidthConfig, MoonrakerNetworkConfig, OrderFieldMode, SlicerConfig,
-    SolidInfillPattern, SparseInfillPattern, SupportStyle, ToolConfig, WallPrintOrder,
+    BedShape, BrickLayerMode, ClearancePointXZ, ClearanceProfileMode, FiveAxisKinematicsMode,
+    GcodeDialect, LayerHeightConfig, LineWidthConfig, MoonrakerNetworkConfig, OrderFieldMode,
+    SlicerConfig, SolidInfillPattern, SparseInfillPattern, SupportStyle, ToolConfig,
+    WallPrintOrder,
 };
 
 /// Top-level tab in the left workspace panel (`Project Setup` vs. `Configuration`).
@@ -796,6 +797,8 @@ pub struct ProcessPreset {
     // Shells, Line Widths & Infill
     pub shell_thickness_mm: f32,
     pub inner_wall_count: u32,
+    #[serde(default)]
+    pub brick_layer_mode: BrickLayerMode,
     pub one_perimeter_on_conformal_patches: bool,
     pub orient_outer_surfaces_to_normal: bool,
     pub outer_surface_parallel_angle_deg: f32,
@@ -897,6 +900,7 @@ impl ProcessPreset {
             max_nonplanar_slope_deg: cfg.slicing.max_nonplanar_slope_deg,
             shell_thickness_mm: cfg.slicing.shell_thickness_mm,
             inner_wall_count: cfg.slicing.inner_wall_count,
+            brick_layer_mode: cfg.slicing.brick_layer_mode,
             one_perimeter_on_conformal_patches: cfg.slicing.one_perimeter_on_conformal_patches,
             orient_outer_surfaces_to_normal: cfg.slicing.orient_outer_surfaces_to_normal,
             outer_surface_parallel_angle_deg: cfg.slicing.outer_surface_parallel_angle_deg,
@@ -977,6 +981,7 @@ impl ProcessPreset {
         cfg.slicing.max_nonplanar_slope_deg = self.max_nonplanar_slope_deg;
         cfg.slicing.shell_thickness_mm = self.shell_thickness_mm;
         cfg.slicing.inner_wall_count = self.inner_wall_count;
+        cfg.slicing.brick_layer_mode = self.brick_layer_mode;
         cfg.slicing.one_perimeter_on_conformal_patches = self.one_perimeter_on_conformal_patches;
         cfg.slicing.orient_outer_surfaces_to_normal = self.orient_outer_surfaces_to_normal;
         cfg.slicing.outer_surface_parallel_angle_deg = self.outer_surface_parallel_angle_deg;
@@ -1088,6 +1093,7 @@ impl ProcessPreset {
             )
             && approx_eq(self.shell_thickness_mm, cfg.slicing.shell_thickness_mm)
             && self.inner_wall_count == cfg.slicing.inner_wall_count
+            && self.brick_layer_mode == cfg.slicing.brick_layer_mode
             && self.one_perimeter_on_conformal_patches
                 == cfg.slicing.one_perimeter_on_conformal_patches
             && self.orient_outer_surfaces_to_normal

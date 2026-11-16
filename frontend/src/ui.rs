@@ -11,9 +11,10 @@ use crate::calibration::{
     EmCalibrationPass, PaCalibrationMode, TransientCalibrationPass,
 };
 use crate::config::{
-    lookup_parameter_doc, BedShape, ClearancePointXZ, ClearanceProfileMode, FiveAxisKinematicsMode,
-    GcodeDialect, OrderFieldMode, PointNormalHint, SlicerConfig, SolidInfillPattern,
-    SparseInfillPattern, SupportStyle, SurfaceHintMode, ToolConfig, WallPrintOrder,
+    lookup_parameter_doc, BedShape, BrickLayerMode, ClearancePointXZ, ClearanceProfileMode,
+    FiveAxisKinematicsMode, GcodeDialect, OrderFieldMode, PointNormalHint, SlicerConfig,
+    SolidInfillPattern, SparseInfillPattern, SupportStyle, SurfaceHintMode, ToolConfig,
+    WallPrintOrder,
 };
 use crate::field_vis::{
     high_contrast_parameter_ramp, sample_slice_colormap_rgba, FieldColormap,
@@ -6760,6 +6761,24 @@ fn render_process_config_tab(
             param_help_button(ui, "gcode.wall_print_order");
         });
 
+        ui.horizontal(|ui| {
+            ui.label("Brick Layers:");
+            egui::ComboBox::from_id_source("process_brick_layer_mode_combo")
+                .selected_text(config.slicing.brick_layer_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in BrickLayerMode::ALL {
+                        tp_cfg_changed |= ui
+                            .selectable_value(
+                                &mut config.slicing.brick_layer_mode,
+                                mode,
+                                mode.label(),
+                            )
+                            .changed();
+                    }
+                });
+            param_help_button(ui, "slicing.brick_layer_mode");
+        });
+
         ui.separator();
         ui.horizontal(|ui| {
             ui.small(egui::RichText::new("Line Widths (Target / Min / Max mm):").strong());
@@ -8527,6 +8546,7 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         one_perimeter_on_conformal_patches: config.slicing.one_perimeter_on_conformal_patches,
         orient_outer_surfaces_to_normal: config.slicing.orient_outer_surfaces_to_normal,
         outer_surface_parallel_angle_deg: config.slicing.outer_surface_parallel_angle_deg,
+        brick_layer_mode: config.slicing.brick_layer_mode.as_u8(),
     });
 
     ffi::set_order_field_mode(config.eikonal.order_field_mode.as_u8());

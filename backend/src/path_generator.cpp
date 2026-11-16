@@ -2770,6 +2770,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
     const float shellThicknessMm = std::max(0.05f, spec.shell_thickness_mm);
     const std::uint32_t numInnerWalls = spec.inner_wall_count;
+    const std::uint8_t brickLayerMode = spec.brick_layer_mode;
+    const bool brickLateralActive = (brickLayerMode == 1 || brickLayerMode == 3);
+    const bool brickVerticalActive = (brickLayerMode == 2 || brickLayerMode == 3);
     const bool onePerimeterOnConformalPatches = spec.one_perimeter_on_conformal_patches;
     const bool orientOuterSurfacesToNormal = spec.orient_outer_surfaces_to_normal;
     const float outerSurfaceParallelAngleDeg = std::isfinite(spec.outer_surface_parallel_angle_deg)
@@ -4724,14 +4727,51 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 }
 
                 // Inner walls: j = 1 .. layerNumInnerWalls (may be closed loops or open polylines!)
+                // When `brickLateralOddLayer` is active (`LateralSeamStagger` or `CombinedLateralAndVertical`
+                // on odd layers k > 0), inner wall 1 is widened by +0.5*w_inner and subsequent inner walls
+                // shift inward by +0.5*w_inner so each bead straddles the seam between two beads below.
+                const bool brickLateralOddLayer =
+                    brickLateralActive &&
+                    !layerInfo.is_first_layer &&
+                    !isConformalSkinLayer &&
+                    ((layerInfo.layer_index % 2) == 1);
+
                 for (std::uint32_t j = 1; j <= layerNumInnerWalls; ++j) {
                     const float minSpanForWallJ =
                         outerW.min_mm + static_cast<float>(j) * innerW.min_mm;
                     std::vector<float> innerLevel(nV, 0.0f);
                     std::vector<float> innerValidity(nV, 0.0f);
+                    std::vector<float> wallJWidth = localInnerWidth;
                     for (std::size_t i = 0; i < nV; ++i) {
-                        const float centerOffset =
+                        float centerOffset =
                             localOuterWidth[i] + (static_cast<float>(j) - 0.5f) * localInnerWidth[i];
+                        if (brickLateralOddLayer && activeInnerCount[i] >= j) {
+                            const float extraAvail =
+                                std::max(0.0f, availableSpan[i] - totalWallSpan[i]);
+                            const float seamShift = (extraAvail >= 0.45f * localInnerWidth[i])
+                                ? (0.50f * localInnerWidth[i])
+                                : ((activeInnerCount[i] >= 2)
+                                       ? (0.35f * localInnerWidth[i])
+                                       : std::min(extraAvail, 0.50f * localInnerWidth[i]));
+                            if (j == 1) {
+                                const float w1 = localInnerWidth[i] + seamShift;
+                                wallJWidth[i] = w1;
+                                centerOffset = localOuterWidth[i] + 0.5f * w1;
+                            } else if (j == activeInnerCount[i] && extraAvail < seamShift) {
+                                const float shrink = seamShift - extraAvail;
+                                const float wLast =
+                                    std::max(innerW.min_mm, localInnerWidth[i] - shrink);
+                                wallJWidth[i] = wLast;
+                                centerOffset = localOuterWidth[i] +
+                                    static_cast<float>(j - 1) * localInnerWidth[i] +
+                                    seamShift + 0.5f * wLast;
+                            } else {
+                                wallJWidth[i] = localInnerWidth[i];
+                                centerOffset = localOuterWidth[i] +
+                                    (static_cast<float>(j) - 0.5f) * localInnerWidth[i] +
+                                    seamShift;
+                            }
+                        }
                         innerLevel[i] = dOuter[i] - centerOffset;
                         innerValidity[i] = (activeInnerCount[i] >= j)
                             ? supportedWallValidity[i]
@@ -4744,7 +4784,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         0.0f,
                         innerValidity,
                         minSpanForWallJ,
-                        localInnerWidth);
+                        wallJWidth);
                     const auto innerChains =
                         stitchSegmentsIntoChains(innerSegs, stitchSnap, closeLoopTol);
 
@@ -4757,6 +4797,18 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                 minExtrusionLengthMm,
                                 ep)) {
                             layerOut.paths.push_back(std::move(ep));
+                        }
+                    }
+                }
+
+                if (brickLateralOddLayer) {
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (activeInnerCount[i] >= 1) {
+                            const float extraAvail =
+                                std::max(0.0f, availableSpan[i] - totalWallSpan[i]);
+                            const float spanAdvance =
+                                std::min(extraAvail, 0.50f * localInnerWidth[i]);
+                            totalWallSpan[i] += spanAdvance;
                         }
                     }
                 }
@@ -5405,6 +5457,96 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                 for (auto& pt : path.points) {
                                     pt.height_mm =
                                         std::clamp(pt.height_mm * hScale, layerMinH, layerMaxH);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Vertical Half-Layer Brick Interlocking (`VerticalHalfLayer` or `CombinedLateralAndVertical`):
+                // Offsets odd-indexed inner walls (j = 1, 3, ...) by +0.5 * h_layer along the local
+                // nozzle axis \hat{z}_nozzle, with a 0.5 * h starter pass on the first layer and a
+                // 0.5 * h flush closing cap pass on the topmost layer containing inner walls.
+                const bool isLastInnerWallLayer =
+                    layerInfo.is_top_layer ||
+                    (onePerimeterOnConformalPatches &&
+                     isUniformThicknessLayer &&
+                     layerInfo.branch_layer_count >= 2 &&
+                     (layerInfo.branch_layer_index + 2 >= layerInfo.branch_layer_count));
+
+                if (brickVerticalActive &&
+                    layerNumInnerWalls > 0 &&
+                    layerInfo.branch_layer_count >= 2 &&
+                    !layerOut.paths.empty()) {
+                    if (layerInfo.is_first_layer && !isLastInnerWallLayer) {
+                        rust::Vec<ExtrusionPath> brickPaths;
+                        brickPaths.reserve(layerOut.paths.size() + layerNumInnerWalls);
+                        for (const auto& path : layerOut.paths) {
+                            if (path.feature_kind == kFeatureInnerWall &&
+                                (path.wall_index % 2 == 1)) {
+                                ExtrusionPath starterPath = path;
+                                for (auto& pt : starterPath.points) {
+                                    const float hOrig = pt.height_mm;
+                                    const float hHalf = std::max(0.02f, 0.5f * hOrig);
+                                    const Vec3f zNoz =
+                                        normalize3(Vec3f{pt.nx, pt.ny, pt.nz}, fallbackNozzle);
+                                    pt.x -= 0.5f * hOrig * zNoz.x;
+                                    pt.y -= 0.5f * hOrig * zNoz.y;
+                                    pt.z -= 0.5f * hOrig * zNoz.z;
+                                    pt.height_mm = hHalf;
+                                }
+                                brickPaths.push_back(std::move(starterPath));
+                            }
+                        }
+                        for (auto& path : layerOut.paths) {
+                            if (path.feature_kind == kFeatureInnerWall &&
+                                (path.wall_index % 2 == 1)) {
+                                for (auto& pt : path.points) {
+                                    const float hOrig = pt.height_mm;
+                                    const Vec3f p0{pt.x, pt.y, pt.z};
+                                    const Vec3f zNoz =
+                                        normalize3(Vec3f{pt.nx, pt.ny, pt.nz}, fallbackNozzle);
+                                    const float sdfUp =
+                                        sampleSdf(p0 + (zNoz * (0.5f * hOrig))) - sdfZeroShift;
+                                    if (sdfUp <= -0.10f * outerW.min_mm) {
+                                        pt.x += 0.5f * hOrig * zNoz.x;
+                                        pt.y += 0.5f * hOrig * zNoz.y;
+                                        pt.z += 0.5f * hOrig * zNoz.z;
+                                    } else {
+                                        pt.height_mm = std::max(0.02f, 0.5f * hOrig);
+                                    }
+                                }
+                            }
+                            brickPaths.push_back(std::move(path));
+                        }
+                        layerOut.paths = std::move(brickPaths);
+                    } else if (!layerInfo.is_first_layer && !isLastInnerWallLayer) {
+                        for (auto& path : layerOut.paths) {
+                            if (path.feature_kind == kFeatureInnerWall &&
+                                (path.wall_index % 2 == 1)) {
+                                for (auto& pt : path.points) {
+                                    const float hOrig = pt.height_mm;
+                                    const Vec3f p0{pt.x, pt.y, pt.z};
+                                    const Vec3f zNoz =
+                                        normalize3(Vec3f{pt.nx, pt.ny, pt.nz}, fallbackNozzle);
+                                    const float sdfUp =
+                                        sampleSdf(p0 + (zNoz * (0.5f * hOrig))) - sdfZeroShift;
+                                    if (sdfUp <= -0.10f * outerW.min_mm) {
+                                        pt.x += 0.5f * hOrig * zNoz.x;
+                                        pt.y += 0.5f * hOrig * zNoz.y;
+                                        pt.z += 0.5f * hOrig * zNoz.z;
+                                    } else {
+                                        pt.height_mm = std::max(0.02f, 0.5f * hOrig);
+                                    }
+                                }
+                            }
+                        }
+                    } else if (isLastInnerWallLayer && !layerInfo.is_first_layer) {
+                        for (auto& path : layerOut.paths) {
+                            if (path.feature_kind == kFeatureInnerWall &&
+                                (path.wall_index % 2 == 1)) {
+                                for (auto& pt : path.points) {
+                                    pt.height_mm = std::max(0.02f, 0.5f * pt.height_mm);
                                 }
                             }
                         }

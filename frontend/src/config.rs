@@ -901,6 +901,75 @@ impl SolidInfillPattern {
     }
 }
 
+/// Brick-layer perimeter staggering mode used to interlock adjacent wall extrusions across layers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BrickLayerMode {
+    /// Standard stacked walls (each perimeter loop sits directly atop the corresponding loop below).
+    #[default]
+    Standard,
+    /// Running-bond lateral staggering: shifts inner wall centerlines by $+0.5 w_{\text{inner}}$ on odd
+    /// layers (widening `InnerWall 1` to $1.5 w_{\text{inner}}$) so each extrusion straddles the seam
+    /// between two extrusions on the previous layer.
+    LateralSeamStagger,
+    /// True brick-layer vertical interlocking: offsets odd-indexed inner walls ($j = 1, 3, \dots$)
+    /// by $+0.5 h_{\text{layer}}$ along the local nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$,
+    /// with half-height ($0.5 h$) starter and cap passes on the first and top layers.
+    VerticalHalfLayer,
+    /// Combines both running-bond lateral seam staggering and $+0.5 h_{\text{layer}}$ vertical
+    /// half-layer interlocking.
+    CombinedLateralAndVertical,
+}
+
+impl BrickLayerMode {
+    pub const ALL: [Self; 4] = [
+        Self::Standard,
+        Self::LateralSeamStagger,
+        Self::VerticalHalfLayer,
+        Self::CombinedLateralAndVertical,
+    ];
+
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::Standard => 0,
+            Self::LateralSeamStagger => 1,
+            Self::VerticalHalfLayer => 2,
+            Self::CombinedLateralAndVertical => 3,
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::LateralSeamStagger,
+            2 => Self::VerticalHalfLayer,
+            3 => Self::CombinedLateralAndVertical,
+            _ => Self::Standard,
+        }
+    }
+
+    pub const fn has_lateral_stagger(self) -> bool {
+        matches!(
+            self,
+            Self::LateralSeamStagger | Self::CombinedLateralAndVertical
+        )
+    }
+
+    pub const fn has_vertical_interlock(self) -> bool {
+        matches!(
+            self,
+            Self::VerticalHalfLayer | Self::CombinedLateralAndVertical
+        )
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard (Aligned Walls)",
+            Self::LateralSeamStagger => "Lateral Seam Stagger (Running Bond)",
+            Self::VerticalHalfLayer => "Vertical Half-Layer Interlock (+0.5h)",
+            Self::CombinedLateralAndVertical => "Combined Lateral + Vertical Brick",
+        }
+    }
+}
+
 /// Pattern used to generate sparse infill inside the interior core ($\phi_{\text{sdf}}(\mathbf{x}) < -T_{\text{shell}}$).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SparseInfillPattern {
@@ -1024,6 +1093,8 @@ pub struct SlicingProcessConfig {
     pub shell_thickness_mm: f32,
     /// Number of inner walls immediately inside the outer wall (in addition to the 1 outer wall).
     pub inner_wall_count: u32,
+    /// Brick-layer perimeter staggering mode (`Standard`, `LateralSeamStagger`, `VerticalHalfLayer`, `CombinedLateralAndVertical`).
+    pub brick_layer_mode: BrickLayerMode,
     /// Variable line width `(target_mm, min_mm, max_mm)` for outer walls contacting $\phi_{\text{sdf}} = 0$.
     pub outer_wall_width: LineWidthConfig,
     /// Variable line width `(target_mm, min_mm, max_mm)` for inner walls.
@@ -1134,6 +1205,7 @@ impl Default for SlicingProcessConfig {
             infill_angle_deg: 45.0,
             shell_thickness_mm: 1.60,
             inner_wall_count: 2,
+            brick_layer_mode: BrickLayerMode::Standard,
             outer_wall_width: LineWidthConfig::new(0.40, 0.28, 0.56),
             inner_wall_width: LineWidthConfig::new(0.42, 0.28, 0.58),
             solid_infill_width: LineWidthConfig::new(0.42, 0.26, 0.60),
@@ -2910,6 +2982,15 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         default_value: "2",
         summary: "Number of concentric inner perimeter loops printed inside the outer wall.",
         details: "Inner walls back up the outer perimeter and provide structural stiffness before transitioning to solid or sparse infill.",
+    },
+    ParameterDoc {
+        key: "slicing.brick_layer_mode",
+        category: "Shell & Toolpath Generation",
+        title: "Brick Layers (Perimeter Interlocking)",
+        units: "",
+        default_value: "Standard (Aligned Walls)",
+        summary: "Staggers perimeter extrusions across layers laterally (running bond), vertically (+0.5h along z_nozzle), or both so each extrusion binds to two extrusions on the previous layer.",
+        details: "Lateral Seam Stagger shifts inner wall centerlines by +0.5*w_inner on odd layers (widening Inner Wall 1 to 1.5*w_inner) so every bead straddles the seam between two beads below while keeping the outer wall crisp. Vertical Half-Layer Interlock shifts odd-indexed inner walls (1, 3, ...) by +0.5*h_layer along the local nozzle axis (with 0.5*h starter and cap passes on the first and top layers) and orders passes in monotonically increasing elevation so the nozzle tip never dips between raised walls.",
     },
     ParameterDoc {
         key: "slicing.min_extrusion_length_mm",

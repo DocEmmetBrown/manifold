@@ -1639,6 +1639,7 @@ struct SlicerBackend::Impl {
         true,
         true,
         15.0f,
+        0,
     };
     SupportSpec supportSpec{
         true,
@@ -8169,6 +8170,7 @@ void SlicerBackend::setShellPathSpec(const ShellPathSpec& spec) noexcept {
     s.wave_overhang_overlap_fraction = (s.wave_overhang_overlap_fraction > 1.0e-4f)
         ? std::clamp(s.wave_overhang_overlap_fraction, 0.01f, 0.45f)
         : 0.08f;
+    s.brick_layer_mode = (s.brick_layer_mode <= 3) ? s.brick_layer_mode : 0;
     impl_->shellPathSpec = s;
 }
 

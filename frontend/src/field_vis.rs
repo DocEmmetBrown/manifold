@@ -677,6 +677,7 @@ impl FieldVisualizationState {
             one_perimeter_on_conformal_patches: s.one_perimeter_on_conformal_patches,
             orient_outer_surfaces_to_normal: s.orient_outer_surfaces_to_normal,
             outer_surface_parallel_angle_deg: s.outer_surface_parallel_angle_deg,
+            brick_layer_mode: s.brick_layer_mode.as_u8(),
         };
         let support_spec = SupportSpec {
             enabled: s.enable_support_generation,
@@ -5027,6 +5028,7 @@ mod tests {
             one_perimeter_on_conformal_patches: true,
             orient_outer_surfaces_to_normal: true,
             outer_surface_parallel_angle_deg: 15.0,
+            brick_layer_mode: 0,
         };
         ffi::set_shell_path_spec(base_spec.clone());
 
@@ -5208,6 +5210,7 @@ mod tests {
             one_perimeter_on_conformal_patches: true,
             orient_outer_surfaces_to_normal: true,
             outer_surface_parallel_angle_deg: 15.0,
+            brick_layer_mode: 0,
         });
 
         let res = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
@@ -5606,6 +5609,7 @@ mod tests {
             one_perimeter_on_conformal_patches: true,
             orient_outer_surfaces_to_normal: true,
             outer_surface_parallel_angle_deg: 15.0,
+            brick_layer_mode: 0,
         };
 
         // Test all 7 sparse infill patterns (0..=6: Monotonic, Cubic, Gyroid, SchwarzD, SchwarzP, Concentric, AllWalls)
@@ -6500,6 +6504,7 @@ mod tests {
             one_perimeter_on_conformal_patches: true,
             orient_outer_surfaces_to_normal: true,
             outer_surface_parallel_angle_deg: 15.0,
+            brick_layer_mode: 0,
         });
 
         let tp_bridge = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
@@ -6572,6 +6577,7 @@ mod tests {
             one_perimeter_on_conformal_patches: true,
             orient_outer_surfaces_to_normal: true,
             outer_surface_parallel_angle_deg: 15.0,
+            brick_layer_mode: 0,
         });
 
         let tp_wave_only = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
@@ -9180,6 +9186,168 @@ mod tests {
         assert!(matches!(mat_xray_core.alpha_mode, AlphaMode::Blend));
         assert!(matches!(mat_xray_outer.alpha_mode, AlphaMode::Blend));
         assert!(mat_xray_core.depth_bias < mat_xray_outer.depth_bias);
+    }
+
+    #[test]
+    fn test_brick_layer_modes_lateral_vertical_and_combined() {
+        let _guard = crate::bridge::TEST_BACKEND_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // 16 x 16 x 2.0 mm box (5 layers of 0.40 mm)
+        let positions: [f32; 24] = [
+            -8.0, -8.0, 0.0,  8.0, -8.0, 0.0,  8.0, 8.0, 0.0, -8.0, 8.0, 0.0,
+            -8.0, -8.0, 2.0,  8.0, -8.0, 2.0,  8.0, 8.0, 2.0, -8.0, 8.0, 2.0,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2,
+            4, 5, 6, 4, 6, 7,
+            0, 1, 5, 0, 5, 4,
+            1, 2, 6, 1, 6, 5,
+            2, 3, 7, 2, 7, 6,
+            3, 0, 4, 3, 4, 7,
+        ];
+        let part = ffi::register_triangle_mesh("brick_test_box", &positions, &indices);
+        assert!(part.object_id > 0);
+
+        let mut cfg = SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+        cfg.slicing.enable_support_generation = false;
+        cfg.slicing.enable_auto_conformal_skin = false;
+        cfg.slicing.layer_height = crate::config::LayerHeightConfig {
+            target_mm: 0.40,
+            min_mm: 0.30,
+            max_mm: 0.50,
+            first_layer_mm: 0.40,
+            top_layer_mm: 0.40,
+        };
+        cfg.slicing.shell_thickness_mm = 2.0;
+        cfg.slicing.inner_wall_count = 2;
+        cfg.slicing.outer_wall_width = crate::config::LineWidthConfig::new(0.40, 0.28, 0.60);
+        cfg.slicing.inner_wall_width = crate::config::LineWidthConfig::new(0.40, 0.28, 0.65);
+
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.35, 3.0));
+
+        // 1. Standard mode (brick_layer_mode = Standard)
+        cfg.slicing.brick_layer_mode = crate::config::BrickLayerMode::Standard;
+        crate::ui::sync_config_to_backend(&cfg);
+        let tp_std = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp_std.valid && tp_std.layers.len() >= 3);
+
+        let std_l0_w1 = tp_std.layers[0]
+            .paths
+            .iter()
+            .find(|p| p.feature_kind == 1 && p.wall_index == 1)
+            .expect("Standard Layer 0 InnerWall 1");
+        let std_l1_w1 = tp_std.layers[1]
+            .paths
+            .iter()
+            .find(|p| p.feature_kind == 1 && p.wall_index == 1)
+            .expect("Standard Layer 1 InnerWall 1");
+        assert!(
+            (std_l0_w1.mean_width_mm - std_l1_w1.mean_width_mm).abs() < 0.03,
+            "Standard mode should have uniform InnerWall 1 width across even/odd layers ({} vs {})",
+            std_l0_w1.mean_width_mm,
+            std_l1_w1.mean_width_mm
+        );
+
+        // 2. LateralSeamStagger mode (brick_layer_mode = LateralSeamStagger)
+        cfg.slicing.brick_layer_mode = crate::config::BrickLayerMode::LateralSeamStagger;
+        crate::ui::sync_config_to_backend(&cfg);
+        let tp_lat = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp_lat.valid);
+        let lat_l1_w1 = tp_lat.layers[1]
+            .paths
+            .iter()
+            .find(|p| p.feature_kind == 1 && p.wall_index == 1)
+            .expect("Lateral Layer 1 InnerWall 1");
+        assert!(
+            lat_l1_w1.mean_width_mm > std_l1_w1.mean_width_mm + 0.14,
+            "LateralSeamStagger odd layer InnerWall 1 should widen by +0.5*w_inner (~0.60mm vs {}), got {}",
+            std_l1_w1.mean_width_mm,
+            lat_l1_w1.mean_width_mm
+        );
+
+        // 3. VerticalHalfLayer mode (brick_layer_mode = VerticalHalfLayer)
+        cfg.slicing.brick_layer_mode = crate::config::BrickLayerMode::VerticalHalfLayer;
+        crate::ui::sync_config_to_backend(&cfg);
+        let tp_vert = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp_vert.valid);
+
+        // Layer 0 (first layer) must contain both a 0.5*h starter pass and a +0.5*h raised pass for InnerWall 1
+        let l0_w1_paths: Vec<_> = tp_vert.layers[0]
+            .paths
+            .iter()
+            .filter(|p| p.feature_kind == 1 && p.wall_index == 1)
+            .collect();
+        assert!(
+            l0_w1_paths.len() >= 2,
+            "VerticalHalfLayer Layer 0 should have starter + raised passes for InnerWall 1, got {}",
+            l0_w1_paths.len()
+        );
+        let has_starter = l0_w1_paths
+            .iter()
+            .any(|p| p.points.iter().all(|pt| pt.height_mm < 0.25));
+        let has_raised = l0_w1_paths
+            .iter()
+            .any(|p| p.points.iter().all(|pt| pt.height_mm > 0.30));
+        assert!(has_starter && has_raised, "Expected both half-height starter and full-height raised pass on Layer 0");
+
+        // Interior layer 1: InnerWall 1 (odd) should sit +0.5*h higher in Z than OuterWall 0 (even)
+        let l1_outer_z = tp_vert.layers[1]
+            .paths
+            .iter()
+            .find(|p| p.feature_kind == 0)
+            .unwrap()
+            .points[0]
+            .z;
+        let l1_inner1_z = tp_vert.layers[1]
+            .paths
+            .iter()
+            .find(|p| p.feature_kind == 1 && p.wall_index == 1)
+            .unwrap()
+            .points[0]
+            .z;
+        assert!(
+            l1_inner1_z > l1_outer_z + 0.14,
+            "VerticalHalfLayer interior odd wall should be shifted +0.5*h above even wall ({l1_inner1_z} vs {l1_outer_z})"
+        );
+
+        // Topmost layer containing inner walls: InnerWall 1 should have half-height closing cap pass (height_mm ~ 0.20mm)
+        let top_w1 = tp_vert
+            .layers
+            .iter()
+            .rev()
+            .find_map(|l| {
+                l.paths
+                    .iter()
+                    .find(|p| p.feature_kind == 1 && p.wall_index == 1)
+            })
+            .expect("Topmost layer with InnerWall 1");
+        assert!(
+            top_w1.points[0].height_mm < 0.25,
+            "Topmost inner-wall layer odd wall should use half-height closing cap pass, got {}",
+            top_w1.points[0].height_mm
+        );
+
+        // 4. CombinedLateralAndVertical mode (brick_layer_mode = CombinedLateralAndVertical)
+        cfg.slicing.brick_layer_mode = crate::config::BrickLayerMode::CombinedLateralAndVertical;
+        crate::ui::sync_config_to_backend(&cfg);
+        let tp_comb = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp_comb.valid);
+        let comb_l1_w1 = tp_comb.layers[1]
+            .paths
+            .iter()
+            .find(|p| p.feature_kind == 1 && p.wall_index == 1)
+            .expect("Combined Layer 1 InnerWall 1");
+        assert!(
+            comb_l1_w1.mean_width_mm > std_l1_w1.mean_width_mm + 0.14
+                && comb_l1_w1.points[0].z > l1_outer_z + 0.14,
+            "CombinedLateralAndVertical must apply both lateral width stagger and vertical +0.5*h shift"
+        );
+
+        let _ = ffi::remove_cad_object(part.object_id);
     }
 }
 

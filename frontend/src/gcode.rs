@@ -1017,24 +1017,86 @@ fn order_chain_band_single_slot(
         }
     }
 
-    // Sort supported walls according to `WallPrintOrder`
+    // Sort supported walls according to `WallPrintOrder`, and when Vertical Half-Layer Brick
+    // Interlocking is present, order monotonically by elevation tier:
+    // Tier 0 (First-Layer 0.5*h Starter Pass) -> Tier 1 (Even Walls 0, 2, 4...) -> Tier 2 (Raised +0.5*h Odd Walls)
     let max_wall_idx = walls.iter().map(|w| w.wall_index).max().unwrap_or(0);
-    let wall_rank = |w_idx: u32| -> u32 {
-        match wall_order {
-            WallPrintOrder::OutsideIn => w_idx,
+    let mut even_h_sum = 0.0f32;
+    let mut even_proj_sum = 0.0f32;
+    let mut even_pt_cnt = 0usize;
+    for w in &walls {
+        if w.wall_index % 2 == 0 {
+            for pt in &w.pts {
+                even_h_sum += pt.height_mm;
+                even_proj_sum += pt.pos_bed.dot(pt.nozzle_bed);
+                even_pt_cnt += 1;
+            }
+        }
+    }
+    let even_mean_h = if even_pt_cnt > 0 {
+        even_h_sum / (even_pt_cnt as f32)
+    } else {
+        0.20
+    };
+    let even_mean_proj = if even_pt_cnt > 0 {
+        even_proj_sum / (even_pt_cnt as f32)
+    } else {
+        0.0
+    };
+    let chain_mean_h_and_proj = |w: &WorkingChain| -> (f32, f32) {
+        if w.pts.is_empty() {
+            return (even_mean_h, even_mean_proj);
+        }
+        let mut hs = 0.0f32;
+        let mut ps = 0.0f32;
+        for pt in &w.pts {
+            hs += pt.height_mm;
+            ps += pt.pos_bed.dot(pt.nozzle_bed);
+        }
+        let inv = 1.0 / (w.pts.len() as f32);
+        (hs * inv, ps * inv)
+    };
+    let has_vertical_brick_shift = even_pt_cnt > 0
+        && walls.iter().any(|w| {
+            if w.wall_index % 2 == 1 {
+                let (mh, mp) = chain_mean_h_and_proj(w);
+                (mh - even_mean_h).abs() > 0.20 * even_mean_h
+                    || (mp - even_mean_proj).abs() > 0.20 * even_mean_h
+            } else {
+                false
+            }
+        });
+
+    let wall_rank = |w: &WorkingChain| -> u32 {
+        let base_rank = match wall_order {
+            WallPrintOrder::OutsideIn => w.wall_index,
             WallPrintOrder::InnerOuterInner => {
                 // [n..=2, 0, 1]: print inner walls >= 2 from inside out, then outer wall 0, then backing wall 1
-                if w_idx >= 2 {
-                    max_wall_idx - w_idx
-                } else if w_idx == 0 {
+                if w.wall_index >= 2 {
+                    max_wall_idx - w.wall_index
+                } else if w.wall_index == 0 {
                     max_wall_idx
                 } else {
                     max_wall_idx + 1
                 }
             }
+        };
+        if !has_vertical_brick_shift {
+            return base_rank;
         }
+        let tier = if w.wall_index % 2 == 0 {
+            1u32
+        } else {
+            let (mh, mp) = chain_mean_h_and_proj(w);
+            if mh < 0.72 * even_mean_h && mp < even_mean_proj - 0.15 * even_mean_h {
+                0u32 // First-layer half-height starter pass (-0.5 * h_0)
+            } else {
+                2u32 // Raised +0.5 * h_k brick pass (or top-layer closing cap pass)
+            }
+        };
+        tier * 1024 + base_rank
     };
-    walls.sort_by_key(|w| wall_rank(w.wall_index));
+    walls.sort_by_key(|w| wall_rank(w));
 
     let weighted_dist_sq = |a: Vec3, b: Vec3| -> f32 {
         let d = b - a;
@@ -1077,14 +1139,14 @@ fn order_chain_band_single_slot(
             .iter()
             .enumerate()
             .filter(|(i, _)| !used_walls[*i])
-            .map(|(_, w)| wall_rank(w.wall_index))
+            .map(|(_, w)| wall_rank(w))
             .min()
             .unwrap_or(0);
 
         let mut best_i = 0usize;
         let mut best_d = f32::MAX;
         for (i, w) in walls.iter().enumerate() {
-            if used_walls[i] || wall_rank(w.wall_index) != min_remaining_rank {
+            if used_walls[i] || wall_rank(w) != min_remaining_rank {
                 continue;
             }
             let d = if w.is_closed {

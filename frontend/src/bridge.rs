@@ -281,6 +281,8 @@ pub mod ffi {
         /// Maximum angular deviation (degrees, `0.0..=85.0`) between the reachable clamped tool axis and
         /// the outward surface normal considered "almost parallel" when `orient_outer_surfaces_to_normal` is enabled.
         pub outer_surface_parallel_angle_deg: f32,
+        /// Brick-layer perimeter staggering mode (`0 = Standard`, `1 = LateralSeamStagger`, `2 = VerticalHalfLayer`, `3 = CombinedLateralAndVertical`).
+        pub brick_layer_mode: u8,
     }
 
     /// A single 3D vertex along a continuous non-planar extrusion toolpath.
