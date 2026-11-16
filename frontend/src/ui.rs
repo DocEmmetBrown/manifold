@@ -18,7 +18,7 @@ use crate::config::{
 use crate::field_vis::{
     high_contrast_parameter_ramp, sample_slice_colormap_rgba, FieldColormap,
     FieldVisualizationState, IsoIntersectionMode, ObjectSurfaceColorMode,
-    SelectedLayersColorMode, SliceAxis, ToolpathColorMode, BRANCH_PALETTE,
+    SelectedLayersColorMode, SliceAxis, ToolpathColorMode, ToolpathQualityMode, BRANCH_PALETTE,
 };
 use crate::hull::rotation_to_place_face_on_bed;
 use crate::io::threemf::{save_project_to_3mf, ExportableObject};
@@ -772,6 +772,88 @@ fn render_layer_and_move_scrub_controls(
     });
 }
 
+/// Renders the extrusion geometry quality (`Fast` vs `HighQualityPbr`), physical filament TD
+/// translucency, lithophane backlight, and live alpha X-ray opacity controls.
+fn render_toolpath_quality_and_transparency_controls(
+    ui: &mut egui::Ui,
+    vis_state: &mut FieldVisualizationState,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Extrusion Render:");
+        for q_mode in [
+            ToolpathQualityMode::Fast,
+            ToolpathQualityMode::HighQualityPbr,
+        ] {
+            let selected = vis_state.toolpath_quality_mode == q_mode;
+            if render_delineated_pill_tab(ui, selected, q_mode.short_label())
+                .on_hover_text(match q_mode {
+                    ToolpathQualityMode::Fast => {
+                        "Fast 4-sided bead prisms merged into a single mesh for maximum interactive FPS."
+                    }
+                    ToolpathQualityMode::HighQualityPbr => {
+                        "High-quality 12-vertex pressed-stadium (capsule) beads with continuous mitered joints, bullnose endcaps, per-filament Bevy PBR polymer sheen, TD-driven translucency, and soft cascaded shadows."
+                    }
+                })
+                .clicked()
+                && !selected
+            {
+                vis_state.toolpath_quality_mode = q_mode;
+                vis_state.dirty_toolpaths_mesh = true;
+            }
+        }
+    });
+
+    if vis_state.toolpath_quality_mode == ToolpathQualityMode::HighQualityPbr {
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut vis_state.enable_pbr_translucency,
+                "TD-Based Filament Opacity",
+            )
+            .on_hover_text(
+                "Set each filament's bead opacity directly from its Kubelka–Munk Transmission Distance (TD) and physical bead thickness (high-TD filaments are translucent; low-TD filaments are dense).",
+            );
+            ui.checkbox(
+                &mut vis_state.lithophane_backlight_preview,
+                "Lithophane Backlight",
+            )
+            .on_hover_text(
+                "Boost rear backlight illumination behind the print to preview backlit lithophane glow through translucent extrusions.",
+            );
+            ui.checkbox(&mut vis_state.enable_hq_shadows, "Soft Shadows")
+                .on_hover_text(
+                    "Enable millimeter-calibrated cascaded directional shadows on the 3D studio key light.",
+                );
+        });
+    }
+
+    ui.horizontal(|ui| {
+        let slider_lbl = if vis_state.toolpath_quality_mode == ToolpathQualityMode::HighQualityPbr
+            && vis_state.enable_pbr_translucency
+        {
+            "Opacity Scale (× TD)"
+        } else {
+            "Extrusion Opacity"
+        };
+        let max_op = if vis_state.toolpath_quality_mode == ToolpathQualityMode::HighQualityPbr
+            && vis_state.enable_pbr_translucency
+        {
+            1.50
+        } else {
+            1.00
+        };
+        if vis_state.toolpath_opacity > max_op {
+            vis_state.toolpath_opacity = max_op;
+        }
+        ui.add(egui::Slider::new(&mut vis_state.toolpath_opacity, 0.10..=max_op).text(slider_lbl))
+            .on_hover_text(
+                "At 1.00 in High-Quality PBR mode, bead opacity matches each tool's physical Transmission Distance (TD). Lower below 1.00 to X-ray inside the core, or raise toward 1.50 to increase density.",
+            );
+        if (vis_state.toolpath_opacity - 1.0).abs() > 1.0e-3 && ui.small_button("1.0×").clicked() {
+            vis_state.toolpath_opacity = 1.0;
+        }
+    });
+}
+
 /// Renders the active toolpath legend (either continuous 5-tick gradient bar or categorical swatches).
 fn render_toolpath_color_legend(
     ui: &mut egui::Ui,
@@ -846,6 +928,31 @@ fn render_toolpath_color_legend(
             .map(|(s, c)| (s.as_str(), *c))
             .collect();
         draw_categorical_swatch_legend(ui, "Tool / Filament Colour Legend", &borrowed);
+        return;
+    }
+
+    if vis_state.toolpath_color_mode == ToolpathColorMode::ByOpticalComposite {
+        let mut owned_items: Vec<(String, [f32; 4])> = Vec::new();
+        for tool in &config.tools {
+            let td_mm = tool.effective_transmission_distance_mm();
+            owned_items.push((
+                format!(
+                    "T{} ({}, {}, TD {:.1} mm)",
+                    tool.id, tool.name, tool.filament_color_hex, td_mm
+                ),
+                tool.filament_color_srgba,
+            ));
+        }
+        owned_items.push(("Support".to_string(), [0.22, 0.88, 0.62, 1.0]));
+        let borrowed: Vec<(&str, [f32; 4])> = owned_items
+            .iter()
+            .map(|(s, c)| (s.as_str(), *c))
+            .collect();
+        let title = format!(
+            "Simulated Optical Stack ({})",
+            config.slicing.color_mixing.lighting_mode.label()
+        );
+        draw_categorical_swatch_legend(ui, &title, &borrowed);
         return;
     }
 
@@ -933,6 +1040,7 @@ fn render_toolpath_color_legend(
             ),
             ToolpathColorMode::ByFeatureType
             | ToolpathColorMode::ByToolOrFilament
+            | ToolpathColorMode::ByOpticalComposite
             | ToolpathColorMode::BySurfaceNormalUsage => {
                 unreachable!()
             }
@@ -4913,6 +5021,7 @@ fn apply_quick_cmykw_palette_setup(
         need_reslice = true;
     }
     vis_state.toolpath_color_mode = ToolpathColorMode::ByToolOrFilament;
+    vis_state.toolpath_quality_mode = ToolpathQualityMode::HighQualityPbr;
     vis_state.dirty_color_mixing = true;
     vis_state.dirty_planned_gcode = true;
     vis_state.dirty_toolpaths_mesh = true;
@@ -7499,6 +7608,25 @@ fn render_view_and_inspection_panel(
                 }
             }
 
+            let mut hq_pbr_scene =
+                vis_state.toolpath_quality_mode == ToolpathQualityMode::HighQualityPbr;
+            if ui
+                .checkbox(
+                    &mut hq_pbr_scene,
+                    "High-Quality PBR Shading, Clearcoat & Soft Shadows",
+                )
+                .on_hover_text(
+                    "Enable Bevy PBR clearcoat polymer sheen, cascaded soft directional shadows, and 12-vertex pressed-capsule toolpath rendering.",
+                )
+                .changed()
+            {
+                vis_state.toolpath_quality_mode = if hq_pbr_scene {
+                    ToolpathQualityMode::HighQualityPbr
+                } else {
+                    ToolpathQualityMode::Fast
+                };
+                vis_state.dirty_toolpaths_mesh = true;
+            }
             ui.checkbox(
                 &mut plate.show_object_labels,
                 "Show Build-Plate Object Labels (EXCLUDE_OBJECT)",
@@ -7535,6 +7663,8 @@ fn render_view_and_inspection_panel(
                     "standalone_calibration_scrub",
                 );
                 if vis_state.show_toolpaths {
+                    render_toolpath_quality_and_transparency_controls(ui, vis_state);
+                    ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         ui.label("Color By:");
                         let combo_w = (ui.available_width() - 8.0).clamp(130.0, 220.0);
@@ -8007,6 +8137,9 @@ fn render_view_and_inspection_panel(
                 "toolpaths_gcode_preview_scrub",
             );
             ui.add_space(3.0);
+
+            render_toolpath_quality_and_transparency_controls(ui, vis_state);
+            ui.add_space(2.0);
 
             ui.horizontal(|ui| {
                 ui.label("Color By:");

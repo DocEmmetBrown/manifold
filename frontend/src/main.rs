@@ -20,7 +20,9 @@ use bevy::render::renderer::RenderDevice;
 use bevy::tasks::IoTaskPool;
 use bevy_egui::{egui, EguiContexts, EguiPlugin};
 use bridge::ffi::RenderVertex;
-use field_vis::{sync_field_visualization_system, FieldVisualizationState};
+use field_vis::{
+    sync_field_visualization_system, sync_viewport_pbr_quality_system, FieldVisualizationState,
+};
 use scene::{
     compute_orbit_eye, draw_viewport_gizmos_system, update_selection_materials_system,
     viewport_interaction_system, BuildPlateState, OrbitCamera,
@@ -59,6 +61,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
 #[derive(Resource, Default)]
 struct StartupFiles(Vec<std::path::PathBuf>);
+
+/// Marker component for the primary 3D viewport key directional light (casts cascaded shadows in HQ PBR mode).
+#[derive(Component)]
+pub struct ViewportKeyLight;
+
+/// Marker component for the secondary cool-sky fill directional light.
+#[derive(Component)]
+pub struct ViewportFillLight;
+
+/// Marker component for the rear grazing rim / lithophane backlight directional light.
+#[derive(Component)]
+pub struct ViewportRimBackLight;
 
 fn main() {
     let gui_opts = match cli::handle_cli_args_from_env() {
@@ -112,6 +126,7 @@ fn main() {
                 surface_ui::sync_and_interact_surface_ui_system,
                 viewport_interaction_system,
                 sync_field_visualization_system,
+                sync_viewport_pbr_quality_system,
                 update_selection_materials_system,
                 draw_viewport_gizmos_system,
             )
@@ -187,32 +202,74 @@ fn setup_viewport_scene_and_pipeline(
     // Spawn Bevy 3D viewport camera with Z-up CAD convention
     commands.spawn((
         Camera3dBundle {
+            camera_3d: bevy::core_pipeline::core_3d::Camera3d {
+                screen_space_specular_transmission_steps: 0,
+                screen_space_specular_transmission_quality:
+                    bevy::core_pipeline::core_3d::ScreenSpaceTransmissionQuality::High,
+                ..default()
+            },
             transform: Transform::from_translation(eye).looking_at(orbit.focus, Vec3::Z),
             ..default()
         },
         orbit,
     ));
 
-    // Key & fill directional lights
-    commands.spawn(DirectionalLightBundle {
-        directional_light: DirectionalLight {
-            illuminance: 12_000.0,
-            shadows_enabled: false,
-            ..default()
-        },
-        transform: Transform::from_xyz(250.0, -220.0, 350.0).looking_at(Vec3::ZERO, Vec3::Z),
-        ..default()
-    });
+    // 3-point studio lighting rig (Key + Cool Fill + Rear Rim/Lithophane Backlight)
+    let shadow_cascades = bevy::pbr::CascadeShadowConfigBuilder {
+        num_cascades: 4,
+        minimum_distance: 1.0,
+        first_cascade_far_bound: 95.0,
+        maximum_distance: 700.0,
+        overlap_proportion: 0.2,
+    }
+    .build();
 
-    commands.spawn(DirectionalLightBundle {
-        directional_light: DirectionalLight {
-            illuminance: 5_500.0,
-            shadows_enabled: false,
+    commands.spawn((
+        DirectionalLightBundle {
+            directional_light: DirectionalLight {
+                color: Color::srgb(1.0, 0.985, 0.96),
+                illuminance: 11_500.0,
+                shadows_enabled: false,
+                // Millimeter-scale shadow biases (1 world unit = 1 mm across a 700 mm frustum)
+                // prevent shadow-map self-acne shimmer on sub-millimeter extruded beads.
+                shadow_depth_bias: 0.45,
+                shadow_normal_bias: 1.8,
+                ..default()
+            },
+            cascade_shadow_config: shadow_cascades,
+            transform: Transform::from_xyz(250.0, -220.0, 350.0).looking_at(Vec3::ZERO, Vec3::Z),
             ..default()
         },
-        transform: Transform::from_xyz(-240.0, 260.0, -140.0).looking_at(Vec3::ZERO, Vec3::Z),
-        ..default()
-    });
+        ViewportKeyLight,
+    ));
+
+    commands.spawn((
+        DirectionalLightBundle {
+            directional_light: DirectionalLight {
+                color: Color::srgb(0.90, 0.95, 1.0),
+                illuminance: 4_800.0,
+                shadows_enabled: false,
+                ..default()
+            },
+            transform: Transform::from_xyz(-240.0, 260.0, -140.0).looking_at(Vec3::ZERO, Vec3::Z),
+            ..default()
+        },
+        ViewportFillLight,
+    ));
+
+    commands.spawn((
+        DirectionalLightBundle {
+            directional_light: DirectionalLight {
+                color: Color::srgb(0.98, 0.99, 1.0),
+                illuminance: 3_200.0,
+                shadows_enabled: false,
+                ..default()
+            },
+            transform: Transform::from_xyz(-180.0, 240.0, 170.0).looking_at(Vec3::ZERO, Vec3::Z),
+            ..default()
+        },
+        ViewportRimBackLight,
+    ));
 
     if !startup_files.0.is_empty() {
         let paths = std::mem::take(&mut startup_files.0);

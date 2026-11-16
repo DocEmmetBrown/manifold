@@ -15,10 +15,11 @@ Unlike conventional 2.5D planar slicers that intersect triangle meshes with flat
 - **6-Axis Robot Arms, 5-Axis Tilting Beds & 3-Axis Gantries**: Supports 6-axis robotic extrusion cells, 5-axis tilting build plates (`Rx`, `Ry`), and non-planar conformal slicing within the physical toolhead clearance cone of 3-axis CoreXY, Cartesian, and Delta printers.
 - **Multi-Tool Registry & Flexible 3D Clearance Envelopes**: Configure multiple extrusion toolheads (`T0`, `T1`, …), each with its own orifice diameter, temperature, rotational tilt limit, and 3D collision clearance envelope (`PiecewiseXZ` multi-point revolved table, `ParametricCone` circular cone, or anisotropic 4-sided `RectilinearCone` pyramid).
 
-### Native CAD Ingestion & Multi-Plate `.3mf` Projects
+### Native CAD Ingestion, Multi-Colour `.3mf` & Kubelka–Munk Optical Mixing
 - **Direct STEP B-Rep CAD Import (`.step` / `.stp`)**: Powered by **OpenCASCADE (OCCT)**, preserving exact topological `TopoDS_Face` patches so you can click individual CAD faces to assign conformal, orthogonal, or conformal-skin hints.
-- **Mesh Import (`.stl` / `.3mf`)**: Automatic coplanar surface-patch segmentation, 3D Quickhull **Place on Face** orientation, and Archimedean spiral collision-free auto-arrangement.
-- **Multi-Plate `.3mf` Ecosystem**: Native multi-plate workspace compatible with `.3mf` projects from **Manifold Slicer**, **OrcaSlicer**, **Bambu Studio**, and **PrusaSlicer**.
+- **Mesh & Multi-Colour `.3mf` Import (`.stl` / `.3mf`)**: Automatic coplanar surface-patch segmentation, 3D Quickhull **Place on Face** orientation, Archimedean spiral collision-free auto-arrangement, and full multi-plate/multi-colour `.3mf` compatibility with **Manifold Slicer**, **OrcaSlicer**, **Bambu Studio**, and **PrusaSlicer** (`p:mmu_segmentation` paint trees, `<basematerials>`, `<m:colorgroup>`, and UV-mapped `<m:texture2d>` PNG textures).
+- **Kubelka–Munk Optical Colour Mixing & Lithophanes (`CMYKW` & Arbitrary Filaments)**: Approximates continuous RGB/textured surfaces using any $N \ge 2$ loaded filaments calibrated by opaque colour and **Transmission Distance (`TD` in mm)** via associative **Redheffer star-product** slab stacking across non-planar layers and concentric walls, 3D footpoint adjacent-layer dithering, along-path **Oklab** error-diffused short extrusions, and `FrontLitReflectance` / `BackLitTransmittance` (lithophane) / `MixedFrontAndBack` illumination modes.
+- **High-Quality Pressed-Stadium PBR Rendering & TD-Matched Opacity**: Interactive Bevy PBR viewport mode rendering 12-vertex pressed-stadium (capsule) beads in the local `NozzleFrame` with continuous mitered joints, bullnose endcaps, polymer `clearcoat`, soft cascaded shadows, simulated Kubelka–Munk optical composite previewing, and flicker-free **TD-Based Filament Opacity** ($\alpha(d, \text{TD}) = 1 - (0.08)^{d/\text{TD}}$).
 
 ### Volumetric OpenVDB Dual-Grid & Constrained Eikonal Slicing
 - **Dual-Grid Multi-Resolution**: Solves global arrival-time propagation on a coarse interior core grid ($\Delta x_{\text{coarse}} = R \cdot \Delta x_{\text{fine}}$, $64\times$ fewer interior voxels at $R = 4$) while refining the outer shell ($-T_{\text{shell}} \le \phi_{\text{sdf}} \le 0$) on a fine narrow-band grid ($\Delta x_{\text{fine}}$) with conformal mesh subdivision.
@@ -150,14 +151,15 @@ manifold-frontend slice \
   -s slicing.sparse_infill_pattern=Gyroid \
   part.step -o part.gcode
 
-# Slice a multi-plate .3mf project (exports one .gcode file per populated plate)
+# Slice a multi-plate or full-colour CMYKW .3mf project
 manifold-frontend slice project.3mf -o ./gcode_out/
+manifold-frontend slice --process "0.16mm CMYKW Full-Colour Optical Mixing" painted.3mf -o painted_cmykw.gcode
 
 # Initialize, inspect, modify, and diff JSON or TOML profiles
-manifold-frontend profile init my_profile.json --filament "Generic ASA (Enclosed)"
+manifold-frontend profile init my_profile.json --filament "Generic ASA"
 manifold-frontend profile set my_profile.json layer_height.target_mm=0.16 enable_scarf_joint=true
 manifold-frontend profile diff my_profile.json
-manifold-frontend profile keys --filter overhang
+manifold-frontend profile keys --filter color_mixing
 
 # Generate rheology calibration G-code patterns (Extrusion Multiplier, Ellis PA, Transient Melt Pressure)
 manifold-frontend calibrate em -p my_profile.json -t T0 --pass 1 -o calib_em_pass1.gcode
@@ -171,12 +173,12 @@ manifold-frontend calibrate transient -p my_profile.json -t T0 --pass 1 -o calib
 
 Detailed guides and technical references are available in the [`docs/`](docs/) directory:
 
-- **[Application Capabilities (`docs/capabilities.md`)](docs/capabilities.md)** — Hardware targets, CAD/3MF formats, volumetric fields, 3D toolpath features, rheology models, and Klipper integration.
+- **[Application Capabilities (`docs/capabilities.md`)](docs/capabilities.md)** — Hardware targets, CAD/multi-colour 3MF formats, Kubelka–Munk optical mixing & lithophanes, volumetric fields, 3D toolpath features, rheology models, and High-Quality PBR previewing.
 - **[Polymer Rheology & Flow Calibration Guide (`docs/calibration_guide.md`)](docs/calibration_guide.md)** — Visual and quantitative guide to generating and reading Extrusion Multiplier, Viscoelastic Die Swell, Dual-Band Ellis Pressure Advance, and Transient Melt-Zone Pressure calibration patterns.
-- **[User Interface Guide (`docs/ui_guide.md`)](docs/ui_guide.md)** — Interactive 3D viewport tools, multi-plate workflow, orientation hint authoring, VDB field inspection, calibration utilities, and toolpath preview controls.
+- **[User Interface Guide (`docs/ui_guide.md`)](docs/ui_guide.md)** — Interactive 3D viewport tools, multi-plate & multi-colour slot mapping, CMYKW optical mixing setup, High-Quality PBR & TD-matched opacity controls, orientation hint authoring, VDB field inspection, and calibration utilities.
 - **[Command-Line Interface Reference (`docs/cli.md`)](docs/cli.md)** — Complete syntax and examples for `manifold-frontend slice`, `manifold-frontend calibrate`, and `manifold-frontend profile` verbs.
 - **[Profile Variables Reference (`docs/profile_variables.md`)](docs/profile_variables.md)** — Exhaustive catalog of every `SlicerConfig` variable, dotted path, shorthand alias, preset category, unit, default value, and physical behavior.
-- **[Core Mathematical & Geometric Algorithms (`docs/core_algorithms.md`)](docs/core_algorithms.md)** — Mathematical formulations for `NozzleFrame` kinematics, Dual-Grid OpenVDB SDF/overhang/constrained Eikonal solvers, Reeb-graph layer scheduling, geodesic perimeters, 3D TPMS contouring, and viscoelastic polymer rheology.
+- **[Core Mathematical & Geometric Algorithms (`docs/core_algorithms.md`)](docs/core_algorithms.md)** — Mathematical formulations for `NozzleFrame` kinematics, Dual-Grid OpenVDB SDF/overhang/constrained Eikonal solvers, Reeb-graph layer scheduling, geodesic perimeters, 3D TPMS contouring, viscoelastic polymer rheology, Kubelka–Munk Redheffer optical colour mixing, and pressed-stadium PBR rendering.
 - **[Kinematic Invariants (`AGENTS.md`)](AGENTS.md)** — Mandatory multi-axis coordinate frame and bed-coordinate gravity rules.
 
 ---

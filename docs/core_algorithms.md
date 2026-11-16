@@ -276,3 +276,90 @@ When `enable_dynamic_fan_speed = true` (after `disable_fan_first_layers`), Manif
    When total layer duration $T_{\text{layer}} < T_{\text{target}} = \text{target\_layer\_cooling\_time\_s}$, a layer-time boost $u_{\text{layer}} = \text{clamp}\bigl((T_{\text{target}} - T_{\text{layer}}) / T_{\text{target}},\, 0,\, 1\bigr)$ ramps cooling upward. Acute corners and non-planar overhangs add $u_{\text{curl},i} \in [0, 1]$ so newly deposited corners freeze immediately before upward thermal curling can occur.
 4. **Rotor Spin-Up Lead Compensation & PWM Hysteresis**:
    Combining the demand terms yields $u_i = \text{clamp}\bigl(0.35\,u_{\text{flow},i} + 0.30\,u_{\text{duct},i} + 0.35\,\max(u_{\text{layer}}, u_{\text{curl},i}),\, 0,\, 1\bigr)$. Because DC blower fans require $\sim 0.35\text{ s}$ to spin up, each segment's target fan duty cycle takes the maximum over a `0.35 s` forward lookahead window (`M106` commands are emitted *before* entering an overhang, bridge, or high-flow burst) and applies a `7 / 255` (`~2.7%`) PWM deadband to avoid G-code chatter.
+
+---
+
+## 7. Multi-Colour 3MF Segmentation, Kubelka–Munk Optical Mixing & Lithophane Optics
+
+Manifold Slicer supports both **discrete multi-extruder / AMS slot painting** and **continuous full-colour / textured optical mixing** (using CMYKW or any arbitrary $N \ge 2$ loaded filaments) across curved non-planar layers and multi-axis tool orientations.
+
+### 7.1 Multi-Colour 3MF Ingestion, Volumetric Surface-Optics Grids & Conformal Perimeter Splitting
+1. **Discrete Paint-Tree & Continuous True-Colour / UV-Texture 3MF Ingestion (`frontend/src/threemf.rs`)**:
+   - **Discrete Multi-Material Segmentation**: Parses PrusaSlicer / OrcaSlicer / Bambu Studio `p:mmu_segmentation` (`paint_color`) hexadecimal quadtree strings by recursively subdividing painted mesh triangles (`4`-child midpoint split per hex nibble) and assigning 0-based `filament_slot` indices mapped to `SlicerConfig::filament_slots`.
+   - **True-Colour Materials & UV-Mapped PNG Textures**: Parses 3MF Core `<basematerials>`, Materials Extension `<m:colorgroup>`, and `<m:texture2d>` + `<m:texture2dgroup>` embedded PNG textures. Textured triangles bilinearly sample UV coordinates in IEC 61966-2-1 linear light and pack per-triangle `0xRRGGBBAA` colours alongside discrete slot indices.
+2. **Volumetric OpenVDB Surface-Optics Propagation (`backend/src/slicer_backend.cpp`)**:
+   - During `meshToLevelSet` narrow-band rasterization, the closest surface triangle index for every voxel transfers both its discrete `filament_slot` (`filamentSlotGrid`) and packed `0xRRGGBBAA` surface colour (`surfaceColorGrid`) throughout the 3D shell.
+   - For any interior or boundary query point $\mathbf{x}$ in bed coordinates, `sampleObjectSurfaceOptics` evaluates the outward surface normal $\hat{\mathbf{n}}_{\text{surf}}(\mathbf{x}) = \nabla\phi_{\text{sdf}}(\mathbf{x}) / \|\nabla\phi_{\text{sdf}}(\mathbf{x})\|$, signed shell depth $d_{\text{surf}}(\mathbf{x}) = \max\bigl(0,\, -\phi_{\text{sdf}}(\mathbf{x})\bigr)$, and nearest boundary footpoint:
+     $$\mathbf{x}_{\text{surf}}(\mathbf{x}) = \mathbf{x} - \phi_{\text{sdf}}(\mathbf{x})\,\hat{\mathbf{n}}_{\text{surf}}(\mathbf{x})$$
+     returning the exact boundary target colour and slot directly above $\mathbf{x}$.
+3. **Conformal Perimeter & Infill Splitting Across Slot Boundaries**:
+   - When discrete multi-slot painting is active (`color_mixing.enabled = false`), C++ conformal shell extraction (`splitPolylineByFilamentSlot`) splits curved `OuterWall`, `InnerWall`, and `SolidInfill` polylines at exact `filament_slot` transitions so colour boundaries remain crisp on curved 2-manifold layers, while G-code compilation emits toolchanges (`T{id}`), per-tool hotend temperatures, per-tool rheology/cooling overrides (`ToolConfig::effective_gcode_config`), and obstacle-aware toolchange clearance hops (`tool_change_hop_before`, `tool_change_approach_after`).
+
+### 7.2 Two-Flux Kubelka–Munk Optical Model & Transmission Distance (`TD`) Calibration
+Implemented in `frontend/src/color_optics.rs`, Manifold Slicer models translucent pigmented polymers using two-flux **Kubelka–Munk** radiative transfer in linear RGB channels $c \in \{R, G, B\}$:
+
+1. **Polymer Fresnel Interface Bound & Attenuation Calibration (`FilamentOpticalModel::from_srgb_and_td`)**:
+   - Converts each filament's opaque colour from sRGB to IEC 61966-2-1 linear reflectance and clamps $R_{\infty,c} \in [0.004, 0.93]$ to account for the $\sim 4\text{--}7\%$ air–polymer Fresnel surface reflection loss and carbon-black floor.
+   - From $R_{\infty,c}$, the dimensionless Kubelka–Munk absorption-to-scattering ratio and hyperbolic attenuation factor are determined analytically:
+     $$\frac{K_c}{S} = \frac{(1 - R_{\infty,c})^2}{2\,R_{\infty,c}}, \qquad b_c = \frac{1 - R_{\infty,c}^2}{2\,R_{\infty,c}} = \sqrt{\left(\frac{K_c}{S}\right)^2 + 2\,\frac{K_c}{S}}$$
+   - Given the filament's physical **Transmission Distance** $\text{TD}$ in millimeters (defaulting to a researched `2.5 mm` baseline for standard opaque PLA/PETG/ABS/ASA when unset, or material/lightness-aware heuristics via `estimate_default_td_mm`), Manifold Slicer calibrates the isotropic scattering coefficient $S$ ($\text{mm}^{-1}$) by 64-step bisection such that effective passband diffuse transmittance at $d = \text{TD}$ equals $8\%$ ($\sim 92\%$ hiding contrast, matching empirical HueForge step-wedge calibration):
+     $$T_{\text{eff}}(S, \text{TD}) = \max\!\Bigl(0.2126\,T_R(\text{TD}) + 0.7152\,T_G(\text{TD}) + 0.0722\,T_B(\text{TD}),\; 0.75\max_{c \in \{R,G,B\}} T_c(\text{TD})\Bigr) = 0.08$$
+2. **Overflow-Free Exponential Single-Slab Response**:
+   For a homogeneous filament slab of physical thickness $d \ge 0$, setting $u_c = b_c S d$ yields the overflow-free exact Kubelka–Munk reflectance and transmittance:
+   $$R_c(d) = \frac{R_{\infty,c}\bigl(1 - e^{-2 u_c}\bigr)}{1 - R_{\infty,c}^2 e^{-2 u_c}}, \qquad T_c(d) = \frac{\bigl(1 - R_{\infty,c}^2\bigr)\,e^{-u_c}}{1 - R_{\infty,c}^2 e^{-2 u_c}}$$
+   This formulation remains numerically exact from high-scattering $\text{TiO}_2$ white filaments ($R_{\infty,c} \to 0.93$) through subtractive CMY dyes down to pure Beer–Lambert carbon-black absorbers ($R_{\infty,c} \to 0.004$).
+3. **Associative Redheffer Star-Product for Multi-Filament Stacks & Lithophanes (`OpticalSlab::stack_over`)**:
+   Because multi-material shells stack distinct filaments from outer surface ($1$) to inner core ($M$), diffuse inter-reflections between asymmetric slabs $(R^{\text{front}}, R^{\text{back}}, T)$ compose associatively via the Redheffer star-product $1 \otimes 2$ (`1` closer to viewer, `2` deeper toward core/backlight):
+   $$R_{1 \otimes 2, c}^{\text{front}} = R_{1,c}^{\text{front}} + \frac{T_{1,c}^2\,R_{2,c}^{\text{front}}}{1 - R_{1,c}^{\text{back}}\,R_{2,c}^{\text{front}}}, \qquad R_{1 \otimes 2, c}^{\text{back}} = R_{2,c}^{\text{back}} + \frac{T_{2,c}^2\,R_{1,c}^{\text{back}}}{1 - R_{1,c}^{\text{back}}\,R_{2,c}^{\text{front}}}, \qquad T_{1 \otimes 2, c} = \frac{T_{1,c}\,T_{2,c}}{1 - R_{1,c}^{\text{back}}\,R_{2,c}^{\text{front}}}$$
+   Under general front ambient illumination $\mathbf{I}_{\text{front}}$ and rear transillumination $\mathbf{I}_{\text{back}}$ (`FrontLitReflectance`, `BackLitTransmittance`, or `MixedFrontAndBack`), observed linear radiance is:
+   $$I_{\text{obs},c} = R_{\text{stack},c}^{\text{front}}\,I_{\text{front},c} + T_{\text{stack},c}\,I_{\text{back},c}$$
+4. **Monochrome Thickness-Modulated Lithophane Solver (`solve_monochrome_lithophane_thickness`)**:
+   For single-filament back-lit or mixed-lit lithophanes bounded by $[d_{\min}, d_{\max}]$, Oklab perceptual lightness $L(d)$ is strictly monotonic with thickness $d$, allowing 44-step bisection to invert target image lightness $L^* \in [0, 1]$ to exact physical wall thickness $d^*$ ($< 10^{-12}\text{ mm}$ error).
+
+### 7.3 Kinematic-Invariant Non-Planar Optical Mixing (CMYKW & Arbitrary $N$-Filament Palettes)
+When `slicing.color_mixing.enabled = true` (`apply_optical_color_mixing_to_object_toolpaths`), Manifold Slicer approximates arbitrary RGB surface colours using whatever $N \ge 2$ filaments are loaded in `SlicerConfig::tools` (standard 5-tool CMYKW, translucent PETG CMYKW, or any custom 2–8+ filament palette):
+
+1. **Directional Physical Bead Thickness in Local `NozzleFrame` (`directional_slab_thickness_mm`)**:
+   Per `AGENTS.md` Rules 1 & 3, non-planar layers and 5/6-axis perimeters never assume nozzle $= +Z$ or uniform layer height. Given outward surface normal $\hat{\mathbf{n}}_{\text{surf}}$, local `nozzle_axis` $\hat{\mathbf{z}}_{\text{nozzle}}$ from `NozzleFrame`, local bead width $w$, and local layer height $h$, the physical optical path length of one extruded bead along the observer viewing normal $\hat{\mathbf{n}}_{\text{surf}}$ is:
+   $$d_{\text{slab}}\bigl(\hat{\mathbf{n}}_{\text{surf}}, \hat{\mathbf{z}}_{\text{nozzle}}, w, h\bigr) = \sqrt{\Bigl(h\,\bigl\lvert\hat{\mathbf{n}}_{\text{surf}} \cdot \hat{\mathbf{z}}_{\text{nozzle}}\bigr\rvert\Bigr)^2 + \left(w\sqrt{\max\!\bigl(0,\, 1 - (\hat{\mathbf{n}}_{\text{surf}} \cdot \hat{\mathbf{z}}_{\text{nozzle}})^2\bigr)}\right)^2}$$
+   - On conformal roofs/domes where $\hat{\mathbf{n}}_{\text{surf}} \parallel \pm\hat{\mathbf{z}}_{\text{nozzle}}$, $d_{\text{slab}} = h$ (vertical/conformal layer-over-layer stacking).
+   - On steep walls where $\hat{\mathbf{n}}_{\text{surf}} \perp \hat{\mathbf{z}}_{\text{nozzle}}$, $d_{\text{slab}} = w$ (concentric `OuterWall` $\to$ `InnerWall` $\to$ `SolidInfill` lateral stacking).
+   - On oblique curved surfaces, $d_{\text{slab}}$ smoothly interpolates the elliptical cross-section thickness along $-\hat{\mathbf{n}}_{\text{surf}}$.
+2. **$M$-Slab Optical Palette LUT & Core Backing Isolation (`OpticalPaletteLut`)**:
+   - Precomputes candidate $M$-slab outer-to-inner sequences ($M = \text{optical\_shell\_layers} \in [1, 6]$, pruning dominated interior transitions when $N^M > 4096$) using the Redheffer star-product over either an auto-selected high-reflectance neutral/White backing filament (`FrontLitReflectance`) or an open backlight (`BackLitTransmittance`).
+   - Any extrusion deeper than the optical shell ($d_{\text{surf}} > M \cdot d_{\text{slab}}$, including all `SparseInfill`) is assigned uniformly to the single backing filament (`encode_direct_tool_slot(backing_tool)`), maximizing internal reflection brightness while eliminating wasteful interior toolchanges.
+3. **Adjacent-Layer 3D Footpoint Dithering (`use_adjacent_layers`)**:
+   - Projects each sample's boundary footpoint $\mathbf{x}_{\text{surf}}$ onto a deterministic 3D spatial hash cell combined with `layer_index`, dithering between the primary and secondary optical stacks in **Oklab** space so adjacent layers interleave complementary hues without coherent vertical moiré bands.
+4. **Along-Path Short-Extrusion Subdivision & Oklab Error Diffusion (`use_short_extrusions`)**:
+   - Subdivides shell extrusions (`OuterWall`, `InnerWall`, and shallow `SolidInfill`) into sub-segments of arc length $\ge \text{min\_short\_extrusion\_mm}$ (default `3.0 mm`).
+   - Propagates clamped 1D **Oklab** quantization error $\mathbf{e} = (\Delta L, \Delta a, \Delta b)$ (`dither_strength`) forward along each continuous contour while adding a hysteresis penalty `tool_switch_penalty` against switching away from the active tool for negligible perceptual gain, followed by a run-merging pass that absorbs any residual micro-runs shorter than `min_short_extrusion_mm`.
+
+---
+
+## 8. High-Quality Pressed-Stadium Extrusion Geometry & TD-Matched PBR Rendering
+
+To inspect multi-colour optical mixing, polymer translucency, and non-planar bead placement accurately before printing, `frontend/src/field_vis.rs` provides a physically based extrusion renderer (`ToolpathQualityMode::HighQualityPbr`) alongside the lightweight `Fast` 4-sided diamond preview.
+
+### 8.1 12-Vertex Pressed-Stadium Cross-Section & Mitered Chain Welding
+1. **Pressed-Stadium (Capsule) Profile in Local `NozzleFrame`**:
+   - At every toolpath sample with local `NozzleFrame` $(\hat{\mathbf{x}}_{\text{nozzle}}, \hat{\mathbf{y}}_{\text{nozzle}}, \hat{\mathbf{z}}_{\text{nozzle}})$, bead width $w$, and layer height $h$, a real nozzle irons the extrudate between the substrate (`-0.5 h` along $\hat{\mathbf{z}}_{\text{nozzle}}$) and the brass nozzle flat (`+0.5 h` along $\hat{\mathbf{z}}_{\text{nozzle}}$), while surface tension rounds the unconfined lateral sidewalls into semicircular menisci:
+     $$r_{\text{cap}} = \frac{1}{2}\min(w, h), \qquad a_{\text{flat}} = \max\!\left(0,\; \frac{w - h}{2}\right)$$
+   - Twelve cross-section vertices sample the flat top/bottom lands ($\lvert y \rvert \le a_{\text{flat}},\, z = \pm \frac{1}{2}h$) and lateral semicircles ($y = \pm(a_{\text{flat}} + r_{\text{cap}}\cos\phi),\, z = r_{\text{cap}}\sin\phi$) with exact analytic outward normals and subtle underside contact micro-ambient-occlusion (`0.84` at the substrate crease) so stacked non-planar layers remain visually distinct even in dark or translucent filaments.
+   - Free-air `Bridge` segments automatically transition to an area-preserving circular cross-section of radius $r_{\text{bridge}} = \sqrt{w h / \pi}$.
+2. **Continuous Mitered Chain Welding & Convex Bullnose Endcaps (`append_hq_welded_chain_stadium_mesh`)**:
+   - Consecutive segments sharing the same `(ShellDepthTier, MaterialSlot)` weld into a single continuous tubular manifold using bisecting `NozzleFrame` miters (`(f_prev.nozzle_axis + f_next.nozzle_axis).normalize()`, `(t_prev + t_next).normalize()`), emitting **zero internal endcap faces** inside continuous toolpath runs so translucent alpha compositing never exhibits internal joint-plane seams.
+   - True chain starts and stops are sealed with 3-ring convex 3D bullnose hemispheres extruded along $\mp\hat{\mathbf{x}}_{\text{nozzle}}$.
+
+### 8.2 Polymer PBR Surface Optics, TD-Matched Opacity & Flicker-Free Depth Ordering
+1. **Material-Aware Polymer PBR Shading**:
+   - Configures Bevy `StandardMaterial` parameters from each tool's polymer family (`filament_type`): glossy `PETG` (`perceptual_roughness = 0.24`, `clearcoat = 0.55`), satin `PLA` (`roughness = 0.34`, `clearcoat = 0.35`), low-gloss `ABS`/`ASA` (`roughness = 0.48`, `clearcoat = 0.12`), matte `CF`/`GF` composites (`roughness = 0.68`, `clearcoat = 0.0`), and `TPU` elastomers, with polymer index of refraction $\text{ior} = 1.49$ and sub-surface `diffuse_transmission`.
+   - Illuminated by a millimeter-calibrated three-point studio rig (`ViewportKeyLight` with 4-cascade soft shadow maps across `2..1200 mm`, cool `ViewportFillLight`, and warm `ViewportRimBackLight` that boosts rear transillumination when `Lithophane Backlight` is toggled on).
+2. **Exact Additive Beer–Lambert Hiding Opacity Matched to Filament `TD` (`td_opacity_for_thickness_mm`)**:
+   - When `TD-Based Filament Opacity` is enabled, a bead sub-mesh of mean directional thickness $d$ and effective Transmission Distance $\text{TD}_{\text{eff}} = \text{TD} / s_{\text{opacity}}$ (`Opacity Scale` $s_{\text{opacity}} \in [0.10, 1.50]$, default $1.0\times$) is assigned deterministic alpha:
+     $$\alpha(d, \text{TD}_{\text{eff}}) = 1 - (0.08)^{d / \text{TD}_{\text{eff}}}$$
+   - Because standard GPU `AlphaMode::Blend` multiplies background transmission by $(1 - \alpha_k)$ per slab, stacking $K$ beads of thicknesses $d_1, \dots, d_K$ yields exact cumulative transmission:
+     $$\prod_{k=1}^{K} \bigl(1 - \alpha(d_k, \text{TD}_{\text{eff}})\bigr) = (0.08)^{\bigl(\sum_{k=1}^{K} d_k\bigr) / \text{TD}_{\text{eff}}}$$
+     matching the `92%` hiding contrast (`8%` residual transmission) definition at $\sum_k d_k = \text{TD}_{\text{eff}}$ monotonically and hue-independently across all colours.
+3. **Flicker-Free `(ShellDepthTier, MaterialSlot)` Bucketing & Simulated Optical Composite Mode**:
+   - Avoids stochastic screen-space refraction (`specular_transmission = 0.0`) so stationary camera views remain 100% noise- and flicker-free without temporal anti-aliasing, and assigns strictly positive monotonic hardware `depth_bias` tiers (`12.xxx` Core $\to$ `13.xxx` Inner Shell $\to$ `14.xxx` Outer Shell $\to$ `16.0` translucent CAD ghost envelope) so coplanar overlays never Z-fight and Bevy's `Transparent3d` sort order never ties across overlapping filaments.
+   - Selecting `ToolpathColorMode::ByOpticalComposite` (`compute_planned_optical_composite_colors`) buckets all planned extrusions into a $1.2\text{ mm}$ 3D spatial footpoint grid, sorts local shell beads from outer surface to core along $-\hat{\mathbf{n}}_{\text{surf}}$, and evaluates the exact multi-layer Kubelka–Munk Redheffer stack colour on every visible bead under front-lit or back-lit lithophane illumination.

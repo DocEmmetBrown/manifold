@@ -200,12 +200,15 @@ pub enum ToolpathColorMode {
     BySurfaceNormalUsage,
     /// Colors each segment by its 3MF filament / colour slot (`filament_slot`) and mapped machine tool.
     ByToolOrFilament,
+    /// Colors each segment by its simulated Kubelka–Munk multi-layer optical print appearance (front-lit or back-lit lithophane).
+    ByOpticalComposite,
 }
 
 impl ToolpathColorMode {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::ByFeatureType,
         Self::ByToolOrFilament,
+        Self::ByOpticalComposite,
         Self::ByLineWidth,
         Self::ByLayerHeight,
         Self::BySpeed,
@@ -222,6 +225,9 @@ impl ToolpathColorMode {
         match self {
             Self::ByFeatureType => "Feature Type (Outer / Inner / Solid / Sparse / Scarf / Wipe)",
             Self::ByToolOrFilament => "Tool / Filament Colour (3MF Multi-Colour Slot)",
+            Self::ByOpticalComposite => {
+                "Simulated Print Appearance (Kubelka–Munk Optical Stack)"
+            }
             Self::ByLineWidth => "Line Width W (mm)",
             Self::ByLayerHeight => "Layer Height H (mm)",
             Self::BySpeed => "Planned Speed v (mm/s)",
@@ -239,6 +245,7 @@ impl ToolpathColorMode {
         match self {
             Self::ByFeatureType => "Feature / Line Type",
             Self::ByToolOrFilament => "Tool / Filament Colour",
+            Self::ByOpticalComposite => "Simulated Optical Print",
             Self::ByLineWidth => "Line Width W (mm)",
             Self::ByLayerHeight => "Layer Height H (mm)",
             Self::BySpeed => "Planned Speed v (mm/s)",
@@ -251,6 +258,45 @@ impl ToolpathColorMode {
             Self::BySurfaceNormalUsage => "Surface vs. Isosurface Normal",
         }
     }
+}
+
+/// Geometry & PBR rendering quality mode for 3D extruded bead previews.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ToolpathQualityMode {
+    /// Lightweight 4-sided diamond prism cross-section merged into a single mesh for maximum interactive FPS.
+    #[default]
+    Fast,
+    /// High-quality 12-vertex pressed-stadium (capsule) beads with continuous mitered joints,
+    /// convex bullnose endcaps, per-filament Bevy PBR materials (`clearcoat`, polymer roughness, IOR),
+    /// TD-driven multi-step optical transmission, and soft cascaded directional shadows.
+    HighQualityPbr,
+}
+
+impl ToolpathQualityMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast (4-Sided Tubes)",
+            Self::HighQualityPbr => "High-Quality PBR (Capsule + Translucency)",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast",
+            Self::HighQualityPbr => "High-Quality PBR",
+        }
+    }
+}
+
+/// Persistent Bevy entity + asset handles for one `(ShellDepthTier, MaterialSlot)` sub-mesh in `HighQualityPbr` mode.
+#[derive(Clone, Debug)]
+pub struct HqToolpathSubMesh {
+    pub entity: Entity,
+    pub mesh_handle: Handle<Mesh>,
+    pub mat_handle: Handle<StandardMaterial>,
+    pub tier: u8,
+    pub mat_slot: u16,
+    pub mean_thickness_mm: f32,
 }
 
 /// Marker component for the 3D isosurface mesh entity extracted via `openvdb::tools::volumeToMesh`.
@@ -385,12 +431,24 @@ pub struct FieldVisualizationState {
     pub show_z_hops: bool,
     pub show_toolpath_centerlines: bool,
     pub toolpath_color_mode: ToolpathColorMode,
+    pub toolpath_quality_mode: ToolpathQualityMode,
+    /// Computes each filament's physical single-bead opacity directly from its Kubelka–Munk
+    /// Transmission Distance (`TD`) and local bead thickness (`1 - T_eff(d, TD)`).
+    pub enable_pbr_translucency: bool,
+    /// Enables millimeter-calibrated cascaded directional shadows in `HighQualityPbr` mode.
+    pub enable_hq_shadows: bool,
+    /// Opacity multiplier (`0.10..=1.50`, `1.00` = exact physical TD opacity when `enable_pbr_translucency` is active).
+    pub toolpath_opacity: f32,
+    /// Boosts rear backlight illumination in 3D to preview backlit lithophane glow through translucent extrusions.
+    pub lithophane_backlight_preview: bool,
     pub cached_unmixed_toolpaths: Option<ObjectToolpathsResult>,
     pub cached_toolpaths: Option<ObjectToolpathsResult>,
     pub cached_planned_gcode: Option<crate::gcode::PlannedGcodeResult>,
     pub toolpaths_entity: Option<Entity>,
     pub toolpaths_mesh_handle: Option<Handle<Mesh>>,
     pub toolpaths_mat_handle: Option<Handle<StandardMaterial>>,
+    pub hq_toolpath_parts: Vec<HqToolpathSubMesh>,
+    pub last_hq_pbr_sync_sig: Option<u64>,
     pub dirty_toolpaths: bool,
     pub dirty_color_mixing: bool,
     pub dirty_planned_gcode: bool,
@@ -489,12 +547,19 @@ impl Default for FieldVisualizationState {
             show_z_hops: false,
             show_toolpath_centerlines: false,
             toolpath_color_mode: ToolpathColorMode::ByFeatureType,
+            toolpath_quality_mode: ToolpathQualityMode::Fast,
+            enable_pbr_translucency: true,
+            enable_hq_shadows: false,
+            toolpath_opacity: 1.0,
+            lithophane_backlight_preview: false,
             cached_unmixed_toolpaths: None,
             cached_toolpaths: None,
             cached_planned_gcode: None,
             toolpaths_entity: None,
             toolpaths_mesh_handle: None,
             toolpaths_mat_handle: None,
+            hq_toolpath_parts: Vec::new(),
+            last_hq_pbr_sync_sig: None,
             dirty_toolpaths: true,
             dirty_color_mixing: false,
             dirty_planned_gcode: true,
@@ -892,97 +957,22 @@ pub fn sync_field_visualization_system(
             }
         }
         if !vis_state.show_toolpaths || vis_state.cached_planned_gcode.is_none() {
-            if let Some(ent) = vis_state.toolpaths_entity {
-                if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
-                    *vis = Visibility::Hidden;
-                }
-            }
+            hide_all_toolpath_entities(&vis_state, &mut toolpaths_query);
             return;
         }
 
         // Render standalone planned G-code toolpaths (e.g., Calibration Patterns) at Transform::IDENTITY
         if vis_state.dirty_toolpaths_mesh {
             vis_state.dirty_toolpaths_mesh = false;
-            let stride = vis_state.selected_layer_stride.max(1);
-            let min_idx = vis_state.selected_layer_min_idx;
-            let max_idx = vis_state.selected_layer_max_idx;
-            let highlighted = vis_state.highlighted_selected_layer;
-            let color_mode = vis_state.toolpath_color_mode;
-
-            let mut positions: Vec<[f32; 3]> = Vec::new();
-            let mut normals: Vec<[f32; 3]> = Vec::new();
-            let mut colors: Vec<[f32; 4]> = Vec::new();
-            let mut indices: Vec<u32> = Vec::new();
-
-            if let Some(ref planned) = vis_state.cached_planned_gcode {
-                build_planned_toolpaths_bead_mesh_parallel(
-                    planned,
-                    &vis_state,
-                    &config,
-                    min_idx,
-                    max_idx,
-                    stride,
-                    highlighted,
-                    color_mode,
-                    &mut positions,
-                    &mut normals,
-                    &mut colors,
-                    &mut indices,
-                );
-            }
-
-            if !positions.is_empty() && !indices.is_empty() {
-                let bevy_mesh = Mesh::new(
-                    PrimitiveTopology::TriangleList,
-                    RenderAssetUsages::default(),
-                )
-                .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-                .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-                .with_inserted_indices(Indices::U32(indices));
-
-                if let (Some(ent), Some(ref mesh_h), Some(ref mat_h)) = (
-                    vis_state.toolpaths_entity,
-                    &vis_state.toolpaths_mesh_handle,
-                    &vis_state.toolpaths_mat_handle,
-                ) {
-                    meshes.insert(mesh_h, bevy_mesh);
-                    if let Some(mat) = materials.get_mut(mat_h) {
-                        mat.base_color = Color::WHITE;
-                    }
-                    if let Ok((mut tf, mut vis)) = toolpaths_query.get_mut(ent) {
-                        *tf = Transform::IDENTITY;
-                        *vis = Visibility::Inherited;
-                    }
-                } else {
-                    let mesh_h = meshes.add(bevy_mesh);
-                    let mat_h = materials.add(StandardMaterial {
-                        base_color: Color::WHITE,
-                        metallic: 0.0,
-                        perceptual_roughness: 0.56,
-                        reflectance: 0.16,
-                        alpha_mode: AlphaMode::Opaque,
-                        depth_bias: 14.0,
-                        double_sided: true,
-                        cull_mode: None,
-                        ..default()
-                    });
-                    let ent = commands
-                        .spawn((
-                            PbrBundle {
-                                mesh: mesh_h.clone(),
-                                material: mat_h.clone(),
-                                transform: Transform::IDENTITY,
-                                ..default()
-                            },
-                            ToolpathsMeshEntity,
-                        ))
-                        .id();
-                    vis_state.toolpaths_entity = Some(ent);
-                    vis_state.toolpaths_mesh_handle = Some(mesh_h);
-                    vis_state.toolpaths_mat_handle = Some(mat_h);
-                }
-            }
+            rebuild_and_sync_toolpath_meshes(
+                &mut commands,
+                &mut vis_state,
+                &config,
+                &mut meshes,
+                &mut materials,
+                &mut toolpaths_query,
+                Transform::IDENTITY,
+            );
         }
         return;
     };
@@ -1465,113 +1455,18 @@ pub fn sync_field_visualization_system(
     }
 
     if !vis_state.show_toolpaths {
-        if let Some(ent) = vis_state.toolpaths_entity {
-            if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
-                *vis = Visibility::Hidden;
-            }
-        }
+        hide_all_toolpath_entities(&vis_state, &mut toolpaths_query);
     } else if vis_state.dirty_toolpaths_mesh {
         vis_state.dirty_toolpaths_mesh = false;
-
-        let stride = vis_state.selected_layer_stride.max(1);
-        let min_idx = vis_state.selected_layer_min_idx;
-        let max_idx = vis_state.selected_layer_max_idx;
-        let highlighted = vis_state.highlighted_selected_layer;
-        let color_mode = vis_state.toolpath_color_mode;
-
-        let mut positions: Vec<[f32; 3]> = Vec::new();
-        let mut normals: Vec<[f32; 3]> = Vec::new();
-        let mut colors: Vec<[f32; 4]> = Vec::new();
-        let mut indices: Vec<u32> = Vec::new();
-
-        if let Some(ref planned) = vis_state.cached_planned_gcode {
-            build_planned_toolpaths_bead_mesh_parallel(
-                planned,
-                &vis_state,
-                &config,
-                min_idx,
-                max_idx,
-                stride,
-                highlighted,
-                color_mode,
-                &mut positions,
-                &mut normals,
-                &mut colors,
-                &mut indices,
-            );
-        } else if let Some(ref tp_res) = vis_state.cached_toolpaths {
-            build_raw_toolpaths_bead_mesh_parallel(
-                tp_res,
-                &vis_state,
-                &config,
-                min_idx,
-                max_idx,
-                stride,
-                highlighted,
-                color_mode,
-                &mut positions,
-                &mut normals,
-                &mut colors,
-                &mut indices,
-            );
-        }
-
-        if !positions.is_empty() && !indices.is_empty() {
-            let bevy_mesh = Mesh::new(
-                PrimitiveTopology::TriangleList,
-                RenderAssetUsages::default(),
-            )
-            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-            .with_inserted_indices(Indices::U32(indices));
-
-            if let (Some(ent), Some(ref mesh_h), Some(ref mat_h)) = (
-                vis_state.toolpaths_entity,
-                &vis_state.toolpaths_mesh_handle,
-                &vis_state.toolpaths_mat_handle,
-            ) {
-                meshes.insert(mesh_h, bevy_mesh);
-                if let Some(mat) = materials.get_mut(mat_h) {
-                    mat.base_color = Color::WHITE;
-                }
-                if let Ok((mut tf, mut vis)) = toolpaths_query.get_mut(ent) {
-                    *tf = obj_world_tf;
-                    *vis = Visibility::Inherited;
-                }
-            } else {
-                let mesh_h = meshes.add(bevy_mesh);
-                let mat_h = materials.add(StandardMaterial {
-                    base_color: Color::WHITE,
-                    metallic: 0.0,
-                    perceptual_roughness: 0.56,
-                    reflectance: 0.16,
-                    alpha_mode: AlphaMode::Opaque,
-                    depth_bias: 14.0,
-                    double_sided: true,
-                    cull_mode: None,
-                    ..default()
-                });
-                let ent = commands
-                    .spawn((
-                        PbrBundle {
-                            mesh: mesh_h.clone(),
-                            material: mat_h.clone(),
-                            transform: obj_world_tf,
-                            ..default()
-                        },
-                        ToolpathsMeshEntity,
-                    ))
-                    .id();
-                vis_state.toolpaths_entity = Some(ent);
-                vis_state.toolpaths_mesh_handle = Some(mesh_h);
-                vis_state.toolpaths_mat_handle = Some(mat_h);
-            }
-        } else if let Some(ent) = vis_state.toolpaths_entity {
-            if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
-                *vis = Visibility::Hidden;
-            }
-        }
+        rebuild_and_sync_toolpath_meshes(
+            &mut commands,
+            &mut vis_state,
+            &config,
+            &mut meshes,
+            &mut materials,
+            &mut toolpaths_query,
+            obj_world_tf,
+        );
     }
 
     // Optional crisp gizmo centerlines and travel/Z-hop trajectories on top of toolpath beads
@@ -1805,13 +1700,25 @@ pub fn sync_field_visualization_system(
         }
     }
     if vis_state.show_toolpaths {
+        let mut tf_moved = false;
         if let Some(ent) = vis_state.toolpaths_entity {
             if let Ok((mut tf, _)) = toolpaths_query.get_mut(ent) {
                 if *tf != obj_world_tf {
                     *tf = obj_world_tf;
-                    vis_state.dirty_planned_gcode = true;
+                    tf_moved = true;
                 }
             }
+        }
+        for part in &vis_state.hq_toolpath_parts {
+            if let Ok((mut tf, _)) = toolpaths_query.get_mut(part.entity) {
+                if *tf != obj_world_tf {
+                    *tf = obj_world_tf;
+                    tf_moved = true;
+                }
+            }
+        }
+        if tf_moved {
+            vis_state.dirty_planned_gcode = true;
         }
     }
     if vis_state.show_slice_plane {
@@ -2223,6 +2130,525 @@ impl FieldVisualizationState {
     }
 }
 
+/// Synchronizes 3D viewport key-light shadows, rear lithophane backlight intensity, and live
+/// TD-computed extrusion opacity/PBR materials — gated by a deterministic content hash so GPU
+/// material bind groups are never rebuilt redundantly during idle or camera-orbit frames.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn sync_viewport_pbr_quality_system(
+    config: Res<SlicerConfig>,
+    mut vis_state: ResMut<FieldVisualizationState>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut camera_query: Query<&mut bevy::core_pipeline::core_3d::Camera3d>,
+    mut key_lights: Query<
+        &mut DirectionalLight,
+        (
+            With<crate::ViewportKeyLight>,
+            Without<crate::ViewportRimBackLight>,
+        ),
+    >,
+    mut rim_lights: Query<
+        &mut DirectionalLight,
+        (
+            With<crate::ViewportRimBackLight>,
+            Without<crate::ViewportKeyLight>,
+        ),
+    >,
+) {
+    use std::hash::{Hash, Hasher};
+
+    let hq_pbr = vis_state.toolpath_quality_mode == ToolpathQualityMode::HighQualityPbr;
+    let shadows_active = hq_pbr && vis_state.enable_hq_shadows;
+    let backlight_active = vis_state.lithophane_backlight_preview
+        || (config.slicing.color_mixing.enabled
+            && config.slicing.color_mixing.lighting_mode
+                != crate::color_optics::OpticalLightingMode::FrontLitReflectance);
+    let opacity_bits = vis_state.toolpath_opacity.clamp(0.10, 1.50).to_bits();
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    vis_state.toolpath_quality_mode.hash(&mut hasher);
+    vis_state.enable_pbr_translucency.hash(&mut hasher);
+    shadows_active.hash(&mut hasher);
+    backlight_active.hash(&mut hasher);
+    (vis_state.toolpath_color_mode as u8).hash(&mut hasher);
+    opacity_bits.hash(&mut hasher);
+    vis_state.hq_toolpath_parts.len().hash(&mut hasher);
+    for tool in &config.tools {
+        tool.filament_type.hash(&mut hasher);
+        tool.name.hash(&mut hasher);
+        tool.effective_transmission_distance_mm().to_bits().hash(&mut hasher);
+        for c in tool.filament_color_srgba {
+            c.to_bits().hash(&mut hasher);
+        }
+    }
+    let sig = hasher.finish();
+
+    if vis_state.last_hq_pbr_sync_sig == Some(sig) {
+        return;
+    }
+    vis_state.last_hq_pbr_sync_sig = Some(sig);
+
+    // Keep screen-space specular transmission disabled (0 steps): its spiral/checkerboard noise taps
+    // shimmer on sub-millimeter beads without TAA, whereas TD-derived alpha opacity + diffuse_transmission
+    // is completely noise-free and matches physical Kubelka–Munk hiding power directly.
+    for mut cam3d in &mut camera_query {
+        if cam3d.screen_space_specular_transmission_steps != 0 {
+            cam3d.screen_space_specular_transmission_steps = 0;
+        }
+    }
+
+    for mut key in &mut key_lights {
+        key.shadows_enabled = shadows_active;
+        key.illuminance = if backlight_active && hq_pbr {
+            6_500.0
+        } else {
+            11_500.0
+        };
+    }
+
+    for mut rim in &mut rim_lights {
+        rim.illuminance = if backlight_active {
+            24_000.0
+        } else if hq_pbr {
+            4_500.0
+        } else {
+            2_800.0
+        };
+    }
+
+    if let Some(ref mat_h) = vis_state.toolpaths_mat_handle {
+        if let Some(mat) = materials.get_mut(mat_h) {
+            *mat = build_fast_toolpath_material(vis_state.toolpath_opacity);
+        }
+    }
+    for part in &vis_state.hq_toolpath_parts {
+        if let Some(mat) = materials.get_mut(&part.mat_handle) {
+            *mat = build_hq_bucket_pbr_material(
+                part.tier,
+                part.mat_slot,
+                part.mean_thickness_mm,
+                &vis_state,
+                &config,
+            );
+        }
+    }
+}
+
+fn hide_all_toolpath_entities(
+    vis_state: &FieldVisualizationState,
+    toolpaths_query: &mut Query<
+        (&mut Transform, &mut Visibility),
+        (
+            With<ToolpathsMeshEntity>,
+            Without<CadObjectEntity>,
+            Without<FieldIsosurfaceEntity>,
+            Without<FieldSliceEntity>,
+            Without<SelectedLayersMeshEntity>,
+        ),
+    >,
+) {
+    if let Some(ent) = vis_state.toolpaths_entity {
+        if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
+            *vis = Visibility::Hidden;
+        }
+    }
+    for part in &vis_state.hq_toolpath_parts {
+        if let Ok((_, mut vis)) = toolpaths_query.get_mut(part.entity) {
+            *vis = Visibility::Hidden;
+        }
+    }
+}
+
+fn build_fast_toolpath_material(opacity: f32) -> StandardMaterial {
+    let alpha = opacity.clamp(0.10, 1.0);
+    if alpha < 0.995 {
+        StandardMaterial {
+            base_color: Color::srgba(1.0, 1.0, 1.0, alpha),
+            metallic: 0.0,
+            perceptual_roughness: 0.52,
+            reflectance: 0.22,
+            alpha_mode: AlphaMode::Blend,
+            depth_bias: 14.0,
+            double_sided: false,
+            cull_mode: Some(wgpu::Face::Back),
+            ..default()
+        }
+    } else {
+        StandardMaterial {
+            base_color: Color::WHITE,
+            metallic: 0.0,
+            perceptual_roughness: 0.56,
+            reflectance: 0.16,
+            alpha_mode: AlphaMode::Opaque,
+            depth_bias: 14.0,
+            double_sided: true,
+            cull_mode: None,
+            ..default()
+        }
+    }
+}
+
+/// Synthesizes a flicker-free physically based `StandardMaterial` for a High-Quality extrusion
+/// sub-mesh bucket `(tier, mat_slot)`:
+/// - Computes physical single-bead opacity $\alpha(d, \text{TD}) = 1 - T_{\text{eff}}(d, \text{TD})$
+///   directly from each filament's Kubelka–Munk `FilamentOpticalModel` and `mean_thickness_mm`.
+/// - Assigns unique positive `depth_bias` (`12.xxx` Core -> `13.xxx` Inner Shell -> `14.xxx` Outer Shell)
+///   eliminating both coplanar Z-fighting against the CAD/isosurface meshes and `Transparent3d` sort ties.
+fn build_hq_bucket_pbr_material(
+    tier: u8,
+    mat_slot: u16,
+    mean_thickness_mm: f32,
+    vis_state: &FieldVisualizationState,
+    config: &SlicerConfig,
+) -> StandardMaterial {
+    let opacity_mult = vis_state.toolpath_opacity.clamp(0.10, 1.50);
+
+    let (ior, roughness, reflectance, metallic, clearcoat, cc_roughness, td_mm, color_srgb) =
+        if (mat_slot as usize) < config.tools.len() {
+            let tool = &config.tools[mat_slot as usize];
+            let upper_type = tool.filament_type.to_ascii_uppercase();
+            let upper_name = tool.name.to_ascii_uppercase();
+            let is_silk = upper_type.contains("SILK") || upper_name.contains("SILK");
+            let is_filled = upper_type.contains("CF")
+                || upper_type.contains("GF")
+                || upper_type.contains("MATTE")
+                || upper_name.contains("MATTE");
+            let is_metal = upper_type.contains("METAL")
+                || upper_type.contains("BRONZE")
+                || upper_type.contains("COPPER")
+                || upper_type.contains("STEEL");
+
+            let (ior, rough, refl, met, cc, cc_r) = if is_metal {
+                (1.50, 0.36, 0.65, 0.72, 0.12, 0.24)
+            } else if is_silk {
+                (1.48, 0.22, 0.64, 0.26, 0.55, 0.16)
+            } else if is_filled {
+                (1.52, 0.76, 0.22, 0.04, 0.0, 0.50)
+            } else if upper_type.contains("PETG")
+                || upper_type.contains("PCTG")
+                || upper_type.contains("PC")
+                || upper_type.contains("CLEAR")
+            {
+                (1.57, 0.24, 0.54, 0.0, 0.44, 0.14)
+            } else if upper_type.contains("ABS") || upper_type.contains("ASA") {
+                (1.54, 0.50, 0.36, 0.0, 0.08, 0.34)
+            } else if upper_type.contains("TPU")
+                || upper_type.contains("TPE")
+                || upper_type.contains("FLEX")
+            {
+                (1.50, 0.48, 0.34, 0.0, 0.12, 0.30)
+            } else {
+                (1.46, 0.33, 0.46, 0.02, 0.32, 0.20)
+            };
+
+            let td = tool.effective_transmission_distance_mm().clamp(0.1, 30.0);
+            let rgb = [
+                tool.filament_color_srgba[0].clamp(0.0, 1.0),
+                tool.filament_color_srgba[1].clamp(0.0, 1.0),
+                tool.filament_color_srgba[2].clamp(0.0, 1.0),
+            ];
+            (ior, rough, refl, met, cc, cc_r, td, rgb)
+        } else if mat_slot == 256 {
+            (1.46, 0.54, 0.30, 0.0, 0.06, 0.35, 1.8, [0.22, 0.88, 0.62])
+        } else if mat_slot == 257 {
+            (1.46, 0.50, 0.28, 0.0, 0.05, 0.35, 1.2, [0.68, 0.76, 0.86])
+        } else {
+            let td = config
+                .active_tool()
+                .map(|t| t.effective_transmission_distance_mm())
+                .unwrap_or(2.5)
+                .clamp(0.1, 30.0);
+            (1.47, 0.34, 0.44, 0.02, 0.28, 0.22, td, [0.92, 0.92, 0.92])
+        };
+
+    let td_opacity_on = vis_state.enable_pbr_translucency
+        && vis_state.toolpath_color_mode == ToolpathColorMode::ByToolOrFilament;
+
+    // Compute physical single-bead opacity directly from the filament's Transmission Distance (TD)!
+    let base_td_opacity = if td_opacity_on {
+        crate::color_optics::td_opacity_for_thickness_mm(td_mm, mean_thickness_mm)
+    } else {
+        1.0
+    };
+
+    // Core/backing tier (`tier == 0`) forms a solid Z-buffered opaque foundation unless the user
+    // explicitly drags `opacity_mult < 1.0` to X-ray inside the core.
+    let final_alpha = if tier == 0 && opacity_mult >= 0.995 {
+        1.0
+    } else if td_opacity_on {
+        (base_td_opacity * opacity_mult).clamp(0.08, 1.0)
+    } else {
+        opacity_mult.clamp(0.08, 1.0)
+    };
+
+    let trans_01 = ((td_mm - 0.45) / (td_mm + 3.0)).clamp(0.0, 0.90);
+    let diffuse_trans = if vis_state.enable_pbr_translucency {
+        (0.08 + 0.48 * trans_01).clamp(0.0, 0.62)
+    } else {
+        0.0
+    };
+
+    // Positive hardware Z-bias (> 10.0) prevents coplanar Z-fighting against the CAD mesh (0.0)
+    // and selected isosurfaces (10.0), while unique per-slot fractional offsets guarantee
+    // deterministic tie-free back-to-front ordering in `Transparent3d`: Core (12.xxx) < Inner (13.xxx) < Outer (14.xxx).
+    let slot_tie_break = (mat_slot.min(300) as f32) * 0.002;
+    let depth_bias = match tier {
+        0 => 12.0 + slot_tie_break,
+        1 => 13.0 + slot_tie_break,
+        _ => 14.0 + slot_tie_break,
+    };
+
+    let alpha_mode = if final_alpha >= 0.985 {
+        AlphaMode::Opaque
+    } else {
+        AlphaMode::Blend
+    };
+
+    StandardMaterial {
+        base_color: Color::srgba(1.0, 1.0, 1.0, final_alpha),
+        metallic,
+        perceptual_roughness: roughness,
+        reflectance,
+        ior,
+        clearcoat,
+        clearcoat_perceptual_roughness: cc_roughness,
+        diffuse_transmission: diffuse_trans,
+        specular_transmission: 0.0,
+        thickness: mean_thickness_mm.clamp(0.10, 2.50),
+        attenuation_distance: if vis_state.enable_pbr_translucency {
+            (0.55 * td_mm).clamp(0.08, 30.0)
+        } else {
+            f32::INFINITY
+        },
+        attenuation_color: Color::srgb(
+            color_srgb[0].max(0.03),
+            color_srgb[1].max(0.03),
+            color_srgb[2].max(0.03),
+        ),
+        alpha_mode,
+        depth_bias,
+        double_sided: false,
+        cull_mode: Some(wgpu::Face::Back),
+        ..default()
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn rebuild_and_sync_toolpath_meshes(
+    commands: &mut Commands,
+    vis_state: &mut FieldVisualizationState,
+    config: &SlicerConfig,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    toolpaths_query: &mut Query<
+        (&mut Transform, &mut Visibility),
+        (
+            With<ToolpathsMeshEntity>,
+            Without<CadObjectEntity>,
+            Without<FieldIsosurfaceEntity>,
+            Without<FieldSliceEntity>,
+            Without<SelectedLayersMeshEntity>,
+        ),
+    >,
+    target_tf: Transform,
+) {
+    let stride = vis_state.selected_layer_stride.max(1);
+    let min_idx = vis_state.selected_layer_min_idx;
+    let max_idx = vis_state.selected_layer_max_idx;
+    let highlighted = vis_state.highlighted_selected_layer;
+    let color_mode = vis_state.toolpath_color_mode;
+
+    if vis_state.toolpath_quality_mode == ToolpathQualityMode::Fast {
+        for part in &vis_state.hq_toolpath_parts {
+            if let Ok((_, mut vis)) = toolpaths_query.get_mut(part.entity) {
+                *vis = Visibility::Hidden;
+            }
+        }
+
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let mut normals: Vec<[f32; 3]> = Vec::new();
+        let mut colors: Vec<[f32; 4]> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+
+        if let Some(ref planned) = vis_state.cached_planned_gcode {
+            build_planned_toolpaths_bead_mesh_parallel(
+                planned,
+                vis_state,
+                config,
+                min_idx,
+                max_idx,
+                stride,
+                highlighted,
+                color_mode,
+                &mut positions,
+                &mut normals,
+                &mut colors,
+                &mut indices,
+            );
+        } else if let Some(ref tp_res) = vis_state.cached_toolpaths {
+            build_raw_toolpaths_bead_mesh_parallel(
+                tp_res,
+                vis_state,
+                config,
+                min_idx,
+                max_idx,
+                stride,
+                highlighted,
+                color_mode,
+                &mut positions,
+                &mut normals,
+                &mut colors,
+                &mut indices,
+            );
+        }
+
+        if !positions.is_empty() && !indices.is_empty() {
+            let bevy_mesh = Mesh::new(
+                PrimitiveTopology::TriangleList,
+                RenderAssetUsages::default(),
+            )
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+            .with_inserted_indices(Indices::U32(indices));
+
+            let fast_mat = build_fast_toolpath_material(vis_state.toolpath_opacity);
+            if let (Some(ent), Some(ref mesh_h), Some(ref mat_h)) = (
+                vis_state.toolpaths_entity,
+                &vis_state.toolpaths_mesh_handle,
+                &vis_state.toolpaths_mat_handle,
+            ) {
+                meshes.insert(mesh_h, bevy_mesh);
+                if let Some(mat) = materials.get_mut(mat_h) {
+                    *mat = fast_mat;
+                }
+                if let Ok((mut tf, mut vis)) = toolpaths_query.get_mut(ent) {
+                    *tf = target_tf;
+                    *vis = Visibility::Inherited;
+                }
+            } else {
+                let mesh_h = meshes.add(bevy_mesh);
+                let mat_h = materials.add(fast_mat);
+                let ent = commands
+                    .spawn((
+                        PbrBundle {
+                            mesh: mesh_h.clone(),
+                            material: mat_h.clone(),
+                            transform: target_tf,
+                            ..default()
+                        },
+                        ToolpathsMeshEntity,
+                    ))
+                    .id();
+                vis_state.toolpaths_entity = Some(ent);
+                vis_state.toolpaths_mesh_handle = Some(mesh_h);
+                vis_state.toolpaths_mat_handle = Some(mat_h);
+            }
+        } else if let Some(ent) = vis_state.toolpaths_entity {
+            if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
+                *vis = Visibility::Hidden;
+            }
+        }
+        return;
+    }
+
+    // HighQualityPbr mode: hide Fast entity and build 12-vertex pressed-stadium PBR buckets
+    if let Some(ent) = vis_state.toolpaths_entity {
+        if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
+            *vis = Visibility::Hidden;
+        }
+    }
+
+    let buckets = if let Some(ref planned) = vis_state.cached_planned_gcode {
+        build_hq_planned_toolpaths_buckets(
+            planned,
+            vis_state,
+            config,
+            min_idx,
+            max_idx,
+            stride,
+            highlighted,
+            color_mode,
+        )
+    } else if let Some(ref tp_res) = vis_state.cached_toolpaths {
+        build_hq_raw_toolpaths_buckets(
+            tp_res,
+            vis_state,
+            config,
+            min_idx,
+            max_idx,
+            stride,
+            highlighted,
+            color_mode,
+        )
+    } else {
+        Vec::new()
+    };
+
+    let used_count = buckets.len();
+    for (slot_i, bucket) in buckets.into_iter().enumerate() {
+        let bevy_mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, bucket.positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, bucket.normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, bucket.colors)
+        .with_inserted_indices(Indices::U32(bucket.indices));
+
+        let pbr_mat = build_hq_bucket_pbr_material(
+            bucket.tier,
+            bucket.mat_slot,
+            bucket.mean_thickness_mm,
+            vis_state,
+            config,
+        );
+
+        if slot_i < vis_state.hq_toolpath_parts.len() {
+            let part = &mut vis_state.hq_toolpath_parts[slot_i];
+            part.tier = bucket.tier;
+            part.mat_slot = bucket.mat_slot;
+            part.mean_thickness_mm = bucket.mean_thickness_mm;
+            meshes.insert(&part.mesh_handle, bevy_mesh);
+            if let Some(mat) = materials.get_mut(&part.mat_handle) {
+                *mat = pbr_mat;
+            }
+            if let Ok((mut tf, mut vis)) = toolpaths_query.get_mut(part.entity) {
+                *tf = target_tf;
+                *vis = Visibility::Inherited;
+            }
+        } else {
+            let mesh_h = meshes.add(bevy_mesh);
+            let mat_h = materials.add(pbr_mat);
+            let ent = commands
+                .spawn((
+                    PbrBundle {
+                        mesh: mesh_h.clone(),
+                        material: mat_h.clone(),
+                        transform: target_tf,
+                        ..default()
+                    },
+                    bevy::pbr::TransmittedShadowReceiver,
+                    ToolpathsMeshEntity,
+                ))
+                .id();
+            vis_state.hq_toolpath_parts.push(HqToolpathSubMesh {
+                entity: ent,
+                mesh_handle: mesh_h,
+                mat_handle: mat_h,
+                tier: bucket.tier,
+                mat_slot: bucket.mat_slot,
+                mean_thickness_mm: bucket.mean_thickness_mm,
+            });
+        }
+    }
+
+    for unused in vis_state.hq_toolpath_parts.iter().skip(used_count) {
+        if let Ok((_, mut vis)) = toolpaths_query.get_mut(unused.entity) {
+            *vis = Visibility::Hidden;
+        }
+    }
+}
+
 /// Builds 3D oriented bead prism geometry across visible layers of a `PlannedGcodeResult`
 /// in parallel across CPU worker threads using `std::thread::scope`.
 #[allow(clippy::too_many_arguments)]
@@ -2291,6 +2717,13 @@ fn build_planned_toolpaths_bead_mesh_parallel(
     colors.reserve(total_est_segs * 8);
     indices.reserve(total_est_segs * 36);
 
+    let optical_composite = if color_mode == ToolpathColorMode::ByOpticalComposite {
+        crate::color_optics::compute_planned_optical_composite_colors(planned, config)
+    } else {
+        Vec::new()
+    };
+    let opt_ref = optical_composite.as_slice();
+
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -2299,7 +2732,7 @@ fn build_planned_toolpaths_bead_mesh_parallel(
     if num_threads <= 1 || total_est_segs < 256 {
         for &(idx, dim_factor, max_layer_segs) in &visible_layers {
             let mut emitted = 0usize;
-            for seg in &planned.layers[idx].segments {
+            for (seg_i, seg) in planned.layers[idx].segments.iter().enumerate() {
                 if !vis_state.is_planned_segment_visible(seg) {
                     continue;
                 }
@@ -2307,10 +2740,15 @@ fn build_planned_toolpaths_bead_mesh_parallel(
                     break;
                 }
                 emitted += 1;
+                let override_rgba = opt_ref
+                    .get(idx)
+                    .and_then(|layer_cols| layer_cols.get(seg_i))
+                    .copied();
                 append_planned_segment_bead_mesh(
                     seg,
                     planned,
                     color_mode,
+                    override_rgba,
                     config,
                     dim_factor,
                     positions,
@@ -2340,7 +2778,7 @@ fn build_planned_toolpaths_bead_mesh_parallel(
                 let mut c_ind = Vec::with_capacity(est * 36);
                 for &(idx, dim_factor, max_layer_segs) in chunk {
                     let mut emitted = 0usize;
-                    for seg in &planned.layers[idx].segments {
+                    for (seg_i, seg) in planned.layers[idx].segments.iter().enumerate() {
                         if !vis_state.is_planned_segment_visible(seg) {
                             continue;
                         }
@@ -2348,10 +2786,15 @@ fn build_planned_toolpaths_bead_mesh_parallel(
                             break;
                         }
                         emitted += 1;
+                        let override_rgba = opt_ref
+                            .get(idx)
+                            .and_then(|layer_cols| layer_cols.get(seg_i))
+                            .copied();
                         append_planned_segment_bead_mesh(
                             seg,
                             planned,
                             color_mode,
+                            override_rgba,
                             config,
                             dim_factor,
                             &mut c_pos,
@@ -2554,6 +2997,7 @@ fn append_planned_segment_bead_mesh(
     seg: &crate::gcode::PlannedSegment,
     planned: &crate::gcode::PlannedGcodeResult,
     color_mode: ToolpathColorMode,
+    override_rgba: Option<[f32; 4]>,
     config: &SlicerConfig,
     brightness_scale: f32,
     positions: &mut Vec<[f32; 3]>,
@@ -2604,7 +3048,8 @@ fn append_planned_segment_bead_mesh(
         ((0.48 * w_eff).max(0.03), (0.42 * h_eff).max(0.02))
     };
 
-    let mut rgba = compute_planned_segment_color(seg, planned, color_mode, config);
+    let mut rgba = override_rgba
+        .unwrap_or_else(|| compute_planned_segment_color(seg, planned, color_mode, config));
     rgba[0] = (rgba[0] * brightness_scale).clamp(0.0, 1.0);
     rgba[1] = (rgba[1] * brightness_scale).clamp(0.0, 1.0);
     rgba[2] = (rgba[2] * brightness_scale).clamp(0.0, 1.0);
@@ -2916,7 +3361,7 @@ fn compute_planned_segment_color(
                 config,
             ),
         },
-        ToolpathColorMode::ByToolOrFilament => {
+        ToolpathColorMode::ByToolOrFilament | ToolpathColorMode::ByOpticalComposite => {
             if seg.kind.is_support() {
                 [0.22, 0.88, 0.62, 1.0]
             } else {
@@ -3114,6 +3559,641 @@ fn append_extrusion_path_bead_mesh(
     emit_seg_count
 }
 
+// ============================================================================
+// High-Quality Pressed-Stadium (Capsule) Welded Bead Mesher & PBR Bucketing
+// ============================================================================
+
+const HQ_RING_VERTS: usize = 12;
+
+/// Assembled triangle mesh for one `(tier, mat_slot)` PBR sub-mesh bucket.
+struct HqBucketMesh {
+    tier: u8,
+    mat_slot: u16,
+    mean_thickness_mm: f32,
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    colors: Vec<[f32; 4]>,
+    indices: Vec<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct HqChainNode {
+    pos: Vec3,
+    nozzle_axis: Vec3,
+    width_mm: f32,
+    height_mm: f32,
+    linear_rgba: [f32; 4],
+    is_circular: bool,
+}
+
+#[derive(Default)]
+struct HqBucketAccum {
+    thickness_sum: f64,
+    thickness_count: usize,
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    colors: Vec<[f32; 4]>,
+    indices: Vec<u32>,
+}
+
+#[inline]
+fn classify_hq_planned_bucket(
+    seg: &crate::gcode::PlannedSegment,
+    color_mode: ToolpathColorMode,
+    config: &SlicerConfig,
+) -> (u8, u16) {
+    let tier = match seg.kind {
+        crate::gcode::PlannedMoveKind::SparseInfill
+        | crate::gcode::PlannedMoveKind::Support
+        | crate::gcode::PlannedMoveKind::SupportInterface
+        | crate::gcode::PlannedMoveKind::Wipe => 0u8,
+        crate::gcode::PlannedMoveKind::InnerWall => {
+            if seg.wall_index >= 2 {
+                0u8
+            } else {
+                1u8
+            }
+        }
+        _ => 2u8,
+    };
+
+    let mat_slot = if color_mode == ToolpathColorMode::ByToolOrFilament {
+        if seg.kind.is_support() {
+            256u16
+        } else if seg.kind == crate::gcode::PlannedMoveKind::Wipe {
+            257u16
+        } else {
+            config
+                .tool_index_for_filament_slot(seg.filament_slot)
+                .min(255) as u16
+        }
+    } else {
+        258u16
+    };
+    (tier, mat_slot)
+}
+
+#[inline]
+fn classify_hq_raw_bucket(
+    path: &ExtrusionPath,
+    color_mode: ToolpathColorMode,
+    config: &SlicerConfig,
+) -> (u8, u16) {
+    let tier = match path.feature_kind {
+        4 | 7 | 8 => 0u8,
+        1 => {
+            if path.wall_index >= 2 {
+                0u8
+            } else {
+                1u8
+            }
+        }
+        _ => 2u8,
+    };
+
+    let mat_slot = if color_mode == ToolpathColorMode::ByToolOrFilament {
+        if path.feature_kind == 7 || path.feature_kind == 8 {
+            256u16
+        } else {
+            config
+                .tool_index_for_filament_slot(path.filament_slot)
+                .min(255) as u16
+        }
+    } else {
+        258u16
+    };
+    (tier, mat_slot)
+}
+
+/// Builds parallel per-`(tier, mat_slot)` 12-vertex pressed-stadium welded chain meshes
+/// across visible layers of a `PlannedGcodeResult`.
+#[allow(clippy::too_many_arguments)]
+fn build_hq_planned_toolpaths_buckets(
+    planned: &crate::gcode::PlannedGcodeResult,
+    vis_state: &FieldVisualizationState,
+    config: &SlicerConfig,
+    min_idx: usize,
+    max_idx: usize,
+    stride: usize,
+    highlighted: Option<usize>,
+    color_mode: ToolpathColorMode,
+) -> Vec<HqBucketMesh> {
+    use std::collections::BTreeMap;
+
+    let total = planned.layers.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    let lo = min_idx.min(total - 1);
+    let hi = max_idx.min(total - 1).max(lo);
+    let active_scrub_layer = highlighted.unwrap_or(hi);
+
+    let mut visible_layers: Vec<(usize, f32, usize)> = Vec::new();
+    for (idx, layer_p) in planned.layers.iter().enumerate() {
+        let is_hovered = highlighted == Some(idx);
+        let in_range = idx >= lo && idx <= hi;
+        let matches_stride =
+            (idx.saturating_sub(lo) % stride == 0) || idx == 0 || idx + 1 == total;
+        if !is_hovered && (!in_range || !matches_stride) {
+            continue;
+        }
+        let dim_factor = if is_hovered {
+            1.15
+        } else if highlighted.is_some() {
+            0.55
+        } else {
+            1.0
+        };
+        let mut layer_segs = 0usize;
+        for seg in &layer_p.segments {
+            if vis_state.is_planned_segment_visible(seg) {
+                layer_segs += 1;
+            }
+        }
+        if idx == active_scrub_layer {
+            if let Some(limit) = vis_state.layer_move_scrub_limit {
+                layer_segs = layer_segs.min(limit);
+            }
+        }
+        if layer_segs > 0 {
+            visible_layers.push((idx, dim_factor, layer_segs));
+        }
+    }
+
+    if visible_layers.is_empty() {
+        return Vec::new();
+    }
+
+    let optical_composite = if color_mode == ToolpathColorMode::ByOpticalComposite {
+        crate::color_optics::compute_planned_optical_composite_colors(planned, config)
+    } else {
+        Vec::new()
+    };
+    let opt_ref = optical_composite.as_slice();
+    let fallback_nozzle = Vec3::from_array(config.machine.nozzle_axis_bed);
+
+    let build_chunk = |chunk: &[(usize, f32, usize)]| -> BTreeMap<(u8, u16), HqBucketAccum> {
+        let mut local_map: BTreeMap<(u8, u16), HqBucketAccum> = BTreeMap::new();
+        let mut chain: Vec<HqChainNode> = Vec::with_capacity(64);
+        let mut current_key: Option<(u8, u16)> = None;
+
+        for &(idx, dim_factor, max_layer_segs) in chunk {
+            let mut emitted = 0usize;
+            for (seg_i, seg) in planned.layers[idx].segments.iter().enumerate() {
+                if !vis_state.is_planned_segment_visible(seg) {
+                    continue;
+                }
+                if emitted >= max_layer_segs {
+                    break;
+                }
+                emitted += 1;
+
+                if matches!(
+                    seg.kind,
+                    crate::gcode::PlannedMoveKind::Travel | crate::gcode::PlannedMoveKind::ZHop
+                ) {
+                    if let Some(prev_k) = current_key.take() {
+                        let acc = local_map.entry(prev_k).or_default();
+                        append_hq_welded_chain_stadium_mesh(&chain, fallback_nozzle, acc);
+                        chain.clear();
+                    }
+                    continue;
+                }
+
+                let len_sq = (seg.p1_local - seg.p0_local).length_squared();
+                if len_sq < 1.0e-9 {
+                    continue;
+                }
+
+                let key = classify_hq_planned_bucket(seg, color_mode, config);
+                let w_eff = if seg.kind == crate::gcode::PlannedMoveKind::Wipe {
+                    (0.55 * seg.width_mm).max(0.10)
+                } else {
+                    seg.width_mm.max(0.06)
+                };
+                let h_eff = if seg.kind == crate::gcode::PlannedMoveKind::Wipe {
+                    (0.55 * seg.height_mm).max(0.06)
+                } else {
+                    seg.height_mm.max(0.04)
+                };
+                let is_circ = seg.kind == crate::gcode::PlannedMoveKind::Bridge;
+
+                let mut rgba = opt_ref
+                    .get(idx)
+                    .and_then(|lc| lc.get(seg_i))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        compute_planned_segment_color(seg, planned, color_mode, config)
+                    });
+                rgba[0] = (rgba[0] * dim_factor).clamp(0.0, 1.0);
+                rgba[1] = (rgba[1] * dim_factor).clamp(0.0, 1.0);
+                rgba[2] = (rgba[2] * dim_factor).clamp(0.0, 1.0);
+                let lin_rgba = srgba_to_linear_rgba(rgba);
+
+                let n0 = seg.nozzle_local_0.try_normalize().unwrap_or(fallback_nozzle);
+                let n1 = seg.nozzle_local_1.try_normalize().unwrap_or(n0);
+
+                let contiguous = current_key == Some(key)
+                    && chain
+                        .last()
+                        .is_some_and(|last| last.pos.distance_squared(seg.p0_local) <= 1.0e-4);
+
+                if !contiguous {
+                    if let Some(prev_k) = current_key.take() {
+                        let acc = local_map.entry(prev_k).or_default();
+                        append_hq_welded_chain_stadium_mesh(&chain, fallback_nozzle, acc);
+                        chain.clear();
+                    }
+                    current_key = Some(key);
+                    chain.push(HqChainNode {
+                        pos: seg.p0_local,
+                        nozzle_axis: n0,
+                        width_mm: w_eff,
+                        height_mm: h_eff,
+                        linear_rgba: lin_rgba,
+                        is_circular: is_circ,
+                    });
+                }
+                chain.push(HqChainNode {
+                    pos: seg.p1_local,
+                    nozzle_axis: n1,
+                    width_mm: w_eff,
+                    height_mm: h_eff,
+                    linear_rgba: lin_rgba,
+                    is_circular: is_circ,
+                });
+            }
+
+            if let Some(prev_k) = current_key.take() {
+                let acc = local_map.entry(prev_k).or_default();
+                append_hq_welded_chain_stadium_mesh(&chain, fallback_nozzle, acc);
+                chain.clear();
+            }
+        }
+        local_map
+    };
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(visible_layers.len());
+
+    let merged_map = if num_threads <= 1 || visible_layers.len() < 4 {
+        build_chunk(&visible_layers)
+    } else {
+        let chunk_size = visible_layers.len().div_ceil(num_threads);
+        let partial_maps: Vec<BTreeMap<(u8, u16), HqBucketAccum>> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(num_threads);
+            for chunk in visible_layers.chunks(chunk_size) {
+                handles.push(s.spawn(move || build_chunk(chunk)));
+            }
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        let mut combined: BTreeMap<(u8, u16), HqBucketAccum> = BTreeMap::new();
+        for part_map in partial_maps {
+            for (k, src) in part_map {
+                if src.positions.is_empty() {
+                    continue;
+                }
+                let dst = combined.entry(k).or_default();
+                let base_v = dst.positions.len() as u32;
+                dst.thickness_sum += src.thickness_sum;
+                dst.thickness_count += src.thickness_count;
+                dst.positions.extend(src.positions);
+                dst.normals.extend(src.normals);
+                dst.colors.extend(src.colors);
+                dst.indices.extend(src.indices.into_iter().map(|i| i + base_v));
+            }
+        }
+        combined
+    };
+
+    finalize_hq_buckets(merged_map)
+}
+
+/// Builds per-`(tier, mat_slot)` 12-vertex pressed-stadium meshes for raw `ObjectToolpathsResult`.
+#[allow(clippy::too_many_arguments)]
+fn build_hq_raw_toolpaths_buckets(
+    tp_res: &ObjectToolpathsResult,
+    vis_state: &FieldVisualizationState,
+    config: &SlicerConfig,
+    min_idx: usize,
+    max_idx: usize,
+    stride: usize,
+    highlighted: Option<usize>,
+    color_mode: ToolpathColorMode,
+) -> Vec<HqBucketMesh> {
+    use std::collections::BTreeMap;
+
+    let total = tp_res.layers.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    let lo = min_idx.min(total - 1);
+    let hi = max_idx.min(total - 1).max(lo);
+    let active_scrub_layer = highlighted.unwrap_or(hi);
+    let fallback_nozzle = Vec3::from_array(config.machine.nozzle_axis_bed);
+
+    let mut buckets: BTreeMap<(u8, u16), HqBucketAccum> = BTreeMap::new();
+    let mut chain: Vec<HqChainNode> = Vec::new();
+
+    for (idx, layer_tp) in tp_res.layers.iter().enumerate() {
+        let is_hovered = highlighted == Some(idx);
+        let in_range = idx >= lo && idx <= hi;
+        let matches_stride =
+            (idx.saturating_sub(lo) % stride == 0) || idx == 0 || idx + 1 == total;
+        if !is_hovered && (!in_range || !matches_stride) {
+            continue;
+        }
+        let dim_factor = if is_hovered {
+            1.15
+        } else if highlighted.is_some() {
+            0.55
+        } else {
+            1.0
+        };
+        let mut rem_segs = if idx == active_scrub_layer {
+            vis_state.layer_move_scrub_limit
+        } else {
+            None
+        };
+
+        for path in &layer_tp.paths {
+            if !vis_state.is_raw_path_visible(path.feature_kind) || path.points.len() < 2 {
+                continue;
+            }
+            if rem_segs == Some(0) {
+                break;
+            }
+            let n = path.points.len();
+            let full_segs = if path.is_closed && n >= 3 { n } else { n - 1 };
+            let emit_segs = rem_segs.map_or(full_segs, |lim| lim.min(full_segs));
+            if emit_segs == 0 {
+                continue;
+            }
+
+            chain.clear();
+            let total_nodes = emit_segs + 1;
+            chain.reserve(total_nodes);
+            for step in 0..total_nodes {
+                let pt = &path.points[step % n];
+                let mut rgba = compute_toolpath_point_color(
+                    path.feature_kind,
+                    path.wall_index,
+                    path.filament_slot,
+                    pt.width_mm,
+                    pt.tool_iso_angle_deg,
+                    pt.uses_surface_normal,
+                    color_mode,
+                    config,
+                );
+                rgba[0] = (rgba[0] * dim_factor).clamp(0.0, 1.0);
+                rgba[1] = (rgba[1] * dim_factor).clamp(0.0, 1.0);
+                rgba[2] = (rgba[2] * dim_factor).clamp(0.0, 1.0);
+                chain.push(HqChainNode {
+                    pos: Vec3::new(pt.x, pt.y, pt.z),
+                    nozzle_axis: Vec3::new(pt.nx, pt.ny, pt.nz)
+                        .try_normalize()
+                        .unwrap_or(fallback_nozzle),
+                    width_mm: pt.width_mm.max(0.06),
+                    height_mm: pt.height_mm.max(0.04),
+                    linear_rgba: srgba_to_linear_rgba(rgba),
+                    is_circular: path.feature_kind == 5,
+                });
+            }
+
+            let key = classify_hq_raw_bucket(path, color_mode, config);
+            let acc = buckets.entry(key).or_default();
+            append_hq_welded_chain_stadium_mesh(&chain, fallback_nozzle, acc);
+
+            if let Some(ref mut rem) = rem_segs {
+                *rem = rem.saturating_sub(emit_segs);
+            }
+        }
+    }
+
+    finalize_hq_buckets(buckets)
+}
+
+fn finalize_hq_buckets(
+    map: std::collections::BTreeMap<(u8, u16), HqBucketAccum>,
+) -> Vec<HqBucketMesh> {
+    let mut out = Vec::with_capacity(map.len());
+    for ((tier, mat_slot), acc) in map {
+        if acc.positions.is_empty() || acc.indices.is_empty() {
+            continue;
+        }
+        let mean_thickness_mm = if acc.thickness_count > 0 {
+            (acc.thickness_sum / (acc.thickness_count as f64)) as f32
+        } else {
+            0.40
+        };
+        out.push(HqBucketMesh {
+            tier,
+            mat_slot,
+            mean_thickness_mm,
+            positions: acc.positions,
+            normals: acc.normals,
+            colors: acc.colors,
+            indices: acc.indices,
+        });
+    }
+    out
+}
+
+/// Emits a continuous welded 12-vertex pressed-stadium (capsule) extrusion chain in each node's
+/// local `NozzleFrame` $(\hat{\mathbf{x}}_{\text{travel}}, \hat{\mathbf{y}}_{\text{lateral}}, \hat{\mathbf{z}}_{\text{nozzle}})$
+/// (`AGENTS.md` Rule 1 — never assuming `+Z`), with bisecting mitered corner joints, smooth
+/// analytic meniscus normals, inter-layer micro-AO, and 3D convex bullnose endcaps.
+fn append_hq_welded_chain_stadium_mesh(
+    raw_nodes: &[HqChainNode],
+    fallback_nozzle: Vec3,
+    acc: &mut HqBucketAccum,
+) {
+    if raw_nodes.len() < 2 {
+        return;
+    }
+
+    // Deduplicate near-coincident consecutive points while preserving closed-loop closure at the end
+    let mut nodes: Vec<HqChainNode> = Vec::with_capacity(raw_nodes.len());
+    for (idx, &nd) in raw_nodes.iter().enumerate() {
+        if let Some(prev) = nodes.last() {
+            let is_final = idx + 1 == raw_nodes.len();
+            if prev.pos.distance_squared(nd.pos) < 1.0e-8 && !is_final {
+                continue;
+            }
+        }
+        nodes.push(nd);
+    }
+    if nodes.len() < 2 {
+        return;
+    }
+
+    let is_closed =
+        nodes.len() >= 4 && nodes[0].pos.distance_squared(nodes.last().unwrap().pos) <= 1.0e-5;
+    if is_closed {
+        nodes.pop(); // Ring `n - 1` wraps seamlessly back to Ring `0` with zero internal endcap!
+    }
+    let n = nodes.len();
+    if n < 2 || (is_closed && n < 3) {
+        return;
+    }
+
+    // Precomputed stadium meniscus angles & micro-groove AO factors:
+    // 0..6: right meniscus [-pi/2 .. +pi/2], 6..12: left meniscus [+pi/2 .. +3pi/2]
+    const ANGLES_COS_SIN_SIDE_AO: [(f32, f32, f32, f32); HQ_RING_VERTS] = [
+        (0.0, -1.0, 1.0, 0.80),          // 0: bottom-right crease
+        (0.58778524, -0.809017, 1.0, 0.91), // 1: -54°
+        (0.95105654, -0.309017, 1.0, 1.00), // 2: -18°
+        (0.95105654, 0.309017, 1.0, 1.00),  // 3: +18°
+        (0.58778524, 0.809017, 1.0, 0.94),  // 4: +54°
+        (0.0, 1.0, 1.0, 0.98),           // 5: top-right ironed land
+        (0.0, 1.0, -1.0, 0.98),          // 6: top-left ironed land
+        (-0.58778524, 0.809017, -1.0, 0.94), // 7: +126°
+        (-0.95105654, 0.309017, -1.0, 1.00), // 8: +162°
+        (-0.95105654, -0.309017, -1.0, 1.00), // 9: +198°
+        (-0.58778524, -0.809017, -1.0, 0.91), // 10: +234°
+        (0.0, -1.0, -1.0, 0.80),         // 11: bottom-left crease
+    ];
+
+    let ring_base = acc.positions.len() as u32;
+    acc.positions.reserve(n * HQ_RING_VERTS + 2);
+    acc.normals.reserve(n * HQ_RING_VERTS + 2);
+    acc.colors.reserve(n * HQ_RING_VERTS + 2);
+    let num_segs = if is_closed { n } else { n - 1 };
+    acc.indices.reserve(num_segs * HQ_RING_VERTS * 6 + HQ_RING_VERTS * 6);
+
+    let mut first_frame = NozzleFrame::from_nozzle_and_travel(fallback_nozzle, Vec3::X);
+    let mut last_frame = first_frame;
+    let mut first_r = 0.10_f32;
+    let mut last_r = 0.10_f32;
+
+    for i in 0..n {
+        let nd = &nodes[i];
+        let z_noz = nd.nozzle_axis.try_normalize().unwrap_or(fallback_nozzle);
+
+        let dir_in_opt = if i > 0 {
+            (nd.pos - nodes[i - 1].pos).try_normalize()
+        } else if is_closed {
+            (nd.pos - nodes[n - 1].pos).try_normalize()
+        } else {
+            None
+        };
+        let dir_out_opt = if i + 1 < n {
+            (nodes[i + 1].pos - nd.pos).try_normalize()
+        } else if is_closed {
+            (nodes[0].pos - nd.pos).try_normalize()
+        } else {
+            None
+        };
+
+        let (frame, miter_scale) = match (dir_in_opt, dir_out_opt) {
+            (Some(d_in), Some(d_out)) => {
+                let f_in = NozzleFrame::from_nozzle_and_travel(z_noz, d_in);
+                let f_out = NozzleFrame::from_nozzle_and_travel(z_noz, d_out);
+                let bisect_travel = (f_in.travel_axis + f_out.travel_axis)
+                    .try_normalize()
+                    .unwrap_or(f_out.travel_axis);
+                let f_mid = NozzleFrame::from_nozzle_and_travel(z_noz, bisect_travel);
+                let cos_half = f_mid.lateral_axis.dot(f_in.lateral_axis).abs().max(0.60);
+                (f_mid, (1.0 / cos_half).clamp(1.0, 1.62))
+            }
+            (None, Some(d_out)) => (NozzleFrame::from_nozzle_and_travel(z_noz, d_out), 1.0),
+            (Some(d_in), None) => (NozzleFrame::from_nozzle_and_travel(z_noz, d_in), 1.0),
+            (None, None) => (NozzleFrame::from_nozzle_and_travel(z_noz, Vec3::X), 1.0),
+        };
+
+        let (flat_a, r_lat, b_vert) = if nd.is_circular {
+            // Free-air stretched circular bridge cross-section preserving exact bead area W * H
+            let r_eq = (0.5 * (std::f32::consts::FRAC_2_PI * 2.0 * nd.width_mm * nd.height_mm).sqrt())
+                .max(0.025);
+            (0.002, r_eq * miter_scale, r_eq)
+        } else {
+            let b = (0.495 * nd.height_mm).max(0.018);
+            let half_w = (0.495 * nd.width_mm).max(0.028);
+            let r_m = b.min(half_w);
+            let a = (half_w - r_m).max(0.002) * miter_scale;
+            (a, r_m * miter_scale, b)
+        };
+
+        if i == 0 {
+            first_frame = frame;
+            first_r = b_vert;
+        }
+        if i + 1 == n {
+            last_frame = frame;
+            last_r = b_vert;
+        }
+
+        acc.thickness_sum += 0.5 * ((nd.width_mm + nd.height_mm) as f64);
+        acc.thickness_count += 1;
+
+        for &(cos_t, sin_t, side_sign, ao) in &ANGLES_COS_SIN_SIDE_AO {
+            let local_y = side_sign * flat_a + r_lat * cos_t;
+            let local_z = b_vert * sin_t;
+            let v_pos = nd.pos + frame.lateral_axis * local_y + frame.nozzle_axis * local_z;
+            let v_nrm = (frame.lateral_axis * cos_t + frame.nozzle_axis * sin_t)
+                .try_normalize()
+                .unwrap_or(frame.nozzle_axis);
+
+            acc.positions.push(v_pos.to_array());
+            acc.normals.push(v_nrm.to_array());
+            acc.colors.push([
+                nd.linear_rgba[0] * ao,
+                nd.linear_rgba[1] * ao,
+                nd.linear_rgba[2] * ao,
+                nd.linear_rgba[3],
+            ]);
+        }
+    }
+
+    // Connect welded rings with outward FrontFace::Ccw triangles
+    let ring_stride = HQ_RING_VERTS as u32;
+    for s in 0..num_segs {
+        let r0 = ring_base + (s as u32) * ring_stride;
+        let r1 = ring_base + (((s + 1) % n) as u32) * ring_stride;
+        for k in 0..ring_stride {
+            let k_next = (k + 1) % ring_stride;
+            let a0 = r0 + k;
+            let a1 = r0 + k_next;
+            let b0 = r1 + k;
+            let b1 = r1 + k_next;
+            acc.indices.extend_from_slice(&[a0, a1, b1, a0, b1, b0]);
+        }
+    }
+
+    // Convex 3D bullnose endcaps at open chain start & end
+    if !is_closed {
+        let n0 = &nodes[0];
+        let start_apex_idx = acc.positions.len() as u32;
+        let start_apex_pos = n0.pos - first_frame.travel_axis * (0.38 * first_r);
+        acc.positions.push(start_apex_pos.to_array());
+        acc.normals.push((-first_frame.travel_axis).to_array());
+        acc.colors.push(n0.linear_rgba);
+
+        let r0 = ring_base;
+        for k in 0..ring_stride {
+            let k_next = (k + 1) % ring_stride;
+            acc.indices
+                .extend_from_slice(&[start_apex_idx, r0 + k_next, r0 + k]);
+        }
+
+        let n_end = &nodes[n - 1];
+        let end_apex_idx = acc.positions.len() as u32;
+        let end_apex_pos = n_end.pos + last_frame.travel_axis * (0.38 * last_r);
+        acc.positions.push(end_apex_pos.to_array());
+        acc.normals.push(last_frame.travel_axis.to_array());
+        acc.colors.push(n_end.linear_rgba);
+
+        let r_last = ring_base + ((n - 1) as u32) * ring_stride;
+        for k in 0..ring_stride {
+            let k_next = (k + 1) % ring_stride;
+            acc.indices
+                .extend_from_slice(&[end_apex_idx, r_last + k, r_last + k_next]);
+        }
+    }
+}
+
 /// Computes the RGBA color for a toolpath point according to `ToolpathColorMode`.
 fn compute_toolpath_point_color(
     feature_kind: u8,
@@ -3145,7 +4225,7 @@ fn compute_toolpath_point_color(
             8 => [0.12, 0.96, 0.88, 1.0], // Support Interface: bright aquamarine
             _ => [0.98, 0.32, 0.88, 1.0], // Gap Fill: vivid magenta
         },
-        ToolpathColorMode::ByToolOrFilament => {
+        ToolpathColorMode::ByToolOrFilament | ToolpathColorMode::ByOpticalComposite => {
             if feature_kind == 7 || feature_kind == 8 {
                 [0.22, 0.88, 0.62, 1.0]
             } else {
@@ -7954,6 +9034,136 @@ mod tests {
         let default_cfg = SlicerConfig::default();
         crate::ui::sync_config_to_backend(&default_cfg);
         let _ = ffi::remove_cad_object(part.object_id);
+    }
+
+    #[test]
+    fn test_hq_stadium_pbr_bucketing_outward_normals_and_translucency() {
+        // 1. Verify closed-loop welded stadium ring count & outward-pointing FrontFace::Ccw normals
+        let mut closed_acc = HqBucketAccum::default();
+        let square_loop = vec![
+            HqChainNode {
+                pos: Vec3::new(0.0, 0.0, 0.2),
+                nozzle_axis: Vec3::new(0.0, 0.2588, 0.9659), // tilted 15° nozzle axis (AGENTS.md Rule 1)
+                width_mm: 0.44,
+                height_mm: 0.20,
+                linear_rgba: [0.1, 0.6, 0.9, 1.0],
+                is_circular: false,
+            },
+            HqChainNode {
+                pos: Vec3::new(10.0, 0.0, 0.2),
+                nozzle_axis: Vec3::new(0.0, 0.2588, 0.9659),
+                width_mm: 0.44,
+                height_mm: 0.20,
+                linear_rgba: [0.1, 0.6, 0.9, 1.0],
+                is_circular: false,
+            },
+            HqChainNode {
+                pos: Vec3::new(10.0, 10.0, 0.2),
+                nozzle_axis: Vec3::new(0.0, 0.2588, 0.9659),
+                width_mm: 0.44,
+                height_mm: 0.20,
+                linear_rgba: [0.1, 0.6, 0.9, 1.0],
+                is_circular: false,
+            },
+            HqChainNode {
+                pos: Vec3::new(0.0, 10.0, 0.2),
+                nozzle_axis: Vec3::new(0.0, 0.2588, 0.9659),
+                width_mm: 0.44,
+                height_mm: 0.20,
+                linear_rgba: [0.1, 0.6, 0.9, 1.0],
+                is_circular: false,
+            },
+            HqChainNode {
+                pos: Vec3::new(0.0, 0.0, 0.2),
+                nozzle_axis: Vec3::new(0.0, 0.2588, 0.9659),
+                width_mm: 0.44,
+                height_mm: 0.20,
+                linear_rgba: [0.1, 0.6, 0.9, 1.0],
+                is_circular: false,
+            },
+        ];
+        append_hq_welded_chain_stadium_mesh(&square_loop, Vec3::Z, &mut closed_acc);
+        // Closed 4-corner loop must have exactly 4 * 12 = 48 vertices (zero internal endcap apices!)
+        assert_eq!(closed_acc.positions.len(), 4 * HQ_RING_VERTS);
+        assert_eq!(closed_acc.indices.len(), 4 * HQ_RING_VERTS * 6);
+
+        for tri in closed_acc.indices.chunks_exact(3) {
+            let p0 = Vec3::from_array(closed_acc.positions[tri[0] as usize]);
+            let p1 = Vec3::from_array(closed_acc.positions[tri[1] as usize]);
+            let p2 = Vec3::from_array(closed_acc.positions[tri[2] as usize]);
+            let face_n = (p1 - p0).cross(p2 - p0);
+            assert!(face_n.length() > 1.0e-7, "Degenerate triangle in stadium tube");
+            let avg_vn = Vec3::from_array(closed_acc.normals[tri[0] as usize])
+                + Vec3::from_array(closed_acc.normals[tri[1] as usize])
+                + Vec3::from_array(closed_acc.normals[tri[2] as usize]);
+            assert!(
+                face_n.dot(avg_vn) > 0.0,
+                "Triangle winding must match outward analytic normal for backface culling"
+            );
+        }
+
+        // Open chain must include 2 convex bullnose endcap apices (`2 * 12 + 2 = 26` vertices) with outward normals
+        let mut open_acc = HqBucketAccum::default();
+        append_hq_welded_chain_stadium_mesh(&square_loop[..2], Vec3::Z, &mut open_acc);
+        assert_eq!(open_acc.positions.len(), 2 * HQ_RING_VERTS + 2);
+        for tri in open_acc.indices.chunks_exact(3) {
+            let p0 = Vec3::from_array(open_acc.positions[tri[0] as usize]);
+            let p1 = Vec3::from_array(open_acc.positions[tri[1] as usize]);
+            let p2 = Vec3::from_array(open_acc.positions[tri[2] as usize]);
+            let face_n = (p1 - p0).cross(p2 - p0);
+            let avg_vn = Vec3::from_array(open_acc.normals[tri[0] as usize])
+                + Vec3::from_array(open_acc.normals[tri[1] as usize])
+                + Vec3::from_array(open_acc.normals[tri[2] as usize]);
+            assert!(
+                face_n.dot(avg_vn) > 0.0,
+                "Bullnose endcap winding must face outward"
+            );
+        }
+
+        // 2. Verify TD-derived filament opacity, tie-free depth_bias ordering, and X-ray multiplier
+        let mut cfg = SlicerConfig::default();
+        cfg.apply_optical_palette_to_tools(&crate::color_optics::bambu_pla_cmykw_palette());
+        // In bambu_pla_cmykw_palette: T0 = Cyan (TD 3.5 mm), T2 = Yellow (TD 6.0 mm), T3 = Black (TD 0.6 mm), T4 = White (TD 5.0 mm)
+        let mut vis = FieldVisualizationState::default();
+        vis.toolpath_quality_mode = ToolpathQualityMode::HighQualityPbr;
+        vis.toolpath_color_mode = ToolpathColorMode::ByToolOrFilament;
+        vis.enable_pbr_translucency = true;
+        vis.toolpath_opacity = 1.0;
+
+        let mat_core_white = build_hq_bucket_pbr_material(0, 4, 0.42, &vis, &cfg);
+        let mat_inner_yel = build_hq_bucket_pbr_material(1, 2, 0.42, &vis, &cfg);
+        let mat_outer_cyan = build_hq_bucket_pbr_material(2, 0, 0.42, &vis, &cfg);
+        let mat_outer_black = build_hq_bucket_pbr_material(2, 3, 0.42, &vis, &cfg);
+
+        // Screen-space specular_transmission is 0.0 (noise-free), while alpha opacity strictly tracks TD!
+        assert_eq!(mat_outer_cyan.specular_transmission, 0.0);
+        assert!(matches!(mat_core_white.alpha_mode, AlphaMode::Opaque));
+        assert!(matches!(mat_outer_cyan.alpha_mode, AlphaMode::Blend));
+        let alpha_yel = mat_inner_yel.base_color.alpha();
+        let alpha_cyan = mat_outer_cyan.base_color.alpha();
+        let alpha_black = mat_outer_black.base_color.alpha();
+        assert!(
+            alpha_yel < alpha_cyan && alpha_cyan < alpha_black && alpha_black > 0.75,
+            "Higher TD must yield lower single-bead opacity (Yellow TD 6.0={alpha_yel} < Cyan TD 3.5={alpha_cyan} < Black TD 0.6={alpha_black})"
+        );
+        // Verify Beer-Lambert multi-layer additivity: 5 stacked 0.12mm layers == 1 single 0.60mm slab!
+        let a_thin = crate::color_optics::td_opacity_for_thickness_mm(3.5, 0.12);
+        let a_stack5 = 1.0 - (1.0 - a_thin).powi(5);
+        let a_thick = crate::color_optics::td_opacity_for_thickness_mm(3.5, 0.60);
+        assert!((a_stack5 - a_thick).abs() < 1.0e-5);
+        // Positive Z-bias (> 10.0) prevents CAD/isosurface Z-fighting, and unique per-slot offsets prevent sort ties!
+        assert!(mat_core_white.depth_bias >= 12.0);
+        assert!(mat_core_white.depth_bias < mat_inner_yel.depth_bias);
+        assert!(mat_inner_yel.depth_bias < mat_outer_cyan.depth_bias);
+        assert_ne!(mat_outer_cyan.depth_bias, mat_outer_black.depth_bias);
+
+        // Lowering `toolpath_opacity` scales core & shell opacities cleanly in back-to-front order
+        vis.toolpath_opacity = 0.45;
+        let mat_xray_core = build_hq_bucket_pbr_material(0, 4, 0.30, &vis, &cfg);
+        let mat_xray_outer = build_hq_bucket_pbr_material(2, 0, 0.30, &vis, &cfg);
+        assert!(matches!(mat_xray_core.alpha_mode, AlphaMode::Blend));
+        assert!(matches!(mat_xray_outer.alpha_mode, AlphaMode::Blend));
+        assert!(mat_xray_core.depth_bias < mat_xray_outer.depth_bias);
     }
 }
 

@@ -39,7 +39,7 @@ manifold-frontend slice [OPTIONS] <INPUT_FILES>...
 
 - **`.step` / `.stp`**: Exact OpenCASCADE (OCCT) B-Rep CAD parts and multi-part assemblies (automatically decomposed into independent parts while preserving assembly relative placement).
 - **`.stl`**: Binary and ASCII triangle meshes.
-- **`.3mf`**: Single-plate and multi-plate 3MF project archives (including Manifold2 `.3mf` projects and third-party multi-plate `.3mf` files from OrcaSlicer, Bambu Studio, and PrusaSlicer).
+- **`.3mf`**: Single-plate, multi-plate, and multi-colour 3MF project archives (including Manifold2 `.3mf` projects, third-party multi-plate `.3mf` files with `mmu_segmentation` paint trees from OrcaSlicer, Bambu Studio, and PrusaSlicer, and true-colour `<basematerials>`, `<m:colorgroup>`, and UV-mapped `<m:texture2d>` PNG-textured models).
 
 ### Slicing Options
 
@@ -98,6 +98,22 @@ manifold-frontend slice \
   -s slicing.support_style=tree \
   -s slicing.support_on_bed_only=true \
   benchy.stl -o benchy_conformal.gcode
+
+# 6. Slice a full-colour or UV-textured .3mf using Kubelka–Munk CMYKW optical colour mixing:
+manifold-frontend slice \
+  -p cmykw_5tool_machine.json \
+  --process "0.16mm CMYKW Full-Colour Optical Mixing" \
+  -s slicing.color_mixing.enabled=true \
+  -s slicing.color_mixing.optical_shell_layers=4 \
+  -s slicing.color_mixing.min_short_extrusion_mm=3.0 \
+  painted_statue.3mf -o painted_statue_cmykw.gcode
+
+# 7. Slice a back-lit full-colour CMYKW lithophane (transmittance mode, no opaque core backing):
+manifold-frontend slice \
+  -p translucent_cmykw_machine.json \
+  --process "0.16mm CMYKW Full-Colour Optical Mixing" \
+  -s slicing.color_mixing.lighting_mode=BackLitTransmittance \
+  lithophane.3mf -o lithophane_cmykw.gcode
 ```
 
 ---

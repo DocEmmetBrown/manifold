@@ -596,8 +596,12 @@ pub fn spawn_loaded_objects(
             } else {
                 Color::srgb(0.24, 0.62, 0.92)
             },
-            metallic: if has_filament_colors { 0.04 } else { 0.22 },
-            perceptual_roughness: if has_filament_colors { 0.62 } else { 0.45 },
+            metallic: if has_filament_colors { 0.02 } else { 0.22 },
+            perceptual_roughness: if has_filament_colors { 0.38 } else { 0.45 },
+            reflectance: if has_filament_colors { 0.44 } else { 0.50 },
+            clearcoat: if has_filament_colors { 0.24 } else { 0.0 },
+            clearcoat_perceptual_roughness: 0.22,
+            ior: 1.48,
             double_sided: true,
             cull_mode: None,
             ..default()
@@ -1001,76 +1005,149 @@ pub fn update_selection_materials_system(
     }
 
     for obj in &plate.objects {
-        if let Some(mat) = materials.get_mut(&obj.material_handle) {
-            let is_selected = plate.selected_object_id == Some(obj.object_id);
-            if is_selected {
-                let any_vis_active = vis_state.show_isosurface
-                    || vis_state.show_slice_plane
-                    || vis_state.show_selected_layers
-                    || vis_state.show_toolpaths;
-                let alpha = if any_vis_active {
-                    vis_state.solid_opacity.clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
-                let use_vertex_colormap = vis_state.surface_color_mode
-                    != crate::field_vis::ObjectSurfaceColorMode::DefaultCad
-                    || !obj.vertex_filament_slots.is_empty()
-                    || !obj.vertex_colors_rgba.is_empty();
-                if alpha < 0.02 {
-                    mat.base_color = Color::srgba(0.55, 0.60, 0.68, 0.0);
-                    mat.alpha_mode = AlphaMode::Mask(1.0);
-                    mat.cull_mode = Some(wgpu::Face::Back);
-                } else if alpha < 0.99 {
-                    if use_vertex_colormap {
-                        mat.base_color = Color::srgba(1.0, 1.0, 1.0, alpha);
-                        mat.metallic = 0.0;
-                        mat.perceptual_roughness = 0.78;
-                        mat.reflectance = 0.08;
-                    } else {
-                        // Neutral, low-glare ghost shell so it does not cast a colored or specular
-                        // veil over internal toolpaths, isosurfaces, or scalar slices.
-                        mat.base_color = Color::srgba(0.52, 0.56, 0.64, alpha);
-                        mat.metallic = 0.0;
-                        mat.perceptual_roughness = 0.90;
-                        mat.reflectance = 0.06;
-                    }
-                    mat.alpha_mode = AlphaMode::Blend;
-                    // Backface culling prevents the translucent CAD shell from self-interfering
-                    mat.cull_mode = Some(wgpu::Face::Back);
-                    mat.double_sided = false;
-                } else {
-                    if use_vertex_colormap {
-                        // Pure white base_color so per-vertex ATTRIBUTE_COLOR directly drives the surface colormap
-                        mat.base_color = Color::srgba(1.0, 1.0, 1.0, 1.0);
-                        mat.metallic = 0.04;
-                        mat.perceptual_roughness = 0.62;
-                        mat.reflectance = 0.18;
-                    } else {
-                        mat.base_color = Color::srgba(0.32, 0.76, 0.98, 1.0);
-                        mat.metallic = 0.22;
-                        mat.perceptual_roughness = 0.45;
-                        mat.reflectance = 0.50;
-                    }
-                    mat.alpha_mode = AlphaMode::Opaque;
-                    mat.cull_mode = None;
-                    mat.double_sided = true;
-                }
+        let is_selected = plate.selected_object_id == Some(obj.object_id);
+        let hq_pbr = vis_state.toolpath_quality_mode
+            == crate::field_vis::ToolpathQualityMode::HighQualityPbr;
+
+        let (
+            target_base,
+            target_metallic,
+            target_rough,
+            target_refl,
+            target_cc,
+            target_diff_trans,
+            target_alpha_mode,
+            target_depth_bias,
+            target_cull,
+            target_double_sided,
+        ) = if is_selected {
+            let any_vis_active = vis_state.show_isosurface
+                || vis_state.show_slice_plane
+                || vis_state.show_selected_layers
+                || vis_state.show_toolpaths;
+            let alpha = if any_vis_active {
+                vis_state.solid_opacity.clamp(0.0, 1.0)
             } else {
-                if !obj.vertex_filament_slots.is_empty() || !obj.vertex_colors_rgba.is_empty() {
-                    mat.base_color = Color::srgb(0.92, 0.92, 0.92);
-                    mat.metallic = 0.04;
-                    mat.perceptual_roughness = 0.62;
-                    mat.reflectance = 0.18;
+                1.0
+            };
+            let use_vertex_colormap = vis_state.surface_color_mode
+                != crate::field_vis::ObjectSurfaceColorMode::DefaultCad
+                || !obj.vertex_filament_slots.is_empty()
+                || !obj.vertex_colors_rgba.is_empty();
+
+            if alpha < 0.02 {
+                (
+                    Color::srgba(0.55, 0.60, 0.68, 0.0),
+                    0.0,
+                    0.85,
+                    0.06,
+                    0.0,
+                    0.0,
+                    AlphaMode::Mask(1.0),
+                    0.0,
+                    Some(wgpu::Face::Back),
+                    false,
+                )
+            } else if alpha < 0.99 {
+                let (bc, rough, refl, cc) = if use_vertex_colormap {
+                    (Color::srgba(1.0, 1.0, 1.0, alpha), 0.58, 0.16, 0.12)
                 } else {
-                    mat.base_color = Color::srgb(0.22, 0.52, 0.78);
-                    mat.metallic = 0.22;
-                    mat.perceptual_roughness = 0.45;
-                    mat.reflectance = 0.50;
-                }
-                mat.alpha_mode = AlphaMode::Opaque;
-                mat.cull_mode = None;
-                mat.double_sided = true;
+                    (Color::srgba(0.52, 0.56, 0.64, alpha), 0.90, 0.06, 0.0)
+                };
+                // Hardware & sort depth_bias = 16.0 keeps the translucent CAD ghost envelope strictly
+                // sorted after and free of Z-fighting with toolpaths (12..14.8) & isosurfaces (10).
+                (
+                    bc,
+                    0.0,
+                    rough,
+                    refl,
+                    cc,
+                    0.0,
+                    AlphaMode::Blend,
+                    16.0,
+                    Some(wgpu::Face::Back),
+                    false,
+                )
+            } else if use_vertex_colormap {
+                (
+                    Color::srgba(1.0, 1.0, 1.0, 1.0),
+                    0.02,
+                    if hq_pbr { 0.34 } else { 0.42 },
+                    0.44,
+                    if hq_pbr { 0.28 } else { 0.18 },
+                    if hq_pbr { 0.16 } else { 0.0 },
+                    AlphaMode::Opaque,
+                    0.0,
+                    None,
+                    true,
+                )
+            } else {
+                (
+                    Color::srgba(0.32, 0.76, 0.98, 1.0),
+                    0.22,
+                    0.45,
+                    0.50,
+                    0.0,
+                    0.0,
+                    AlphaMode::Opaque,
+                    0.0,
+                    None,
+                    true,
+                )
+            }
+        } else if !obj.vertex_filament_slots.is_empty() || !obj.vertex_colors_rgba.is_empty() {
+            (
+                Color::srgba(1.0, 1.0, 1.0, 1.0),
+                0.02,
+                if hq_pbr { 0.36 } else { 0.44 },
+                0.42,
+                if hq_pbr { 0.24 } else { 0.15 },
+                if hq_pbr { 0.14 } else { 0.0 },
+                AlphaMode::Opaque,
+                0.0,
+                None,
+                true,
+            )
+        } else {
+            (
+                Color::srgba(0.22, 0.52, 0.78, 1.0),
+                0.22,
+                0.45,
+                0.50,
+                0.0,
+                0.0,
+                AlphaMode::Opaque,
+                0.0,
+                None,
+                true,
+            )
+        };
+
+        // Avoid calling `materials.get_mut` when properties match so egui's `ResMut` derefs do not
+        // rebuild GPU material bind groups every frame.
+        let needs_write = materials.get(&obj.material_handle).is_some_and(|cur| {
+            cur.base_color != target_base
+                || (cur.perceptual_roughness - target_rough).abs() > 1.0e-4
+                || (cur.clearcoat - target_cc).abs() > 1.0e-4
+                || (cur.diffuse_transmission - target_diff_trans).abs() > 1.0e-4
+                || cur.alpha_mode != target_alpha_mode
+                || (cur.depth_bias - target_depth_bias).abs() > 1.0e-4
+                || cur.cull_mode != target_cull
+        });
+
+        if needs_write {
+            if let Some(mat) = materials.get_mut(&obj.material_handle) {
+                mat.base_color = target_base;
+                mat.metallic = target_metallic;
+                mat.perceptual_roughness = target_rough;
+                mat.reflectance = target_refl;
+                mat.clearcoat = target_cc;
+                mat.clearcoat_perceptual_roughness = 0.22;
+                mat.diffuse_transmission = target_diff_trans;
+                mat.alpha_mode = target_alpha_mode;
+                mat.depth_bias = target_depth_bias;
+                mat.cull_mode = target_cull;
+                mat.double_sided = target_double_sided;
             }
         }
     }

@@ -743,6 +743,29 @@ impl FilamentOpticalModel {
     pub fn opaque_backing_slab(&self) -> OpticalSlab {
         OpticalSlab::opaque_reflector(self.r_inf_linear)
     }
+
+    /// Computes the physical single-slab hiding opacity $\alpha(d, \text{TD}) = 1 - (0.08)^{d / \text{TD}}$
+    /// for a filament bead of physical thickness `thickness_mm` (`d = TD => α = 0.92`).
+    ///
+    /// Satisfies exact Beer–Lambert / HueForge additivity under Porter–Duff alpha compositing:
+    /// stacking $N$ beads of thicknesses $d_1, \dots, d_N$ yields
+    /// $1 - \prod_i (1 - \alpha_i) = 1 - (0.08)^{(\sum_i d_i) / \text{TD}}$, and is strictly
+    /// monotonic in `td_mm` across all filament colours.
+    #[inline]
+    pub fn opacity_at_thickness_mm(&self, thickness_mm: f32) -> f32 {
+        td_opacity_for_thickness_mm(self.td_mm as f32, thickness_mm)
+    }
+}
+
+/// Computes the physical single-slab hiding opacity $\alpha(d, \text{TD}) = 1 - (0.08)^{d / \text{TD}}$
+/// (`[0.06, 1.0]`) for a filament with Transmission Distance `td_mm` at physical bead thickness `thickness_mm`.
+#[inline]
+pub fn td_opacity_for_thickness_mm(td_mm: f32, thickness_mm: f32) -> f32 {
+    let td = (td_mm as f64).max(0.05);
+    let d = (thickness_mm as f64).max(0.02);
+    // -ln(0.08) = 2.5257286443082556 (~92% hiding contrast at thickness == TD)
+    let transmittance = (-2.525_728_644_308_255_6 * (d / td)).exp();
+    (1.0 - transmittance).clamp(0.06, 1.0) as f32
 }
 
 /// Evaluates an arbitrary multi-layer filament stack ordered from **outermost** (viewer-facing, index 0)
@@ -2131,6 +2154,197 @@ fn emit_segmented_extrusion_paths(
         });
     }
     out_paths
+}
+
+/// Evaluates the simulated Kubelka–Munk composite sRGBA `[r, g, b, 1.0]` for every segment in
+/// `planned` (`layers[layer_idx][seg_idx]`), stacking concentric inner walls (`wall_index = 1, 2`)
+/// behind outer perimeters and stepping along $-\hat{\mathbf{z}}_{\text{nozzle}}$ (`AGENTS.md` Rule 1)
+/// beneath top/conformal skin extrusions under `config.slicing.color_mixing.lighting_mode`.
+pub fn compute_planned_optical_composite_colors(
+    planned: &crate::gcode::PlannedGcodeResult,
+    config: &crate::config::SlicerConfig,
+) -> Vec<Vec<[f32; 4]>> {
+    use std::collections::HashMap;
+
+    if planned.layers.is_empty() || config.tools.is_empty() {
+        return Vec::new();
+    }
+
+    let models: Vec<FilamentOpticalModel> = config
+        .tools
+        .iter()
+        .map(|t| {
+            FilamentOpticalModel::from_srgb_and_td(
+                [
+                    t.filament_color_srgba[0],
+                    t.filament_color_srgba[1],
+                    t.filament_color_srgba[2],
+                ],
+                t.effective_transmission_distance_mm(),
+            )
+        })
+        .collect();
+
+    let lighting_mode = config.slicing.color_mixing.lighting_mode;
+    let lighting = lighting_mode.lighting();
+    let backing_idx = if lighting_mode.uses_opaque_core_backing() {
+        Some(
+            config
+                .slicing
+                .color_mixing
+                .backing_tool_index
+                .filter(|&i| i < models.len())
+                .unwrap_or_else(|| select_auto_backing_model_index(&models)),
+        )
+    } else {
+        None
+    };
+    let backing_ref = backing_idx.map(|i| &models[i]);
+
+    const CELL_MM: f32 = 1.6;
+    let quant = |p: bevy::math::Vec3| -> (i32, i32, i32) {
+        (
+            (p.x / CELL_MM).round() as i32,
+            (p.y / CELL_MM).round() as i32,
+            (p.z / CELL_MM).round() as i32,
+        )
+    };
+
+    // Index inner walls (tier 1 = wall 1, tier 2 = wall >= 2) and skin/solid infill (tier 3)
+    let mut wall_grid: HashMap<(i32, i32, i32, u8), (usize, f32)> = HashMap::new();
+    let mut skin_grid: HashMap<(i32, i32, i32), (usize, f32)> = HashMap::new();
+
+    for layer in &planned.layers {
+        for seg in &layer.segments {
+            if !seg.kind.is_extruding() || seg.kind.is_support() {
+                continue;
+            }
+            let mid = 0.5 * (seg.p0_local + seg.p1_local);
+            let t_idx = config
+                .tool_index_for_filament_slot(seg.filament_slot)
+                .min(models.len() - 1);
+            let (qx, qy, qz) = quant(mid);
+            match seg.kind {
+                crate::gcode::PlannedMoveKind::InnerWall => {
+                    let tier = if seg.wall_index <= 1 { 1u8 } else { 2u8 };
+                    wall_grid
+                        .entry((qx, qy, qz, tier))
+                        .or_insert((t_idx, seg.width_mm.max(0.10)));
+                }
+                crate::gcode::PlannedMoveKind::SolidInfill
+                | crate::gcode::PlannedMoveKind::GapFill => {
+                    skin_grid
+                        .entry((qx, qy, qz))
+                        .or_insert((t_idx, seg.height_mm.max(0.05)));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let lookup_wall = |p: bevy::math::Vec3, tier: u8| -> Option<(usize, f32)> {
+        let (qx, qy, qz) = quant(p);
+        if let Some(&hit) = wall_grid.get(&(qx, qy, qz, tier)) {
+            return Some(hit);
+        }
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(&hit) = wall_grid.get(&(qx + dx, qy + dy, qz + dz, tier)) {
+                        return Some(hit);
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    let lookup_skin = |p: bevy::math::Vec3| -> Option<(usize, f32)> {
+        let (qx, qy, qz) = quant(p);
+        if let Some(&hit) = skin_grid.get(&(qx, qy, qz)) {
+            return Some(hit);
+        }
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                if let Some(&hit) = skin_grid.get(&(qx + dx, qy + dy, qz)) {
+                    return Some(hit);
+                }
+            }
+        }
+        None
+    };
+
+    let mut out_layers = Vec::with_capacity(planned.layers.len());
+    let mut stack_buf: Vec<(usize, f64)> = Vec::with_capacity(4);
+
+    for layer in &planned.layers {
+        let mut layer_cols = Vec::with_capacity(layer.segments.len());
+        for seg in &layer.segments {
+            if matches!(
+                seg.kind,
+                crate::gcode::PlannedMoveKind::Travel | crate::gcode::PlannedMoveKind::ZHop
+            ) {
+                layer_cols.push([0.28, 0.86, 0.98, 1.0]);
+                continue;
+            }
+            if seg.kind.is_support() {
+                layer_cols.push([0.22, 0.88, 0.62, 1.0]);
+                continue;
+            }
+            let m0 = config
+                .tool_index_for_filament_slot(seg.filament_slot)
+                .min(models.len() - 1);
+            let mid = 0.5 * (seg.p0_local + seg.p1_local);
+            let z_nozzle = (seg.nozzle_local_0 + seg.nozzle_local_1)
+                .try_normalize()
+                .unwrap_or_else(|| bevy::math::Vec3::from_array(config.machine.nozzle_axis_bed));
+
+            stack_buf.clear();
+            match seg.kind {
+                crate::gcode::PlannedMoveKind::OuterWall
+                | crate::gcode::PlannedMoveKind::ScarfSeam
+                | crate::gcode::PlannedMoveKind::WaveOverhang
+                | crate::gcode::PlannedMoveKind::Bridge => {
+                    stack_buf.push((m0, seg.width_mm.max(0.10) as f64));
+                    if let Some((m1, w1)) = lookup_wall(mid, 1) {
+                        stack_buf.push((m1, w1 as f64));
+                    }
+                    if let Some((m2, w2)) = lookup_wall(mid, 2) {
+                        stack_buf.push((m2, w2 as f64));
+                    }
+                }
+                crate::gcode::PlannedMoveKind::InnerWall => {
+                    stack_buf.push((m0, seg.width_mm.max(0.10) as f64));
+                    if seg.wall_index <= 1 {
+                        if let Some((m2, w2)) = lookup_wall(mid, 2) {
+                            stack_buf.push((m2, w2 as f64));
+                        }
+                    }
+                }
+                crate::gcode::PlannedMoveKind::SolidInfill
+                | crate::gcode::PlannedMoveKind::GapFill => {
+                    let h = seg.height_mm.max(0.05);
+                    stack_buf.push((m0, h as f64));
+                    // Step inward opposite local `nozzle_axis` (never assuming -Z, AGENTS.md Rule 1)
+                    for step in 1..=2 {
+                        let probe = mid - z_nozzle * (h * (step as f32) * 1.15);
+                        if let Some((mk, hk)) = lookup_skin(probe) {
+                            stack_buf.push((mk, hk as f64));
+                        }
+                    }
+                }
+                _ => {
+                    stack_buf.push((m0, seg.height_mm.max(0.10) as f64));
+                }
+            }
+
+            let srgb = evaluate_stack_srgb(&stack_buf, &models, backing_ref, &lighting);
+            layer_cols.push([srgb[0], srgb[1], srgb[2], 1.0]);
+        }
+        out_layers.push(layer_cols);
+    }
+
+    out_layers
 }
 
 #[cfg(test)]

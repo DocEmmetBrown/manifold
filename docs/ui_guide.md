@@ -38,19 +38,19 @@ The **Manifold Slicer** window is divided into five coordinated regions around a
 
 ### 1.1 Top Menu & Action Bar
 Located at the very top of the window, the menu bar provides one-click access to core file and plate operations:
-- **Import Geometry (`STEP / STL / 3MF`)**: Loads `.step`/`.stp` (via OpenCASCADE exact B-Rep triangulation and analytical face patch extraction), `.stl` (ASCII or binary with automatic coplanar patch clustering), or `.3mf` meshes onto the active build plate.
-- **Open / Save Project (`.3mf`)**: Loads or saves a complete Manifold project archive—including all build plates, object transforms, surface/point orientation hints, and the full `SlicerConfig`—in a single standard `.3mf` file. When you open an existing Manifold `.3mf` project, Manifold Slicer remembers its filename and uses it as the default when saving.
+- **Import Geometry (`STEP / STL / 3MF`)**: Loads `.step`/`.stp` (via OpenCASCADE exact B-Rep triangulation and analytical face patch extraction), `.stl` (ASCII or binary with automatic coplanar patch clustering), or `.3mf` meshes (including Prusa/Orca/Bambu `mmu_segmentation` multi-colour paint trees, `<basematerials>`/`<m:colorgroup>` vertex colours, and UV-mapped `<m:texture2d>` PNG textures) onto the active build plate.
+- **Open / Save Project (`.3mf`)**: Loads or saves a complete Manifold project archive—including all build plates, object transforms, surface/point orientation hints, multi-colour slot mappings, and the full `SlicerConfig`—in a single standard `.3mf` file. When you open an existing Manifold `.3mf` project, Manifold Slicer remembers its filename and uses it as the default when saving.
 - **Auto-Arrange Plate**: Runs the Archimedean spiral collision-free packer on all objects on the active build plate around the bed center `(0, 0)`.
-- **Generate Fields & Slice**: Triggers the C++ OpenVDB volumetric solver (`sdf`, `overhang`, `eikonal`), extracts non-planar conformal layers, generates 3D shell/TPMS/support toolpaths, and compiles Klipper G-code.
-- **Export G-code (`.gcode`)**: Writes the generated G-code (including Moonraker thumbnails, `[exclude_object]` polygons, and dynamic PA commands) to disk.
+- **Generate Fields & Slice**: Triggers the C++ OpenVDB volumetric solver (`sdf`, `overhang`, `eikonal`, plus multi-colour `filamentSlotGrid` and `surfaceColorGrid`), extracts non-planar conformal layers, generates 3D shell/TPMS/support toolpaths, runs optional Kubelka–Munk optical colour mixing, and compiles Klipper or RepRapFirmware G-code.
+- **Export G-code (`.gcode`) / Upload & Print (Moonraker)**: Writes the generated G-code (including Moonraker thumbnails, `[exclude_object]` polygons, multi-tool `T{id}` changes, and dynamic PA commands) to disk, or uploads directly to a configured Moonraker printer.
 - **`Calibration ▾`**: Opens the floating **Polymer Rheology & Flow Calibration Utilities** window for generating and previewing Extrusion Multiplier (Pass 1/2/3), Dual-Band Ellis $90^\circ$ Chevron Pressure Advance, and Transient Melt-Zone Pressure ($\gamma$ & $\tau_{\text{melt}}$) calibration prints for any configured toolhead (`T0`, `T1`, …). See the **[Polymer Rheology & Flow Calibration Guide (`docs/calibration_guide.md`)](calibration_guide.md)** for full instructions and visual reading examples.
 
 ### 1.2 Top Presets Bar
 Directly beneath the main menu bar sits the **Four-Category Presets Bar**:
-- **Printer Preset**: Build volume dimensions, bed shape, 5-axis bed tilt, acceleration limits, Klipper SCV/cruise ratio, and start/end G-code templates.
-- **Tool Preset**: Active nozzle diameter, 5/6-axis rotational tilt limits, XZ nozzle clearance profile, and flat-nozzle slope compensation.
-- **Filament Preset**: Hotend and bed temperatures, extrusion multipliers, cooling fan speeds, retractions, shear-thinning Pressure Advance ($k_{\text{low}}, k_{\text{high}}$), and viscoelastic die-swell multipliers.
-- **Process Preset**: Non-planar layer heights, 3D shell thickness, Arachne variable line widths, TPMS sparse infill, overhang/bridging/support thresholds, and feature print speeds.
+- **Printer Preset**: Build volume dimensions, bed shape, 3-axis vs. 5-axis `(B, C)` kinematics, G-code dialect (`Klipper` vs. `RepRapFirmware`), acceleration limits, Klipper SCV/cruise ratio, Moonraker connection settings, and start/end G-code templates.
+- **Tool Preset**: Active nozzle diameter, 5/6-axis rotational tilt limits, XZ/cone nozzle clearance profile, toolchange hop/approach behavior, and flat-nozzle slope compensation.
+- **Filament Preset**: Per-tool hotend and bed temperatures, filament colour (`#RRGGBB`, CSS `rgb(...)`, or colour name), Kubelka–Munk **Transmission Distance (`TD` in mm)**, extrusion multipliers, cooling fan speeds, retractions, shear-thinning Pressure Advance ($k_{\text{low}}, k_{\text{high}}$), and viscoelastic die-swell multipliers (including built-in calibrated CMYKW presets: `Cyan (CMYKW)`, `Magenta (CMYKW)`, `Yellow (CMYKW)`, `Black (CMYKW)`, and `Jade White (CMYKW)`).
+- **Process Preset**: Non-planar layer heights, 3D shell thickness, Arachne variable line widths, **Optical Colour Approximation (`slicing.color_mixing.*`, including `0.16mm CMYKW Full-Colour Optical Mixing`)**, TPMS sparse infill, overhang/bridging/support thresholds, and feature print speeds.
 
 Each category includes a dropdown selector (listing built-in factory presets and your user-saved presets), a **Save…** button to store your current tuning as a reusable preset in `~/.config/manifold2/presets/`, and a **Delete** button for custom presets.
 
@@ -121,35 +121,51 @@ Enabling **Show Nozzle Clearance & Gravity Gizmo** renders:
 Every parameter row in the Right Panel includes a compact **`?` help button**. Clicking `?` opens a rich popover displaying the parameter's canonical dotted key (for CLI/JSON use), physical units, default value, summary, and detailed tuning guidance.
 
 ### 4.1 View & Inspection Panel
-Once fields or toolpaths have been generated, the **View & Inspection** section provides three inspection modes:
+Once fields or toolpaths have been generated, the **View & Inspection** section provides rich 3D inspection, rendering quality, and optical preview controls:
 
-1. **Toolpath Preview & Combined Legend / Toggles**:
-   - **Interactive Layer Range Sliders (`Min Layer .. Max Layer`)**: Scrub through individual non-planar layers or inspect a range of layers from build plate to top skin.
-   - **Wrapping Color-Swatch Feature Toggles**: A responsive wrapping flexbox of pill buttons that combines the **color legend** and **visibility toggles** in a single control so the right panel stays compact:
-     - **Outer Wall** (Orange-Red)
-     - **Inner Wall** (Gold/Amber)
-     - **Solid Infill** (Purple)
-     - **Sparse Infill** (Red/Crimson)
-     - **Gap Fill** (White/Silver)
-     - **Bridge** (Sky Blue)
-     - **Wave Overhang** (Deep Royal Blue)
-     - **Support Base** (Emerald Green)
-     - **Support Interface** (Mint/Cyan-Green)
-     - **Travel Moves** (Teal, off by default)
-     - **3D Scarf Seams** (Magenta/Cyan ramp markers)
-   - Quick **`All On`** and **`Walls Only`** filter buttons let you isolate perimeter quality or inspect internal TPMS lattices in one click.
+1. **CAD & Scene Display**:
+   - **Object Surface Color Mode**: Switch the 3D CAD surface visualization between **Default CAD Material** (displaying true multi-colour 3MF slots, vertex colours, or UV PNG textures with polymer clearcoat), **Overhang vs. Gravity (°)**, **Tool Angle from Surface Normal (°)**, and **Unreachable / Support Needed (%)**.
+   - **Solid Opacity Slider**: Fade the reference CAD shell (`0.0..=1.0`) to inspect internal conformal layers, VDB cross-sections, or multi-colour toolpath stacks without Z-fighting.
+   - **High-Quality PBR Shading, Clearcoat & Soft Shadows**: Toggles studio-lit Bevy PBR polymer shading, clearcoat specular highlights, and cascaded soft directional shadows across the viewport.
 
-2. **Conformal Isosurface Mesh Preview**:
-   - Toggle visibility of the extracted non-planar triangle meshes ($\tau(\mathbf{x}) = \tau_k$) before or alongside the 3D toolpaths to inspect how layers curve over domes, cantilevers, and multi-branch saddles.
+2. **Toolpath Preview, Colour Modes & Feature Toggles**:
+   - **Interactive Layer Range & Within-Layer Move Scrubbing**: Scrub through non-planar layers (`Min Layer .. Max Layer`) and step move-by-move within the active layer to inspect the instantaneous 3D `NozzleFrame`, 5-axis `(B, C)` rotary posture, and gravity vector $\hat{\mathbf{g}}_{\text{bed}}$.
+   - **Toolpath Color Mode (`Color By`)**:
+     - **Feature Type**: Classic feature palette (`Outer Wall`, `Inner Wall`, `Solid Infill`, `Sparse Infill`, `Gap Fill`, `Bridge`, `Wave Overhang`, `Support Base`, `Support Interface`, `Travel`, `3D Scarf Seams`).
+     - **Tool / Filament Colour**: Colours every extruded bead by its assigned machine tool (`T0`, `T1`, …) or imported 3MF filament slot colour, displaying per-tool filament swatches and `TD` values in the legend.
+     - **Simulated Print Appearance (Kubelka–Munk Optical Stack)**: Evaluates the local multi-layer Redheffer optical stack (`Front-Lit` reflectance or `Back-Lit Lithophane` transmittance) across outer walls, inner walls, and core backing so you can preview blended CMYKW hues directly on the 3D toolpath.
+     - **Kinematic & Rheology Channels**: `Line Width W (mm)`, `Layer Height H (mm)`, `Planned Speed v (mm/s)`, `Acceleration a (mm/s²)`, `Actual Volumetric Flow Q (mm³/s)`, `Flow Multiplier M`, `Dynamic Pressure Advance k_PA (s)`, `Melt-Zone Pressure P_melt`, `Angle: Tool vs. Isosurface Normal (°)`, and `Tool Orientation Source`.
+   - **Extrusion Render Quality & TD-Matched Transparency**:
+     - **`Fast` vs. `High-Quality PBR` Pill Tabs**:
+       - **`Fast`**: Lightweight 4-sided diamond tubes merged into a single mesh for maximum interactive frame rate on massive toolpaths.
+       - **`High-Quality PBR`**: 12-vertex pressed-stadium (capsule) beads oriented in the local `NozzleFrame` (flat nozzle-ironed top/bottom lands + semicircular lateral menisci + circular free-air bridges), welded seamlessly across continuous chains with convex 3D bullnose endcaps and polymer-specific PBR `clearcoat` / roughness.
+     - **`TD-Based Filament Opacity`**: Sets each filament's viewport translucency directly from its physical Kubelka–Munk **Transmission Distance (`TD`)** and local bead thickness $d$ via exact additive Beer–Lambert hiding opacity $\alpha(d, \text{TD}) = 1 - (0.08)^{d/\text{TD}}$, so thin outer CMY layers physically reveal underlying White/coloured inner walls without screen-space noise or flicker.
+     - **`Opacity Scale (× TD)` (`0.10× .. 1.50×`, `1.0×` reset)**: Physically matched at `1.0×` (`92%` hiding contrast at thickness `d = TD`). Lower values increase x-ray visibility into deeper shell walls during inspection.
+     - **`Lithophane Backlight`**: Boosts warm rear transillumination from `ViewportRimBackLight` and switches optical composite previews to rear-lit lithophane transmittance.
+     - **`Soft Shadows`**: Enables 4-cascade millimeter-calibrated directional soft shadows across extruded beads and the build plate.
+   - **Wrapping Feature Visibility Toggles**: Pill buttons (`Outer Wall`, `Inner Wall`, `Solid Infill`, `Sparse Infill`, `Gap Fill`, `Bridge`, `Wave Overhang`, `Support`, `Support Interface`, `Travel`, `Scarf`) plus one-click **`All On`** and **`Walls Only`** filters.
 
-3. **OpenVDB Volumetric Field Cross-Sections & 3D Vector Arrows**:
-   - Select any OpenVDB grid (`sdf`, `overhang`, `eikonal`) to view a color-mapped cross-section slice plane (`X`, `Y`, or `Z` axis with interactive position slider).
-   - Enable **3D Field Vector Arrows** to inspect the SDF surface normal $\nabla\phi_{\text{sdf}}$, the constrained Eikonal layer normal $\nabla\tau / \|\nabla\tau\|$, or the 5/6-axis tool orientation vector $\hat{\mathbf{z}}_{\text{nozzle}}(\mathbf{x})$ across space.
+3. **Conformal Isosurface Mesh Preview (`Non-Planar Layers (τ_k) Inspector`)**:
+   - Toggle visibility of the extracted non-planar triangle meshes ($\tau(\mathbf{x}) = \tau_k$) colored by local layer thickness $\Delta h$, Reeb-graph branch ID, or alternating bands.
 
-### 4.2 Collapsible Configuration Sections
-Beneath **View & Inspection**, all profile variables are organized into collapsible sections matching the preset hierarchy:
-- **Print Bed & Auto-Arrangement**: Bed shape, $X/Y/Z$ dimensions, grid spacing, G-code origin placement, part clearance, and bed edge margin.
-- **Machine Tools & 5/6-Axis Kinematics**: Multi-tool selector (`Add Tool`, `Remove Tool`), nozzle diameter, hotend temperature, rotational axis toggle, maximum tilt angle, 3D tool clearance envelope mode (`Piecewise XZ`, `Circular Cone`, or `Rectilinear Cone (XY)`), and 5-axis bed tilt (`Rx`, `Ry`).
-- **Volumetric Fields & Eikonal Solver**: Order field mode (`Constrained Non-Planar` vs. `Height-Only Planar`), auto fine voxel size toggle, Dual-Grid multi-resolution settings, solver iterations, curvature regularization, automatic overhang conformal/orthogonal surface bias, and a live list of all placed surface/point orientation hints (`⊥`, `∥`, and `Skin`).
-- **Non-Planar Layer Slicing & Shells**: Variable layer height (`Target`, `Min`, `Max`, `First Layer`, `Top Layer`), max non-planar slope, **Auto Conformal SDF Top Skin** (`Skin Layers`, `Min Oblique`, `Max Slope`), 3D shell thickness, inner wall count, Arachne variable line widths (`Target`, `Min`, `Max`), solid/sparse infill patterns (`Gyroid`, `Schwarz-D`, `Schwarz-P`, `Cubic`, `Monotonic`, `Concentric`, `All Walls`) with automatic rib-anchored solid-over-sparse infill, circular bridging, wave overhangs, and causal supports (`Columnar Grid` vs. obstacle-avoiding `Non-Planar Tree` supports and dedicated `Support Tool` selection).
-- **G-code, Speeds, Seams & Rheology**: Wall print order (`In-Out-In` vs. `Outside-In`), Klipper `EXCLUDE_OBJECT` and Moonraker thumbnail toggles, feature speeds and accelerations, automatic lever-arm & curled-corner slowdown (`enable_lever_arm_slowdown`, `lever_arm_reference_ratio`, `lever_arm_min_speed_fraction`), Klipper SCV/cruise ratio, stepper back-EMF dynamics, automatic first-layer brim (`enable_auto_brim`, `brim_width_mm`, `brim_gap_mm`), 3D scarf joints, retractions/wipes, thermal ooze relaxation, flat-nozzle slope clearance, shear-thinning Pressure Advance ($k_{\text{low}}, k_{\text{high}}$), viscoelastic die-swell multipliers, corner flow compensation, transient melt-chamber pressure lag, static and dynamic volumetric/airflow-residence cooling fan speeds (`enable_dynamic_fan_speed`, `min_fan_speed_percent`, `max_fan_speed_percent`, `target_layer_cooling_time_s`), and Start/End G-code templates.
+4. **OpenVDB Volumetric Field Cross-Sections & 3D Vector Arrows**:
+   - Select any OpenVDB grid (`sdf`, `overhang`, `eikonal`, `support_needed`) to view a color-mapped cross-section slice plane (`X`, `Y`, or `Z` axis with interactive offset slider and iso-contour lines).
+   - Enable **3D Field Vector Arrows** to inspect $\nabla\phi_{\text{sdf}}$, the constrained Eikonal layer normal $\nabla\tau / \|\nabla\tau\|$, or the 5/6-axis tool orientation vector $\hat{\mathbf{z}}_{\text{nozzle}}(\mathbf{x})$ across space.
+
+### 4.2 Multi-Colour, Optical Mixing & Collapsible Configuration Sections
+Beneath **View & Inspection** (and in the **Project Setup** & **Configuration** tabs), profile variables are organized into focused sections:
+- **3MF Colour / Filament → Tool Mapping**:
+  - Automatically populated whenever a multi-colour `.3mf` is imported (or editable manually via **`+ Add Filament Slot`**).
+  - Map each 3MF filament slot to any machine tool (`T0`, `T1`, …), edit its colour swatch (`#RRGGBB`, `rgb(...)`, or colour name) and polymer type (`PLA`, `PETG`, `ABS`, `ASA`, `TPU`, `PVA`, `PA-CF`), or click **`Auto-Create 1:1 Tools (T0..Tn)`** to create one toolhead per imported filament slot automatically.
+- **Machine Tools, Per-Tool Filaments & Transmission Distance (`TD`)**:
+  - Configure multiple extrusion toolheads (`Add Tool`, `Remove Tool`), nozzle diameter, hotend temperature, per-tool filament colour swatch & encoding box, and **Transmission Distance (`TD` in mm)** (`Auto TD` estimates a material/pigment default around the `2.5 mm` opaque baseline, or uncheck `Auto TD` to enter a calibrated HueForge `TD` from `0.1` to `30.0 mm`).
+  - Select each tool's rotational axis capability, 3D tool clearance envelope (`Piecewise XZ`, `Circular Cone`, or `Rectilinear Cone (XY)`), and 3-axis vs. 5-axis `(B, C)` machine kinematics.
+- **Optical Colour Approximation (CMYKW & Arbitrary Filaments)**:
+  - Located in the **Process** configuration tab (and quick-setup bar):
+  - **One-Click Palette Setup**: **`Setup PLA CMYKW (5 Tools)`** (`Cyan`, `Magenta`, `Yellow`, `Black`, `Jade White` with calibrated `TD`s) and **`Setup Translucent CMYKW`** (high-`TD` translucent `PETG` palette for thick walls and backlit colour lithophanes) automatically populate `T0..T4`, enable optical colour mixing, ensure sufficient inner walls, and switch the viewport to `High-Quality PBR`.
+  - **Viewing Illumination (`Lighting Mode`)**: Choose **`Front-Lit 3D Object (Reflectance)`** (stacks translucent outer shells over an opaque White/neutral core backing), **`Back-Lit Lithophane (Transmittance)`** (open rear transillumination with no opaque backing), or **`Mixed Ambient + Back-Lit`**.
+  - **Mixing Controls**: Toggle **`Adjacent-Layer Blending`** (3D footpoint spatial dithering across consecutive layers), **`Short Extrusions Along Path`** with configurable **`Min Segment Length (mm)`** (Oklab error-diffused colour segments along perimeters), **`Optical Shell Slabs (1..6)`**, **`Core Backing Tool`** (`Auto (Brightest / White)` or explicit `T0..Tn`), **`Oklab Dither Strength`**, and **`Tool-Switch Hysteresis`**.
+- **Print Bed & Auto-Arrangement**: Bed shape, $X/Y/Z$ dimensions, grid spacing, G-code origin placement, Moonraker network connection, part clearance, and bed edge margin.
+- **Volumetric Fields & Eikonal Solver**: Order field mode (`Constrained Non-Planar` vs. `Height-Only Planar`), auto fine voxel size toggle, Dual-Grid multi-resolution settings, solver iterations, curvature regularization, automatic overhang conformal/orthogonal surface bias, and placed surface/point orientation hints (`⊥`, `∥`, and `Skin`).
+- **Non-Planar Layer Slicing & Shells**: Variable layer height (`Target`, `Min`, `Max`, `First Layer`, `Top Layer`), max non-planar slope, **Auto Conformal SDF Top Skin** (`Skin Layers`, `Min Oblique`, `Max Slope`), 3D shell thickness, inner wall count, Arachne variable line widths, solid/sparse infill patterns (`Gyroid`, `Schwarz-D`, `Schwarz-P`, `Cubic`, `Monotonic`, `Concentric`, `All Walls`), circular bridging, wave overhangs, and causal supports (`Columnar Grid` vs. `Non-Planar Tree` supports and dedicated `Support Tool`).
+- **G-code, Speeds, Toolchanges, Seams & Rheology**: Firmware dialect (`Klipper` vs. `RepRapFirmware`), wall print order (`In-Out-In` vs. `Outside-In`), Klipper `EXCLUDE_OBJECT` and Moonraker thumbnail toggles, multi-tool change timing and obstacle-aware clearance hops (`tool_change_time_s`, `tool_change_hop_before`, `tool_change_approach_after`), feature speeds and accelerations, automatic lever-arm & curled-corner slowdown, Klipper SCV/cruise ratio, stepper back-EMF dynamics, automatic first-layer brim, 3D scarf joints, retractions/wipes, thermal ooze relaxation, flat-nozzle slope clearance, per-tool shear-thinning Pressure Advance ($k_{\text{low}}, k_{\text{high}}$), viscoelastic die-swell multipliers, corner flow compensation, transient melt-chamber pressure lag, dynamic volumetric/airflow-residence cooling fan speeds, and Start/End G-code templates.

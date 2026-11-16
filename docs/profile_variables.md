@@ -6,26 +6,28 @@ This document provides a complete reference for every configuration variable in 
 
 ## 1. Profile Architecture & Preset Categories
 
-A complete Manifold Slicer configuration (`SlicerConfig`) is organized into seven logical sub-tables plus active tool/preset metadata:
+A complete Manifold Slicer configuration (`SlicerConfig`) is organized into eight logical sub-tables plus active tool, multi-colour 3MF slot, and preset metadata:
 
 | Top-Level Section | Rust Struct | Primary Role |
 | :--- | :--- | :--- |
 | `bed` | `PrintBedConfig` | Build plate shape, X/Y/Z build volume dimensions, and viewport grid spacing |
-| `machine` | `MachineKinematicsConfig` | 5/6-axis nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$, bed-coordinate gravity $\hat{\mathbf{g}}_{\text{bed}}$, and 5-axis bed tilt (`Rx`, `Ry`) |
-| `tools` | `Vec<ToolConfig>` | Multi-tool registry: nozzle diameter, hotend temperature, rotational limits, and XZ clearance profile in the nozzle frame |
+| `machine` | `MachineKinematicsConfig` | 5/6-axis nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$, 5-axis `(B, C)` IK/FK, bed-coordinate gravity $\hat{\mathbf{g}}_{\text{bed}}$, and bed tilt (`Rx`, `Ry`) |
+| `tools` | `Vec<ToolConfig>` | Multi-tool registry: nozzle diameter, hotend temperature, filament colour & `TD`, per-tool rheology/cooling, rotational limits, and 3D clearance profile |
+| `filament_slots` | `Vec<ThreeMfFilamentSlot>` | Multi-colour / multi-filament slots imported from `.3mf` projects and their mapping to machine tools (`tools.<N>`) |
 | `arrangement` | `ArrangementConfig` | Archimedean spiral auto-arrangement part clearance and bed edge margins |
 | `eikonal` | `EikonalFieldConfig` | OpenVDB Dual-Grid resolution, constrained Eikonal solver parameters, overhang bias, and orientation hints |
-| `slicing` | `SlicingProcessConfig` | Variable non-planar layer heights, 3D shell thickness, Arachne line widths, TPMS infill, bridging, wave overhangs, and supports |
-| `gcode` | `GcodeProcessConfig` | Feedrates, accelerations, Klipper lookahead, 3D scarf seams, retractions, shear-thinning PA, die swell, cooling, and G-code templates |
+| `slicing` | `SlicingProcessConfig` | Variable non-planar layer heights, 3D shell thickness, Arachne line widths, **Kubelka–Munk optical colour mixing (`color_mixing.*`)**, TPMS infill, bridging, wave overhangs, and supports |
+| `gcode` | `GcodeProcessConfig` | Firmware dialect (`Klipper` / `RepRapFirmware`), feedrates, accelerations, lookahead, multi-tool change hops, 3D scarf seams, retractions, shear-thinning PA, die swell, cooling, and G-code templates |
+| `network` | `MoonrakerNetworkConfig` | Moonraker HTTP/HTTPS upload, API key, mTLS certificates, and background printer status polling |
 
 ### Four Orthogonal Preset Categories
 
 In both the GUI and the CLI (`--printer`, `--tool`, `--filament`, `--process`), variables are grouped into four independent preset categories that can be mixed and matched without overwriting unrelated settings:
 
-1. **Printer Preset (`printer`)**: `bed.*`, `machine.bed_tilt_*`, `gcode.gcode_origin_at_bed_center`, `gcode.emit_exclude_object`, `gcode.emit_thumbnails`, `gcode.outer_wall_accel_mms2`, `gcode.inner_wall_accel_mms2`, `gcode.infill_accel_mms2`, `gcode.travel_accel_mms2`, `gcode.square_corner_velocity_mms`, `gcode.minimum_cruise_ratio`, `gcode.use_stepper_dynamics`, `gcode.max_stepper_speed_mms`, `gcode.z_travel_penalty`, `gcode.travel_speed_mms`, `gcode.z_hop_speed_mms`, `gcode.start_gcode_template`, `gcode.end_gcode_template`.
-2. **Tool Preset (`tool`)**: Active tool entry (`tools.<active>.*`): `nozzle_diameter_mm`, `has_rotational_axes`, `max_angle_from_bed_normal_deg`, `clearance_profile_xz`, plus `gcode.enable_flat_nozzle_comp`.
-3. **Filament Preset (`filament`)**: Active tool's `temperature_celsius` (`nozzle_temperature_celsius`) and material/rheology settings in `gcode.*`: `filament_type`, `filament_diameter_mm`, `filament_density_g_cm3`, `bed_temperature_celsius`, `extrusion_multiplier`, `first_layer_flow_multiplier`, `bridge_flow_multiplier`, `wave_overhang_flow_multiplier`, `max_volumetric_flow_mm3s`, `retract_length_mm`, `retract_speed_mms`, `min_travel_for_retract_mm`, `z_hop_mm`, `wipe_length_mm`, `pre_retract_taper_mm`, `ooze_relaxation_extra_prime_mm`, `ooze_relaxation_tau_s`, `enable_dynamic_pa`, `enable_slicer_pa_subdivision`, `pa_low_flow_s`, `pa_high_flow_s`, `pa_ref_low_flow_mm3s`, `pa_ref_high_flow_mm3s`, `swell_low`, `swell_high`, `enable_corner_flow_comp`, `corner_flow_comp_ratio`, `enable_transient_pressure_comp`, `transient_pressure_exponent`, `transient_pressure_tau_s`, `transient_min_flow_multiplier`, `fan_speed_percent`, `first_layer_fan_speed_percent`, `disable_fan_first_layers`, `bridge_fan_speed_percent`, `wave_overhang_fan_speed_percent`, `enable_dynamic_fan_speed`, `min_fan_speed_percent`, `max_fan_speed_percent`, `target_layer_cooling_time_s`.
-4. **Process Preset (`process`)**: All `slicing.*` parameters, `eikonal.*` solver parameters (preserving user-placed `surface_hints` and `point_hints`), `arrangement.*` clearances, and feature speeds/seam/brim/lever-arm settings in `gcode.*` (`wall_print_order`, `first_layer_speed_mms`, `outer_wall_speed_mms`, `inner_wall_speed_mms`, `solid_infill_speed_mms`, `sparse_infill_speed_mms`, `gap_fill_speed_mms`, `bridge_speed_mms`, `wave_overhang_speed_mms`, `support_speed_mms`, `support_interface_speed_mms`, `enable_scarf_joint`, `scarf_length_mm`, `scarf_start_height_ratio`, `seam_gap_mm`, `enable_auto_brim`, `brim_width_mm`, `brim_gap_mm`, `enable_lever_arm_slowdown`, `lever_arm_reference_ratio`, `lever_arm_min_speed_fraction`).
+1. **Printer Preset (`printer`)**: `bed.*`, `machine.*`, `network.*`, `gcode.gcode_dialect`, `gcode.gcode_origin_at_bed_center`, `gcode.emit_exclude_object`, `gcode.emit_thumbnails`, `gcode.outer_wall_accel_mms2`, `gcode.inner_wall_accel_mms2`, `gcode.infill_accel_mms2`, `gcode.travel_accel_mms2`, `gcode.square_corner_velocity_mms`, `gcode.minimum_cruise_ratio`, `gcode.use_stepper_dynamics`, `gcode.max_stepper_speed_mms`, `gcode.z_travel_penalty`, `gcode.travel_speed_mms`, `gcode.z_hop_speed_mms`, `gcode.start_gcode_template`, `gcode.end_gcode_template`.
+2. **Tool Preset (`tool`)**: Active tool entry (`tools.<active>.*`): `nozzle_diameter_mm`, `has_rotational_axes`, `max_angle_from_bed_normal_deg`, `clearance_mode`, `clearance_profile_xz`, `cone_*`, `rect_*`, plus extruder/toolchange settings in `gcode.*` (`enable_flat_nozzle_comp`, `max_volumetric_flow_mm3s`, `retract_*`, `z_hop_mm`, `wipe_length_mm`, `pre_retract_taper_mm`, `tool_change_time_s`, `tool_change_hop_before`, `tool_change_approach_after`).
+3. **Filament Preset (`filament`)**: Active tool's `temperature_celsius` (`nozzle_temperature_celsius`), `filament_color_hex`, `transmission_distance_mm`, and material/rheology settings in `gcode.*`: `filament_type`, `filament_diameter_mm`, `filament_density_g_cm3`, `bed_temperature_celsius`, `extrusion_multiplier`, `first_layer_flow_multiplier`, `bridge_flow_multiplier`, `wave_overhang_flow_multiplier`, `ooze_relaxation_extra_prime_mm`, `ooze_relaxation_tau_s`, `enable_dynamic_pa`, `enable_slicer_pa_subdivision`, `pa_low_flow_s`, `pa_high_flow_s`, `pa_ref_low_flow_mm3s`, `pa_ref_high_flow_mm3s`, `swell_low`, `swell_high`, `enable_corner_flow_comp`, `corner_flow_comp_ratio`, `enable_transient_pressure_comp`, `transient_pressure_exponent`, `transient_pressure_tau_s`, `transient_min_flow_multiplier`, `fan_speed_percent`, `first_layer_fan_speed_percent`, `disable_fan_first_layers`, `bridge_fan_speed_percent`, `wave_overhang_fan_speed_percent`, `enable_dynamic_fan_speed`, `min_fan_speed_percent`, `max_fan_speed_percent`, `target_layer_cooling_time_s`. Built-in filament presets include calibrated CMYKW optical entries (`Cyan (CMYKW)`, `Magenta (CMYKW)`, `Yellow (CMYKW)`, `Black (CMYKW)`, `Jade White (CMYKW)`).
+4. **Process Preset (`process`)**: All `slicing.*` parameters (including `slicing.color_mixing.*` and built-in `"0.16mm CMYKW Full-Colour Optical Mixing"`), `eikonal.*` solver parameters (preserving user-placed `surface_hints` and `point_hints`), `arrangement.*` clearances, and feature speeds/seam/brim/lever-arm settings in `gcode.*` (`wall_print_order`, `first_layer_speed_mms`, `outer_wall_speed_mms`, `inner_wall_speed_mms`, `solid_infill_speed_mms`, `sparse_infill_speed_mms`, `gap_fill_speed_mms`, `bridge_speed_mms`, `wave_overhang_speed_mms`, `support_speed_mms`, `support_interface_speed_mms`, `enable_scarf_joint`, `scarf_length_mm`, `scarf_start_height_ratio`, `seam_gap_mm`, `enable_auto_brim`, `brim_width_mm`, `brim_gap_mm`, `enable_lever_arm_slowdown`, `lever_arm_reference_ratio`, `lever_arm_min_speed_fraction`).
 
 ### Key Resolution & Shorthand Aliases
 
@@ -74,19 +76,29 @@ Manifold Slicer never hardcodes `+Z` as the nozzle axis or `-Z` as gravity. All 
 
 ---
 
-## 4. Multi-Tool Registry & Nozzle Clearance (`tools.*` & `active_tool_index`)
+## 4. Multi-Tool Registry, Per-Tool Filament Optics & 3MF Slot Mapping (`tools.*`, `filament_slots.*`)
 
-Manifold Slicer supports machines with multiple extrusion toolheads (`tools.0`, `tools.1`, ...). By default, two tools are configured:
-- `tools.0`: `"T0 - 0.4mm Standard"` ($0.40\text{ mm}$, $215\,^\circ\text{C}$)
-- `tools.1`: `"T1 - 0.6mm High-Flow"` ($0.60\text{ mm}$, $230\,^\circ\text{C}$)
+Manifold Slicer supports machines with multiple extrusion toolheads (`tools.0`, `tools.1`, ...), where each tool carries its own physical nozzle geometry, assigned filament colour, Kubelka–Munk **Transmission Distance (`TD`)**, and per-tool cooling/rheology overrides (`ToolConfig::effective_gcode_config`). By default, two tools are configured:
+- `tools.0`: `"T0 - 0.4mm Standard"` ($0.40\text{ mm}$, $215\,^\circ\text{C}$, `#2298FA`)
+- `tools.1`: `"T1 - 0.6mm High-Flow"` ($0.60\text{ mm}$, $230\,^\circ\text{C}$, `#F87028`)
 
 | Canonical Key | Type / Allowed Values | Default (`tools.0`) | Preset | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `active_tool_index` | `usize` | `0` | Top-Level | 0-based index into `tools` selecting the active toolhead used for slicing, auto-voxel sizing, and G-code emission. |
+| `active_tool_index` | `usize` | `0` | Top-Level | 0-based index into `tools` selecting the active toolhead used for slicing, auto-voxel sizing, and single-material G-code emission. |
 | `tools.<N>.id` | `u32` | `0` | Tool | Numeric tool identifier substituted into `{tool_id}` (`T0`, `T1`, ...) in G-code commands. |
 | `tools.<N>.name` | `String` | `"T0 - 0.4mm Standard"` | Tool | Human-readable tool label displayed in the UI tool selector. |
 | `tools.<N>.nozzle_diameter_mm` | `f32` (mm, `>= 0.10`) | `0.40` | Tool | Orifice diameter $d_{\text{nozzle}}$ of the nozzle tip. Scales the auto fine voxel size, flat-nozzle land radius ($R_{\text{flat}} = d_{\text{nozzle}}$), and circular bridge cross-sectional area $\pi (d_{\text{nozzle}}/2)^2$. |
-| `tools.<N>.temperature_celsius` | `f32` (°C) | `215.0` | Filament / Tool | Target hotend extrusion temperature substituted into `{nozzle_temp}` (`M104`/`M109`) and Moonraker header metadata. |
+| `tools.<N>.temperature_celsius` | `f32` (°C) | `215.0` | Filament / Tool | Target hotend extrusion temperature substituted into `{nozzle_temp}` (`M104`/`M109` or RRF `M568`) and Moonraker header metadata. |
+| `tools.<N>.filament_type` | `String` | `"PLA"` | Filament | Polymer family loaded in this tool (e.g. `"PLA"`, `"PETG"`, `"ABS"`, `"ASA"`, `"TPU"`, `"PVA"`, `"PA-CF"`). Drives both per-tool G-code material overrides and `HighQualityPbr` polymer surface roughness/clearcoat. |
+| `tools.<N>.filament_preset_name` | `String` | `"Generic PLA"` | Filament | Name of the filament preset assigned to this tool. |
+| `tools.<N>.filament_color_hex` | `String` (`"#RRGGBB"`, `"#RRGGBBAA"`, `"rgb(...)"`, or CSS name) | `"#2298FA"` | Filament | Opaque filament colour encoding used for Kubelka–Munk optical colour mixing ($R_\infty$), `ByToolOrFilament` / `HighQualityPbr` viewport rendering, and Moonraker metadata. |
+| `tools.<N>.filament_color_srgba` | `[f32; 4]` (`0.0..=1.0`) | `[0.133, 0.596, 0.980, 1.0]` | Filament | Parsed sRGBA `[r, g, b, a]` companion array synchronized with `filament_color_hex`. |
+| `tools.<N>.transmission_distance_mm` | `Option<f32>` (`null` = Auto, or `0.1..=30.0` mm) | `null` (`~2.5 mm` opaque baseline) | Filament | Physical Kubelka–Munk / HueForge **Transmission Distance (`TD` in mm)** (~92% hiding contrast / 8% passband transmittance at thickness $d = \text{TD}$). Controls both optical colour mixing (`color_optics.rs`) and `TD-Based Filament Opacity` ($\alpha(d, \text{TD}) = 1 - (0.08)^{d/\text{TD}}$) in `HighQualityPbr` mode. When `null`, estimated automatically from polymer type and lightness via `estimate_default_td_mm`. |
+| `tools.<N>.filament_density_g_cm3` | `f32` (g/cm³) | `1.24` | Filament | Per-tool bulk filament density used for multi-tool mass estimation. |
+| `tools.<N>.extrusion_multiplier` | `f32` (`0.2..=2.0`) | `1.00` | Filament | Per-tool volumetric extrusion flow multiplier applied whenever tool `N` is active. |
+| `tools.<N>.fan_speed_percent` / `min_fan_speed_percent` / `max_fan_speed_percent` / `bridge_fan_speed_percent` / `wave_overhang_fan_speed_percent` | `f32` (`0.0..=100.0` %) | `100` / `20` / `100` / `100` / `100` | Filament | Per-tool part cooling fan schedule applied automatically after toolchanges (`T{id}`). |
+| `tools.<N>.pa_low_flow_s` / `pa_high_flow_s` | `f32` (`0.0..=0.5` s) | `0.042` / `0.024` | Filament | Per-tool calibrated low-flow and high-flow shear-thinning Pressure Advance constants. |
+| `tools.<N>.swell_low` / `swell_high` | `f32` (`1.0..=2.0`) | `1.03` / `1.10` | Filament | Per-tool viscoelastic die-swell ratios at $Q_{\text{low}}$ and $Q_{\text{high}}$. |
 | `tools.<N>.has_rotational_axes` | `bool` | `true` | Tool | Indicates whether the toolhead has 5/6-axis rotational degrees of freedom allowing it to tilt $\hat{\mathbf{z}}_{\text{nozzle}}$ away from the bed normal. |
 | `tools.<N>.max_angle_from_bed_normal_deg` | `f32` (deg, `0.0..=180.0`) | `45.0` | Tool | Maximum angle $\theta_{\text{max,tool}}$ that the toolhead axis $\hat{\mathbf{z}}_{\text{nozzle}}$ may tilt away from the bed normal $+Z_{\text{bed}}$. On a 3-axis gantry (`has_rotational_axes = false`), effective tool tilt is $0^\circ$; on a 6-axis robot arm, this can be set up to $90^\circ+$. |
 | `tools.<N>.clearance_mode` | `"PiecewiseXZ"` \| `"ParametricCone"` \| `"RectilinearCone"` | `"PiecewiseXZ"` | Tool | Selects the tool clearance envelope mode in the local nozzle frame $(\hat{\mathbf{x}}_{\text{nozzle}}, \hat{\mathbf{y}}_{\text{nozzle}}, \hat{\mathbf{z}}_{\text{nozzle}})$: `PiecewiseXZ` (multi-point revolved `(X_radius, Z_height)` table), `ParametricCone` (straight-sided circular cone), or `RectilinearCone` (4-sided rectangular pyramid with independent X and Y half-widths and cone angles). |
@@ -99,6 +111,19 @@ Manifold Slicer supports machines with multiple extrusion toolheads (`tools.0`, 
 | `tools.<N>.rect_half_angle_x_deg` | `f32` (deg, `5.0..=80.0`) | `35.0` | Tool | Rectilinear pyramid half-angle $\theta_X$ in the local $XZ$ plane measured from $\hat{\mathbf{z}}_{\text{nozzle}}$ ($\alpha_{\max,X} = 90^\circ - \theta_X$) when `clearance_mode = "RectilinearCone"`. |
 | `tools.<N>.rect_half_angle_y_deg` | `f32` (deg, `5.0..=80.0`) | `25.0` | Tool | Rectilinear pyramid half-angle $\theta_Y$ in the local $YZ$ plane measured from $\hat{\mathbf{z}}_{\text{nozzle}}$ ($\alpha_{\max,Y} = 90^\circ - \theta_Y$) when `clearance_mode = "RectilinearCone"`. |
 | `tools.<N>.rect_height_mm` | `f32` (mm, `>= 2.0`) | `45.0` | Tool | Axial height of the 4-sided rectilinear pyramid cone along $\hat{\mathbf{z}}_{\text{nozzle}}$ when `clearance_mode = "RectilinearCone"`. |
+
+### 4.1 3MF Multi-Colour Slot Mapping (`filament_slots.*`)
+
+When importing multi-colour `.3mf` files (from PrusaSlicer, OrcaSlicer, Bambu Studio, or Manifold Slicer), each project filament slot is stored as a `ThreeMfFilamentSlot`:
+
+| Canonical Key | Type / Allowed Values | Default | Preset | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `filament_slots.<S>.slot_index` | `u32` | `S` (`0`-based) | Project (`.3mf`) | Zero-based slot index (`0` corresponds to Extruder/Filament `#1` in PrusaSlicer/OrcaSlicer/Bambu `.3mf` metadata). |
+| `filament_slots.<S>.name` | `String` | `"Filament #1 (PLA)"` | Project (`.3mf`) | Human-readable label for the imported colour/filament slot. |
+| `filament_slots.<S>.filament_type` | `String` | `"PLA"` | Project (`.3mf`) | Polymer material type parsed from the `.3mf` metadata. |
+| `filament_slots.<S>.color_hex` | `String` | `"#25CC0F"` | Project (`.3mf`) | Hex colour string parsed from the `.3mf` archive (`#RRGGBB` / `#RRGGBBAA`). Used as the target surface colour for discrete slot painting or optical colour approximation when per-triangle RGBA is absent. |
+| `filament_slots.<S>.color_srgba` | `[f32; 4]` (`0.0..=1.0`) | `[0.145, 0.800, 0.059, 1.0]` | Project (`.3mf`) | Linearized/display sRGBA companion array for `color_hex`. |
+| `filament_slots.<S>.tool_index` | `usize` (`0..tools.len()`) | `S.min(tools.len()-1)` | Project (`.3mf`) | Mapped machine tool index in `SlicerConfig::tools` used when discrete multi-slot toolpathing (`slicing.color_mixing.enabled = false`) emits `T{id}` toolchanges. |
 
 ---
 
@@ -236,16 +261,33 @@ Manifold Slicer identifies overhangs that exceed the constrained Eikonal slope c
 | `slicing.support_interface_spacing_mm` | `f32` (`0.0..=5.0` mm) | `0.15` | Process | Edge-to-edge gap between adjacent `SupportInterface` extrusions (`0.0` = zero-gap 100% solid touching roof where center-to-center pitch equals `support_line_width_mm`). |
 | `slicing.support_line_width_mm` | `f32` (`0.15..=3.0` mm) | `0.40` | Process | Extruded bead width for support base and support interface lines. |
 
+### 7.6 Kubelka–Munk Optical Colour Mixing & Lithophane Optics (`slicing.color_mixing.*`)
+
+Approximates full-colour or PNG-textured `.3mf` surface colours using any $N \ge 2$ filaments loaded in `SlicerConfig::tools` (`frontend/src/color_optics.rs`), combining multi-slab Redheffer star-product stacking across variable-thickness non-planar shells, 3D footpoint adjacent-layer dithering, and along-path Oklab error-diffused short extrusions.
+
+| Canonical Key | Type / Allowed Values | Default | Preset | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `slicing.color_mixing.enabled` | `bool` | `false` | Process | Master toggle enabling Kubelka–Munk optical filament mixing across non-planar layers, concentric walls, and short extrusions. Automatically enabled by the `"0.16mm CMYKW Full-Colour Optical Mixing"` process preset. |
+| `slicing.color_mixing.lighting_mode` | `OpticalLightingMode` (`"FrontLitReflectance"` \| `"BackLitTransmittance"` \| `"MixedFrontAndBack"`) | `"FrontLitReflectance"` | Process | Target viewing illumination:<br>• `"FrontLitReflectance"`: Front-lit 3D print / HueForge painting stacked over an opaque neutral/White core backing.<br>• `"BackLitTransmittance"`: Rear-transilluminated colour lithophane with no opaque core backing.<br>• `"MixedFrontAndBack"`: Combined $35\%$ front ambient illumination + $100\%$ rear backlight. |
+| `slicing.color_mixing.use_adjacent_layers` | `bool` | `true` | Process | Blends intermediate hues across consecutive layers (`layer_index`) by combining multi-layer Kubelka–Munk stacking with deterministic 3D boundary-footpoint spatial dithering. |
+| `slicing.color_mixing.use_short_extrusions` | `bool` | `true` | Process | Subdivides continuous outer/inner perimeters and shallow solid skin paths into short colour-diffused segments ($\ge$ `min_short_extrusion_mm`) to reproduce lateral colour gradients and UV textures along a single layer. |
+| `slicing.color_mixing.min_short_extrusion_mm` | `f32` (`0.8..=50.0` mm) | `3.0` | Process | Minimum physical arc length (mm) of each subdivided colour run when `use_short_extrusions = true`. Residual micro-runs shorter than this threshold are merged into neighboring runs to avoid blobs and chatter. |
+| `slicing.color_mixing.optical_shell_layers` | `u32` (`1..=6` slabs) | `4` | Process | Number of outer shell slabs $M \in [1, 6]$ (evaluated along directional bead thickness $d_{\text{slab}}$ in the local `NozzleFrame`) participating in through-depth optical stacking before transitioning to the single core backing filament. |
+| `slicing.color_mixing.backing_tool_index` | `Option<usize>` (`null` or `0..N`) | `null` | Process | Optional explicit machine tool index used for the internal core backing and all `SparseInfill` (`null` = auto-select the highest-reflectance neutral/White filament in `tools`). |
+| `slicing.color_mixing.dither_strength` | `f32` (`0.0..=1.0`) | `0.85` | Process | Perceptual **Oklab** error-diffusion and adjacent-layer dithering strength (`0.0` = deterministic nearest $M$-slab optical match; `1.0` = full Oklab error diffusion). |
+| `slicing.color_mixing.tool_switch_penalty` | `f32` (`0.0..=0.25` Oklab $\Delta E$) | `0.012` | Process | Oklab perceptual hysteresis penalty discouraging marginal filament switches along continuous toolpath contours when the currently active tool already matches within `tool_switch_penalty`. |
+
 ---
 
 ## 8. G-code Generation, Kinematics & Polymer Rheology (`gcode.*`)
 
-Controls the toolpath-to-G-code compiler (`frontend/src/gcode.rs`), including coordinate origin placement, Moonraker metadata, Klipper lookahead velocity planning, 3D scarf joints, viscoelastic die swell, shear-thinning Pressure Advance, corner flow compensation, and transient melt-chamber pressure lag.
+Controls the toolpath-to-G-code compiler (`frontend/src/gcode.rs`), including firmware dialect, coordinate origin placement, Moonraker metadata, Klipper lookahead velocity planning, multi-tool change choreography, 3D scarf joints, viscoelastic die swell, shear-thinning Pressure Advance, corner flow compensation, and transient melt-chamber pressure lag.
 
 ### 8.1 General G-code Output, Filament & Cooling
 
 | Canonical Key | Type / Allowed Values | Default | Preset | Description |
 | :--- | :--- | :--- | :--- | :--- |
+| `gcode.gcode_dialect` | `"Klipper"` \| `"RepRapFirmware"` | `"Klipper"` | Printer | Selects emitted firmware macro syntax: Klipper (`SET_PRESSURE_ADVANCE`, `SET_VELOCITY_LIMIT`, `EXCLUDE_OBJECT_*`) or RepRapFirmware / Duet (`M572`, `M204`, `M486`, `M568`, 5-axis RTCP `XYZBC`). |
 | `gcode.gcode_origin_at_bed_center` | `bool` | `false` | Printer | When `false` (standard for rectangular CoreXY/Cartesian beds), G-code `(X0, Y0)` is placed at the front-left corner of the bed (`[0..width_x, 0..depth_y]`). When `true` (or on `Circular` beds), G-code `(X0, Y0)` is at the bed center. |
 | `gcode.emit_exclude_object` | `bool` | `true` | Printer | Emits Klipper `EXCLUDE_OBJECT_DEFINE` (with 2D convex-hull `POLYGON` and `CENTER`), `EXCLUDE_OBJECT_START`, and `EXCLUDE_OBJECT_END` commands around per-object extrusions. |
 | `gcode.emit_thumbnails` | `bool` | `true` | Printer | Renders `32x32` and `300x300` isometric 3D toolpath PNG thumbnails into base64 `; thumbnail begin` blocks at the top of the `.gcode` file for Moonraker/Mainsail/Fluidd/KlipperScreen. |
@@ -319,6 +361,9 @@ Every extruding move's target feedrate is automatically capped by the hotend's v
 | `gcode.z_hop_mm` | `f32` (`0.0..=5.0` mm) | `0.40` | Filament | Clearance lift distance along the local nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$ during retracted travel moves. |
 | `gcode.ooze_relaxation_extra_prime_mm` | `f32` (`-0.5..=0.5` mm) | `-0.02` | Filament | Asymptotic extra prime offset $\Delta E_{\text{ooze}}$ applied on unretract as a function of travel duration $t_{\text{travel}}$: $\Delta E = \Delta E_{\text{ooze}} (1 - e^{-t_{\text{travel}} / \tau_{\text{ooze}}})$. |
 | `gcode.ooze_relaxation_tau_s` | `f32` (`0.1..=30.0` s) | `1.50` | Filament | Viscoelastic relaxation time constant $\tau_{\text{ooze}}$ (seconds) for thermal ooze and die-swell decay during travel moves. |
+| `gcode.tool_change_time_s` | `f32` (`0.0..=600.0` s) | `15.0` | Tool | Estimated physical tool-change / AMS filament swap duration (seconds) per `T{id}` transition, included in print time estimation and layer cooling return-time calculations. |
+| `gcode.tool_change_hop_before` | `bool` | `true` | Tool | Lifts the outgoing tool along its local `nozzle_axis` $\hat{\mathbf{z}}_{\text{nozzle}}$ above the `PrintedHeightMap` obstacle envelope *before* emitting `T{id}` so toolchanger docking or purge moves never collide with curved non-planar peaks. |
+| `gcode.tool_change_approach_after` | `bool` | `true` | Tool | Approaches the next extrusion start point at safe obstacle-cleared elevation *after* `T{id}` before plunging down along the incoming tool's local `nozzle_axis` $\hat{\mathbf{z}}_{\text{nozzle}}$. |
 
 ### 8.4 Non-Newtonian Rheology, Die Swell, Shear-Thinning PA & Flow Compensation
 

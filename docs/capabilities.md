@@ -32,9 +32,23 @@ Manifold Slicer is architected from the ground up so that standard 3-axis planar
   - Preserves exact topological `TopoDS_Face` boundaries as selectable surface patches (`SurfacePatch`) so you can click individual analytical CAD faces to assign conformal or orthogonal layer orientation hints.
 - **Mesh Import with Automatic Patch Segmentation (`.stl` / `.3mf`)**:
   - Imports ASCII and binary STL files as well as 3MF mesh objects, automatically clustering contiguous coplanar triangles into selectable surface patches and computing 3D convex hulls for instant **Place on Face** orientation.
-- **Multi-Plate `.3mf` Project Compatibility**:
+- **Multi-Plate & Multi-Colour `.3mf` Project Ecosystem**:
   - Native multi-plate workspace (`Plate 1`, `Plate 2`, …) with per-plate object assignment, plate duplication, object cloning, and Archimedean spiral auto-arrangement.
-  - Imports multi-plate `.3mf` project archives from **OrcaSlicer**, **Bambu Studio**, and **PrusaSlicer** (parsing `Metadata/model_settings.config` and `3D/3dmodel.model` build items/components) as well as native Manifold `.3mf` projects (`/Metadata/manifold2_config.toml` and `/Metadata/manifold2_project.toml`).
+  - Imports multi-plate and multi-colour `.3mf` project archives from **OrcaSlicer**, **Bambu Studio**, and **PrusaSlicer** (parsing `Metadata/model_settings.config`, `3D/3dmodel.model` build items/components, `p:mmu_segmentation` recursive paint-tree quadtrees, `<basematerials>`, `<m:colorgroup>`, and UV-mapped `<m:texture2d>` + `<m:texture2dgroup>` PNG textures) as well as native Manifold `.3mf` projects (`/Metadata/manifold2_config.toml` and `/Metadata/manifold2_project.toml`).
+
+---
+
+## 2.5 Multi-Colour Segmentation, Kubelka–Munk Optical Mixing, Lithophanes & PBR Preview
+
+- **Discrete Multi-Tool Slot Painting & Conformal Perimeter Splitting**:
+  - Propagates imported `.3mf` filament slots (`filamentSlotGrid`) and packed RGBA surface colours (`surfaceColorGrid`) volumetrically through OpenVDB, splitting curved conformal perimeters and shell infill cleanly across colour boundaries (`splitPolylineByFilamentSlot`) with per-tool rheology, cooling, and obstacle-aware `T{id}` toolchange clearance hops.
+- **Kubelka–Munk Optical Colour Mixing (`CMYKW` & Arbitrary $N \ge 2$ Filaments)**:
+  - Calibrates two-flux scattering $S$ and per-channel absorption $K_c$ from each filament's opaque colour (`#RRGGBB`, CSS `rgb(...)`, or colour name) and physical **Transmission Distance (`TD` in mm)** (`2.5 mm` researched opaque baseline when unset), stacking heterogeneous shell slabs via the associative **Redheffer star-product**.
+  - Evaluates kinematic-invariant directional bead thickness $d_{\text{slab}}$ in the local `NozzleFrame` across non-planar roofs and concentric walls alike, pairing $M$-slab (`1..6`) optical LUT selection over an auto-selected White/neutral core backing with 3D boundary-footpoint adjacent-layer dithering and along-path **Oklab** error-diffused short extrusions (`min_short_extrusion_mm`).
+- **Front-Lit, Back-Lit Lithophane & Mixed Illumination Optics**:
+  - Supports `FrontLitReflectance` 3D prints, `BackLitTransmittance` full-colour and monochrome thickness-modulated lithophanes (`solve_monochrome_lithophane_thickness`), and `MixedFrontAndBack` viewing modes, plus one-click 5-tool calibrated **PLA CMYKW** and **Translucent PETG CMYKW** palette setup.
+- **High-Quality Pressed-Stadium PBR Extrusion Rendering & TD-Matched Translucency**:
+  - Renders 12-vertex pressed-stadium (capsule) extrusions in the local `NozzleFrame` with continuous mitered joints, convex 3D bullnose endcaps, polymer-specific `clearcoat`/roughness, 4-cascade soft directional shadows, `Simulated Print Appearance (Kubelka–Munk Optical Stack)` previewing, and flicker-free **TD-Based Filament Opacity** ($\alpha(d, \text{TD}) = 1 - (0.08)^{d/\text{TD}}$).
 
 ---
 
