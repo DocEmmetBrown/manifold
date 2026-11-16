@@ -187,7 +187,7 @@ fn is_supported_3d_file_arg(arg: &str) -> bool {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    matches!(ext.as_str(), "step" | "stp" | "stl" | "3mf")
+    matches!(ext.as_str(), "step" | "stp" | "stl" | "obj" | "3mf")
 }
 
 pub fn print_top_level_help() {
@@ -197,7 +197,7 @@ pub fn print_top_level_help() {
             "USAGE:\n",
             "  manifold-frontend                         Launch interactive 3D GUI\n",
             "  manifold-frontend gui [OPTIONS] [FILES]   Launch GUI with preloaded profile/files\n",
-            "  manifold-frontend slice [OPTIONS] <FILES> Slice STEP/STL/3MF objects to G-code\n",
+            "  manifold-frontend slice [OPTIONS] <FILES> Slice STEP/STL/OBJ/3MF objects to G-code\n",
             "  manifold-frontend calibrate <KIND> [...]  Generate EM/Swell, PA, or Transient calibration G-code\n",
             "  manifold-frontend profile <VERB> [...]    Inspect, create, diff, and edit profiles/presets\n\n",
             "SLICE OPTIONS (`manifold-frontend slice --help` for full details):\n",
@@ -237,7 +237,7 @@ fn print_slice_help() {
             "USAGE:\n",
             "  manifold-frontend slice [OPTIONS] <INPUT_FILES>...\n\n",
             "INPUT FILES:\n",
-            "  One or more `.step`, `.stp`, `.stl`, or `.3mf` files (including multi-plate `.3mf`\n",
+            "  One or more `.step`, `.stp`, `.stl`, `.obj`, or `.3mf` files (including multi-plate `.3mf`\n",
             "  projects from Manifold, OrcaSlicer, Bambu Studio, or PrusaSlicer).\n\n",
             "OPTIONS:\n",
             "  -p, --profile <FILE>          Apply a full or partial JSON/TOML profile (repeatable).\n",

@@ -928,6 +928,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_obj"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "891c44dd1ed9aa3fc80d55e9019f61771307c1a6eb4cae3117cef25bd9fcfcee"
+dependencies = [
+ "bevy_app",
+ "bevy_asset",
+ "bevy_render",
+ "bevy_utils",
+ "thiserror 1.0.69",
+ "tobj",
+]
+
+[[package]]
 name = "bevy_pbr"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3207,6 +3221,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "bevy_egui",
+ "bevy_obj",
  "bytemuck",
  "cmake",
  "cxx",
@@ -3219,6 +3234,7 @@ dependencies = [
  "serde",
  "serde_json",
  "stl_io",
+ "tobj",
  "toml",
  "wgpu",
  "zip",
@@ -5032,6 +5048,15 @@ name = "tinyvec"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
+name = "tobj"
+version = "4.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6eb8e04167c1c0c76b5de63226fd733485ad63ef71e40de31e16272f47b099e2"
+dependencies = [
+ "ahash",
+]
 
 [[package]]
 name = "tokio"

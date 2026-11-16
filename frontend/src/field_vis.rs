@@ -3162,20 +3162,36 @@ pub const BRANCH_PALETTE: [[f32; 3]; 8] = [
 ];
 
 /// Returns per-vertex Linear RGBA colors for a CAD object in `DefaultCad` surface color mode:
-/// uses the 3MF painted filament slot palette if `vertex_filament_slots` is non-empty, else
-/// true-color/textured 3MF `vertex_colors_rgba`, or uniform white (`[1.0, 1.0, 1.0, 1.0]`).
+/// uses discrete 3MF/OBJ filament slot colours when multiple slots (or explicit slot mappings) are
+/// present without continuous texture/vertex colours, else uses true-colour/textured `vertex_colors_rgba`,
+/// or uniform white (`[1.0, 1.0, 1.0, 1.0]`).
 pub fn default_cad_vertex_colors(
     vertex_count: usize,
     vertex_filament_slots: &[u8],
     vertex_colors_rgba: &[[u8; 4]],
     config: &SlicerConfig,
 ) -> Vec<[f32; 4]> {
-    if vertex_filament_slots.len() == vertex_count && !vertex_filament_slots.is_empty() {
+    let has_slots = vertex_filament_slots.len() == vertex_count && !vertex_filament_slots.is_empty();
+    let has_true_colors = vertex_colors_rgba.len() == vertex_count && !vertex_colors_rgba.is_empty();
+
+    if has_true_colors && !has_slots {
+        vertex_colors_rgba
+            .iter()
+            .map(|&[r, g, b, a]| {
+                srgba_to_linear_rgba([
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    a as f32 / 255.0,
+                ])
+            })
+            .collect()
+    } else if has_slots {
         vertex_filament_slots
             .iter()
             .map(|&slot| srgba_to_linear_rgba(config.color_srgba_for_filament_slot(slot)))
             .collect()
-    } else if vertex_colors_rgba.len() == vertex_count && !vertex_colors_rgba.is_empty() {
+    } else if has_true_colors {
         vertex_colors_rgba
             .iter()
             .map(|&[r, g, b, a]| {

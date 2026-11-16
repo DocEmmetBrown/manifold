@@ -30,8 +30,8 @@ Manifold Slicer is architected from the ground up so that standard 3-axis planar
 - **Direct STEP B-Rep CAD Import (`.step` / `.stp`)**:
   - Powered by **OpenCASCADE (OCCT)** (`STEPControl_Reader` + `BRepMesh_IncrementalMesh`).
   - Preserves exact topological `TopoDS_Face` boundaries as selectable surface patches (`SurfacePatch`) so you can click individual analytical CAD faces to assign conformal or orthogonal layer orientation hints.
-- **Mesh Import with Automatic Patch Segmentation (`.stl` / `.3mf`)**:
-  - Imports ASCII and binary STL files as well as 3MF mesh objects, automatically clustering contiguous coplanar triangles into selectable surface patches and computing 3D convex hulls for instant **Place on Face** orientation.
+- **Mesh Import with Automatic Patch Segmentation & Multi-Colour Optics (`.stl` / `.obj` / `.3mf`)**:
+  - Imports ASCII and binary STL files, Wavefront `.obj` meshes (via `bevy_obj` / `tobj`, including companion `.mtl` diffuse materials `Kd`, `map_Kd` UV PNG textures, and `v x y z r g b` per-vertex colours), and `.3mf` mesh objects, automatically clustering contiguous coplanar triangles into selectable surface patches and computing 3D convex hulls for instant **Place on Face** orientation.
 - **Multi-Plate & Multi-Colour `.3mf` Project Ecosystem**:
   - Native multi-plate workspace (`Plate 1`, `Plate 2`, …) with per-plate object assignment, plate duplication, object cloning, and Archimedean spiral auto-arrangement.
   - Imports multi-plate and multi-colour `.3mf` project archives from **OrcaSlicer**, **Bambu Studio**, and **PrusaSlicer** (parsing `Metadata/model_settings.config`, `3D/3dmodel.model` build items/components, `p:mmu_segmentation` recursive paint-tree quadtrees, `<basematerials>`, `<m:colorgroup>`, and UV-mapped `<m:texture2d>` + `<m:texture2dgroup>` PNG textures) as well as native Manifold `.3mf` projects (`/Metadata/manifold2_config.toml` and `/Metadata/manifold2_project.toml`).

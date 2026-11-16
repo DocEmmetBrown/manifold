@@ -1,3 +1,4 @@
+pub mod obj;
 pub mod stl;
 pub mod threemf;
 
@@ -58,7 +59,7 @@ pub struct LoadedBatchReport {
     pub errors: Vec<String>,
 }
 
-/// Loads one or more CAD/mesh/project files (`.step`, `.stp`, `.stl`, `.3mf`)
+/// Loads one or more CAD/mesh/project files (`.step`, `.stp`, `.stl`, `.obj`, `.3mf`)
 /// through the C++ backend and builds their local meshes and $\le 27$-face convex hulls.
 pub fn load_files_into_backend(paths: &[PathBuf]) -> LoadedBatchReport {
     let mut report = LoadedBatchReport::default();
@@ -78,6 +79,9 @@ pub fn load_files_into_backend(paths: &[PathBuf]) -> LoadedBatchReport {
                 Ok(obj) => report.objects.push(obj),
                 Err(err) => report.errors.push(format!("{}: {err}", path.display())),
             },
+            "obj" => {
+                obj::load_obj_file_into_report(path, &mut report);
+            }
             "3mf" => {
                 threemf::load_3mf_archive(path, &mut report);
             }

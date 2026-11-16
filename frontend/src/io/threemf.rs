@@ -14,8 +14,8 @@ use crate::bridge::ffi::{self, RenderVertex};
 use crate::color_optics;
 use crate::config::{SlicerConfig, ThreeMfFilamentSlot};
 use crate::io::{
-    build_loaded_object_from_part, load_step_file_parts, stl, LoadedBatchReport, LoadedObjectData,
-    LoadedPlateInfo,
+    build_loaded_object_from_part, load_step_file_parts, obj, stl, LoadedBatchReport,
+    LoadedObjectData, LoadedPlateInfo,
 };
 
 const MANIFOLD_CONFIG_ENTRY: &str = "Metadata/manifold2_config.toml";
@@ -119,7 +119,7 @@ struct TrianglePropRef {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum TextureTileStyle {
+pub(crate) enum TextureTileStyle {
     #[default]
     Wrap,
     Clamp,
@@ -259,6 +259,8 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
     let mut model_files: HashMap<String, ParsedModelFile> = HashMap::new();
     let mut embedded_step_entries: HashMap<String, Vec<u8>> = HashMap::new();
     let mut embedded_stl_entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut embedded_obj_entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut embedded_mtl_entries: HashMap<String, Vec<u8>> = HashMap::new();
     let mut embedded_png_entries: HashMap<String, Vec<u8>> = HashMap::new();
     let mut scene_manifest: Option<SavedSceneManifest> = None;
     let mut model_settings: Option<ParsedModelSettingsConfig> = None;
@@ -390,6 +392,22 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
             continue;
         }
 
+        if lower_name.ends_with(".obj") {
+            let mut bytes = Vec::new();
+            if entry.read_to_end(&mut bytes).is_ok() {
+                embedded_obj_entries.push((raw_name, bytes));
+            }
+            continue;
+        }
+
+        if lower_name.ends_with(".mtl") {
+            let mut bytes = Vec::new();
+            if entry.read_to_end(&mut bytes).is_ok() {
+                embedded_mtl_entries.insert(raw_name, bytes);
+            }
+            continue;
+        }
+
         if lower_name.ends_with(".png") {
             let mut bytes = Vec::new();
             if entry.read_to_end(&mut bytes).is_ok() {
@@ -512,7 +530,7 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
         let _ = load_embedded_step_bytes(entry_name, step_bytes, &archive_label, report);
     }
 
-    // 2. Load any embedded STL files inside the 3MF
+    // 2. Load any embedded STL or OBJ files inside the 3MF
     for (entry_name, stl_bytes) in embedded_stl_entries {
         let mut cursor = Cursor::new(stl_bytes);
         let stem = Path::new(&entry_name)
@@ -521,6 +539,65 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
             .unwrap_or("embedded_stl");
         match stl::load_stl_from_reader(&mut cursor, stem, &format!("{archive_label}::{entry_name}"))
         {
+            Ok(obj) => report.objects.push(obj),
+            Err(err) => report.errors.push(err),
+        }
+    }
+
+    for (entry_name, obj_bytes) in embedded_obj_entries {
+        let stem = Path::new(&entry_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("embedded_obj");
+        let label = format!("{archive_label}::{entry_name}");
+        match obj::load_obj_bytes_into_report(
+            &obj_bytes,
+            stem,
+            &label,
+            |mtl_path| {
+                let mtl_str = mtl_path.to_string_lossy();
+                let mtl_fname = mtl_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                embedded_mtl_entries
+                    .get(mtl_str.as_ref())
+                    .or_else(|| {
+                        embedded_mtl_entries
+                            .iter()
+                            .find(|(k, _)| {
+                                k.eq_ignore_ascii_case(&mtl_str)
+                                    || (!mtl_fname.is_empty()
+                                        && Path::new(k)
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .map_or(false, |n| n.eq_ignore_ascii_case(mtl_fname)))
+                            })
+                            .map(|(_, v)| v)
+                    })
+                    .cloned()
+            },
+            |png_name| {
+                let png_fname = Path::new(png_name)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                embedded_png_entries
+                    .get(png_name)
+                    .or_else(|| {
+                        embedded_png_entries
+                            .iter()
+                            .find(|(k, _)| {
+                                k.eq_ignore_ascii_case(png_name)
+                                    || (!png_fname.is_empty()
+                                        && Path::new(k)
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .map_or(false, |n| n.eq_ignore_ascii_case(png_fname)))
+                            })
+                            .map(|(_, v)| v)
+                    })
+                    .cloned()
+            },
+            report,
+        ) {
             Ok(obj) => report.objects.push(obj),
             Err(err) => report.errors.push(err),
         }
@@ -1022,15 +1099,20 @@ fn instantiate_3mf_mesh(
     }
 }
 
-struct DecodedRgbaImage {
-    width: u32,
-    height: u32,
-    pixels: Vec<u8>,
+pub(crate) struct DecodedRgbaImage {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pixels: Vec<u8>,
 }
 
 impl DecodedRgbaImage {
-    fn decode_png(bytes: &[u8]) -> Option<Self> {
-        let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    pub(crate) fn decode_png(bytes: &[u8]) -> Option<Self> {
+        let mut decoder = png::Decoder::new_with_limits(
+            Cursor::new(bytes),
+            png::Limits {
+                bytes: 1024 * 1024 * 1024,
+            },
+        );
         decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
         let mut reader = decoder.read_info().ok()?;
         let buf_len = reader.output_buffer_size()?;
@@ -1101,7 +1183,7 @@ impl DecodedRgbaImage {
         ]
     }
 
-    fn sample_bilinear_srgba8(
+    pub(crate) fn sample_bilinear_srgba8(
         &self,
         u: f32,
         v: f32,

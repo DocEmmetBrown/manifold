@@ -1647,15 +1647,19 @@ pub fn ui_workspace_system(
             .clicked()
             {
                 plate.status_message =
-                    "Select one or more STEP, STL, or 3MF files...".to_string();
+                    "Select one or more STEP, STL, OBJ, or 3MF files...".to_string();
                 let task = IoTaskPool::get().spawn(async move {
                     let handles = rfd::AsyncFileDialog::new()
                         .add_filter(
-                            "Supported 3D Files (.step, .stp, .stl, .3mf)",
-                            &["step", "stp", "STEP", "STP", "stl", "STL", "3mf", "3MF"],
+                            "Supported 3D Files (.step, .stp, .stl, .obj, .3mf)",
+                            &[
+                                "step", "stp", "STEP", "STP", "stl", "STL", "obj", "OBJ", "3mf",
+                                "3MF",
+                            ],
                         )
                         .add_filter("STEP CAD Assemblies", &["step", "stp", "STEP", "STP"])
                         .add_filter("STL Meshes", &["stl", "STL"])
+                        .add_filter("OBJ Meshes", &["obj", "OBJ"])
                         .add_filter("3MF Projects", &["3mf", "3MF"])
                         .pick_files()
                         .await?;

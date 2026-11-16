@@ -98,6 +98,7 @@ fn main() {
             ..default()
         }))
         .add_plugins(EguiPlugin)
+        .add_plugins(bevy_obj::ObjPlugin)
         .insert_resource(ClearColor(Color::srgb(0.11, 0.12, 0.15)))
         .insert_resource(AmbientLight {
             color: Color::WHITE,
