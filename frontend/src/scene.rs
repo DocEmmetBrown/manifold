@@ -16,9 +16,10 @@ use crate::config::{
 };
 use crate::field_vis::SliceAxis;
 use crate::hull::{
-    ray_intersect_triangle, rotation_to_place_face_on_bed, SimplifiedConvexHull, SurfacePatch,
+    build_surface_patches, ray_intersect_triangle, rotation_to_place_face_on_bed,
+    SimplifiedConvexHull, SurfacePatch, MAX_SIMPLIFIED_HULL_FACES,
 };
-use crate::io::{LoadedBatchReport, LoadedObjectData};
+use crate::io::{compute_vertex_bounds, scale_vertices_in_frame, LoadedBatchReport, LoadedObjectData};
 
 /// Active user editing tool mode selectable from the top/side toolbar.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -96,6 +97,10 @@ pub struct SceneObject {
     pub entity: Entity,
     pub mesh_handle: Handle<Mesh>,
     pub material_handle: Handle<StandardMaterial>,
+    pub base_vertices: Vec<RenderVertex>,
+    pub scale_factors: Vec3,
+    pub scale_rotation: Quat,
+    pub lock_scale_axes: bool,
     pub vertices: Vec<RenderVertex>,
     pub indices: Vec<u32>,
     pub local_min: Vec3,
@@ -114,24 +119,23 @@ pub struct SceneObject {
 
 impl SceneObject {
     /// Computes the exact world-space AABB `(world_min, world_max)` for the object
-    /// under `transform` by transforming its convex hull polygon vertices (plus local bounds).
+    /// under `transform`.
     pub fn compute_world_aabb(&self, transform: &Transform) -> (Vec3, Vec3) {
-        let mut min_pt = Vec3::splat(f32::INFINITY);
-        let mut max_pt = Vec3::splat(f32::NEG_INFINITY);
-
-        if !self.hull.faces.is_empty() {
-            for face in &self.hull.faces {
-                for &p in &face.polygon {
-                    let wp = transform.transform_point(p);
-                    min_pt = min_pt.min(wp);
-                    max_pt = max_pt.max(wp);
-                }
-            }
+        if self.vertices.is_empty() {
+            return (transform.translation, transform.translation);
+        }
+        if transform.rotation.angle_between(Quat::IDENTITY) < 1.0e-6
+            && (transform.scale - Vec3::ONE).abs().max_element() < 1.0e-6
+        {
+            return (
+                self.local_min + transform.translation,
+                self.local_max + transform.translation,
+            );
         }
 
-        // Also sample a strided subset of mesh vertices to guarantee exact Z-min
-        let step = (self.vertices.len() / 512).max(1);
-        for v in self.vertices.iter().step_by(step) {
+        let mut min_pt = Vec3::splat(f32::INFINITY);
+        let mut max_pt = Vec3::splat(f32::NEG_INFINITY);
+        for v in &self.vertices {
             let wp = transform.transform_point(Vec3::new(v.x, v.y, v.z));
             min_pt = min_pt.min(wp);
             max_pt = max_pt.max(wp);
@@ -142,6 +146,185 @@ impl SceneObject {
         } else {
             (min_pt, max_pt)
         }
+    }
+
+    /// Computes the unscaled (`100%`) world-space AABB `(min_pt, max_pt)` of `self.base_vertices`
+    /// under `rotation`.
+    pub fn compute_base_world_aabb(&self, rotation: Quat) -> (Vec3, Vec3) {
+        let src = if self.base_vertices.is_empty() {
+            &self.vertices
+        } else {
+            &self.base_vertices
+        };
+        if src.is_empty() {
+            return (Vec3::ZERO, Vec3::ZERO);
+        }
+        let rot = if rotation.is_finite() && rotation.length_squared() > 1.0e-8 {
+            rotation.normalize()
+        } else {
+            Quat::IDENTITY
+        };
+        let mut min_pt = Vec3::splat(f32::INFINITY);
+        let mut max_pt = Vec3::splat(f32::NEG_INFINITY);
+        for bv in src {
+            let pw = rot * Vec3::new(bv.x, bv.y, bv.z);
+            min_pt = min_pt.min(pw);
+            max_pt = max_pt.max(pw);
+        }
+        (min_pt, max_pt)
+    }
+
+    /// Scales this object's mesh from `self.base_vertices` by `new_scale` along the axes of
+    /// `new_scale_rotation`, updating the C++ backend, Bevy `Mesh` & frustum `Aabb`, `wgpu`
+    /// vertex buffer, convex hull, surface patches, and any 3D point normal hints.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_scale_in_frame(
+        &mut self,
+        commands: &mut Commands,
+        render_device: Option<&RenderDevice>,
+        meshes: &mut Assets<Mesh>,
+        config: &mut SlicerConfig,
+        vis_state: &mut crate::field_vis::FieldVisualizationState,
+        new_scale: Vec3,
+        new_scale_rotation: Quat,
+    ) -> bool {
+        let clamped_scale = Vec3::new(
+            if new_scale.x.is_finite() { new_scale.x } else { 1.0 },
+            if new_scale.y.is_finite() { new_scale.y } else { 1.0 },
+            if new_scale.z.is_finite() { new_scale.z } else { 1.0 },
+        )
+        .clamp(Vec3::splat(0.001), Vec3::splat(1000.0));
+        let norm_rot = if new_scale_rotation.is_finite() && new_scale_rotation.length_squared() > 1.0e-8
+        {
+            new_scale_rotation.normalize()
+        } else {
+            Quat::IDENTITY
+        };
+
+        let is_uniform = (clamped_scale.x - clamped_scale.y).abs() < 1.0e-6
+            && (clamped_scale.y - clamped_scale.z).abs() < 1.0e-6;
+        let rot_unchanged = is_uniform || self.scale_rotation.angle_between(norm_rot) < 1.0e-5;
+        if (clamped_scale - self.scale_factors).abs().max_element() < 1.0e-6 && rot_unchanged {
+            return false;
+        }
+
+        if self.base_vertices.is_empty() {
+            self.base_vertices = self.vertices.clone();
+        }
+        if self.base_vertices.is_empty() {
+            return false;
+        }
+
+        let old_scale = self.scale_factors.max(Vec3::splat(0.001));
+        let old_rot = self.scale_rotation;
+        let (old_bmin, old_bmax) = self.compute_base_world_aabb(old_rot);
+        let old_pivot = Vec3::new(
+            0.5 * (old_bmin.x + old_bmax.x),
+            0.5 * (old_bmin.y + old_bmax.y),
+            old_bmin.z,
+        );
+        let (new_bmin, new_bmax) = self.compute_base_world_aabb(norm_rot);
+        let new_pivot = Vec3::new(
+            0.5 * (new_bmin.x + new_bmax.x),
+            0.5 * (new_bmin.y + new_bmax.y),
+            new_bmin.z,
+        );
+
+        let _ = ffi::set_object_scale(
+            self.object_id,
+            clamped_scale.to_array(),
+            norm_rot.to_array(),
+        );
+
+        self.vertices = scale_vertices_in_frame(&self.base_vertices, clamped_scale, norm_rot);
+        self.scale_factors = clamped_scale;
+        self.scale_rotation = norm_rot;
+        let (lmin, lmax) = compute_vertex_bounds(&self.vertices);
+        self.local_min = lmin;
+        self.local_max = lmax;
+        self.hull = SimplifiedConvexHull::from_vertices(&self.vertices, MAX_SIMPLIFIED_HULL_FACES);
+        let (patches, tri_to_patch) =
+            build_surface_patches(&self.vertices, &self.indices, &self.triangle_to_patch);
+        self.surface_patches = patches;
+        self.triangle_to_patch = tri_to_patch;
+
+        if let Some(mesh) = meshes.get_mut(&self.mesh_handle) {
+            let mut positions = Vec::with_capacity(self.vertices.len());
+            let mut normals = Vec::with_capacity(self.vertices.len());
+            for v in &self.vertices {
+                positions.push([v.x, v.y, v.z]);
+                normals.push([v.nx, v.ny, v.nz]);
+            }
+            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+        }
+
+        commands
+            .entity(self.entity)
+            .insert(bevy::render::primitives::Aabb::from_min_max(
+                self.local_min,
+                self.local_max,
+            ));
+
+        if let Some(device) = render_device {
+            let wgpu_device = device.wgpu_device();
+            let vertex_bytes: &[u8] = bytemuck::cast_slice(&self.vertices);
+            self.vertex_buffer = Some(wgpu_device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("occt_tessellated_vertex_buffer"),
+                    contents: vertex_bytes,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                },
+            ));
+        }
+
+        // Transform any 3D point normal hints attached to this object so they stay locked to the mesh
+        let old_rot_inv = old_rot.inverse();
+        let new_rot_inv = norm_rot.inverse();
+        for ph in config
+            .eikonal
+            .point_hints
+            .iter_mut()
+            .filter(|h| h.object_id == self.object_id)
+        {
+            let p_local_old = Vec3::from_array(ph.local_position);
+            let pw_old = old_rot * p_local_old;
+            let pw_base = old_pivot + (pw_old - old_pivot) / old_scale;
+            let p_base_local = old_rot_inv * pw_base;
+
+            let pw_new_base = norm_rot * p_base_local;
+            let pw_new = new_pivot + (pw_new_base - new_pivot) * clamped_scale;
+            let p_local_new = new_rot_inv * pw_new;
+            ph.local_position = p_local_new.to_array();
+
+            let d_local_old = Vec3::from_array(ph.local_direction);
+            let dw_old = old_rot * d_local_old;
+            let dw_base = dw_old * old_scale;
+            let d_base_local = old_rot_inv * dw_base;
+            let dw_new_base = norm_rot * d_base_local;
+            let dw_new = Vec3::new(
+                dw_new_base.x / clamped_scale.x,
+                dw_new_base.y / clamped_scale.y,
+                dw_new_base.z / clamped_scale.z,
+            );
+            let d_local_new = (new_rot_inv * dw_new).normalize_or_zero();
+            if d_local_new.length_squared() > 0.5 {
+                ph.local_direction = d_local_new.to_array();
+            }
+        }
+
+        if vis_state.last_object_id == Some(self.object_id) {
+            vis_state.available_fields.clear();
+            vis_state.cached_stats = None;
+            vis_state.cached_selected_layers = None;
+            vis_state.cached_toolpaths = None;
+            vis_state.cached_planned_gcode = None;
+            vis_state.last_solved_field_rotation = None;
+            vis_state.dirty_surface_colors = true;
+            vis_state.mark_all_dirty();
+        }
+
+        true
     }
 
     /// Returns the sanitized Klipper `EXCLUDE_OBJECT_DEFINE NAME=...` identifier for this object.
@@ -635,6 +818,25 @@ pub fn spawn_loaded_objects(
             ))
             .id();
 
+        let base_vertices = if data.base_vertices.is_empty() {
+            data.vertices.clone()
+        } else {
+            data.base_vertices
+        };
+        let scale_factors = if data.scale_factors.is_finite()
+            && data.scale_factors.min_element() > 0.0
+        {
+            data.scale_factors
+        } else {
+            Vec3::ONE
+        };
+        let scale_rotation =
+            if data.scale_rotation.is_finite() && data.scale_rotation.length_squared() > 1.0e-8 {
+                data.scale_rotation.normalize()
+            } else {
+                Quat::IDENTITY
+            };
+
         let scene_obj = SceneObject {
             object_id: data.object_id,
             name: data.name,
@@ -644,6 +846,10 @@ pub fn spawn_loaded_objects(
             entity,
             mesh_handle,
             material_handle: mat_handle,
+            base_vertices,
+            scale_factors,
+            scale_rotation,
+            lock_scale_axes: data.lock_scale_axes,
             vertices: data.vertices,
             indices: data.indices,
             local_min: data.local_min,
@@ -778,6 +984,10 @@ pub fn clone_object_on_plate(
     let base_name = strip_clone_number_suffix(&plate.objects[src_idx].name).to_string();
     let src_source_file = plate.objects[src_idx].source_file.clone();
     let src_has_brep = plate.objects[src_idx].has_brep;
+    let src_base_vertices = plate.objects[src_idx].base_vertices.clone();
+    let src_scale_factors = plate.objects[src_idx].scale_factors;
+    let src_scale_rotation = plate.objects[src_idx].scale_rotation;
+    let src_lock_scale_axes = plate.objects[src_idx].lock_scale_axes;
     let src_vertices = plate.objects[src_idx].vertices.clone();
     let src_indices = plate.objects[src_idx].indices.clone();
     let src_local_min = plate.objects[src_idx].local_min;
@@ -886,6 +1096,10 @@ pub fn clone_object_on_plate(
             plate_index: target_plate_index,
             initial_translation: Vec3::new(target_translation_xy.x, target_translation_xy.y, 0.0),
             initial_rotation: src_tf.rotation,
+            base_vertices: src_base_vertices.clone(),
+            scale_factors: src_scale_factors,
+            scale_rotation: src_scale_rotation,
+            lock_scale_axes: src_lock_scale_axes,
             vertices: src_vertices.clone(),
             indices: src_indices.clone(),
             local_min: src_local_min,

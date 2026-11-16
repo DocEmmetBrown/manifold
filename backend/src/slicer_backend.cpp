@@ -66,6 +66,9 @@ struct ObjectRecord {
     float originZ = 0.0f;
     float minX = 0.0f, minY = 0.0f, minZ = 0.0f;
     float maxX = 0.0f, maxY = 0.0f, maxZ = 0.0f;
+    std::vector<RenderVertex> baseVertexBuffer;
+    std::array<float, 3> scaleFactors{1.0f, 1.0f, 1.0f};
+    std::array<float, 4> scaleRotationXyzw{0.0f, 0.0f, 0.0f, 1.0f};
     std::vector<RenderVertex> vertexBuffer;
     std::vector<std::uint32_t> indexBuffer;
     /// Per-triangle STEP B-Rep TopoDS_Face index (1 entry per triangle when `hasBrep == true`).
@@ -188,6 +191,9 @@ void recenterVertexBuffer(ObjectRecord& rec) {
         rec.vertexBuffer,
         rec.minX, rec.minY, rec.minZ,
         rec.maxX, rec.maxY, rec.maxZ);
+    rec.baseVertexBuffer = rec.vertexBuffer;
+    rec.scaleFactors = {1.0f, 1.0f, 1.0f};
+    rec.scaleRotationXyzw = {0.0f, 0.0f, 0.0f, 1.0f};
 }
 
 /// Computes the right-handed orthonormal local frame of the nozzle:
@@ -1818,6 +1824,9 @@ std::uint64_t SlicerBackend::cloneObject(
     rec.maxX = src.maxX;
     rec.maxY = src.maxY;
     rec.maxZ = src.maxZ;
+    rec.baseVertexBuffer = src.baseVertexBuffer;
+    rec.scaleFactors = src.scaleFactors;
+    rec.scaleRotationXyzw = src.scaleRotationXyzw;
     rec.vertexBuffer = src.vertexBuffer;
     rec.indexBuffer = src.indexBuffer;
     rec.triangleFaceIds = src.triangleFaceIds;
@@ -1858,6 +1867,124 @@ std::uint64_t SlicerBackend::cloneObject(
     impl_->lastLoadedId = newId;
     impl_->objects.emplace(newId, std::move(rec));
     return newId;
+}
+
+bool SlicerBackend::setObjectScale(
+    std::uint64_t objectId,
+    const std::array<float, 3>& scaleXyz,
+    const std::array<float, 4>& rotationXyzw)
+{
+    const auto it = impl_->objects.find(objectId);
+    if (it == impl_->objects.end()) {
+        return false;
+    }
+
+    ObjectRecord& rec = it->second;
+    if (rec.baseVertexBuffer.empty() && !rec.vertexBuffer.empty()) {
+        rec.baseVertexBuffer = rec.vertexBuffer;
+    }
+    if (rec.baseVertexBuffer.empty()) {
+        return false;
+    }
+
+    const float sx = std::clamp(std::isfinite(scaleXyz[0]) ? scaleXyz[0] : 1.0f, 0.001f, 1000.0f);
+    const float sy = std::clamp(std::isfinite(scaleXyz[1]) ? scaleXyz[1] : 1.0f, 0.001f, 1000.0f);
+    const float sz = std::clamp(std::isfinite(scaleXyz[2]) ? scaleXyz[2] : 1.0f, 0.001f, 1000.0f);
+
+    float qx = std::isfinite(rotationXyzw[0]) ? rotationXyzw[0] : 0.0f;
+    float qy = std::isfinite(rotationXyzw[1]) ? rotationXyzw[1] : 0.0f;
+    float qz = std::isfinite(rotationXyzw[2]) ? rotationXyzw[2] : 0.0f;
+    float qw = std::isfinite(rotationXyzw[3]) ? rotationXyzw[3] : 1.0f;
+    const float qNorm = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
+    if (qNorm > 1.0e-6f) {
+        qx /= qNorm;
+        qy /= qNorm;
+        qz /= qNorm;
+        qw /= qNorm;
+    } else {
+        qx = 0.0f;
+        qy = 0.0f;
+        qz = 0.0f;
+        qw = 1.0f;
+    }
+
+    auto quatRotate = [](float rx, float ry, float rz, float rw, float vx, float vy, float vz) -> std::array<float, 3> {
+        const float tx = 2.0f * (ry * vz - rz * vy);
+        const float ty = 2.0f * (rz * vx - rx * vz);
+        const float tz = 2.0f * (rx * vy - ry * vx);
+        return {
+            vx + rw * tx + (ry * tz - rz * ty),
+            vy + rw * ty + (rz * tx - rx * tz),
+            vz + rw * tz + (rx * ty - ry * tx)
+        };
+    };
+
+    float wMinX = std::numeric_limits<float>::max();
+    float wMinY = std::numeric_limits<float>::max();
+    float wMinZ = std::numeric_limits<float>::max();
+    float wMaxX = std::numeric_limits<float>::lowest();
+    float wMaxY = std::numeric_limits<float>::lowest();
+    float wMaxZ = std::numeric_limits<float>::lowest();
+
+    for (const auto& bv : rec.baseVertexBuffer) {
+        const auto pw = quatRotate(qx, qy, qz, qw, bv.x, bv.y, bv.z);
+        wMinX = std::min(wMinX, pw[0]);
+        wMinY = std::min(wMinY, pw[1]);
+        wMinZ = std::min(wMinZ, pw[2]);
+        wMaxX = std::max(wMaxX, pw[0]);
+        wMaxY = std::max(wMaxY, pw[1]);
+        wMaxZ = std::max(wMaxZ, pw[2]);
+    }
+
+    const float pivotX = 0.5f * (wMinX + wMaxX);
+    const float pivotY = 0.5f * (wMinY + wMaxY);
+    const float pivotZ = wMinZ;
+
+    rec.vertexBuffer.resize(rec.baseVertexBuffer.size());
+    for (std::size_t i = 0; i < rec.baseVertexBuffer.size(); ++i) {
+        const auto& bv = rec.baseVertexBuffer[i];
+        const auto pw = quatRotate(qx, qy, qz, qw, bv.x, bv.y, bv.z);
+        const float swx = pivotX + (pw[0] - pivotX) * sx;
+        const float swy = pivotY + (pw[1] - pivotY) * sy;
+        const float swz = pivotZ + (pw[2] - pivotZ) * sz;
+        const auto pl = quatRotate(-qx, -qy, -qz, qw, swx, swy, swz);
+
+        const auto nw = quatRotate(qx, qy, qz, qw, bv.nx, bv.ny, bv.nz);
+        const auto nlRaw = quatRotate(-qx, -qy, -qz, qw, nw[0] / sx, nw[1] / sy, nw[2] / sz);
+        const float nLen = std::sqrt(
+            nlRaw[0] * nlRaw[0] + nlRaw[1] * nlRaw[1] + nlRaw[2] * nlRaw[2]);
+
+        auto& v = rec.vertexBuffer[i];
+        v.x = pl[0];
+        v.y = pl[1];
+        v.z = pl[2];
+        if (nLen > 1.0e-7f) {
+            v.nx = nlRaw[0] / nLen;
+            v.ny = nlRaw[1] / nLen;
+            v.nz = nlRaw[2] / nLen;
+        } else {
+            v.nx = bv.nx;
+            v.ny = bv.ny;
+            v.nz = bv.nz;
+        }
+    }
+
+    rec.scaleFactors = {sx, sy, sz};
+    rec.scaleRotationXyzw = {qx, qy, qz, qw};
+    computeVertexBounds(
+        rec.vertexBuffer,
+        rec.minX, rec.minY, rec.minZ,
+        rec.maxX, rec.maxY, rec.maxZ);
+
+    // Clear cached OpenVDB fields so subsequent field/slice passes use the scaled mm geometry
+    rec.scalarFields.clear();
+    rec.surfaceColorGrid.reset();
+    rec.toolAxisGrid.reset();
+    rec.coarseScalarFields.clear();
+    rec.coarseSurfaceColorGrid.reset();
+    rec.coarseToolAxisGrid.reset();
+    rec.hasCachedSelectedLayers = false;
+    return true;
 }
 
 bool SlicerBackend::exportObjectStep(std::uint64_t objectId, const std::string& outFilePath) const {
@@ -3254,6 +3381,15 @@ std::uint64_t clone_cad_object(std::uint64_t source_object_id, rust::Str clone_n
     std::lock_guard<std::mutex> lock(g_backendMutex);
     const std::string nameStr(clone_name.data(), clone_name.size());
     return globalBackend().cloneObject(source_object_id, nameStr);
+}
+
+bool set_object_scale(
+    std::uint64_t object_id,
+    std::array<float, 3> scale_xyz,
+    std::array<float, 4> rotation_xyzw)
+{
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().setObjectScale(object_id, scale_xyz, rotation_xyzw);
 }
 
 bool export_object_step_to_path(std::uint64_t object_id, rust::Str path) {

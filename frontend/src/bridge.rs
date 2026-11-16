@@ -429,6 +429,15 @@ pub mod ffi {
         /// any computed OpenVDB fields) and returns the new `object_id` (or `0` on failure).
         pub fn clone_cad_object(source_object_id: u64, clone_name: &str) -> u64;
 
+        /// Scales `object_id`'s mesh from its original unscaled base vertices along the axes of
+        /// `rotation_xyzw = [qx, qy, qz, qw]` by `scale_xyz = [sx, sy, sz]`, recomputing normals
+        /// and bounds and invalidating cached volumetric fields.
+        pub fn set_object_scale(
+            object_id: u64,
+            scale_xyz: [f32; 3],
+            rotation_xyzw: [f32; 4],
+        ) -> bool;
+
         /// Exports the original OCCT B-Rep `TopoDS_Shape` for `object_id` to a STEP file.
         pub fn export_object_step_to_path(object_id: u64, path: &str) -> bool;
 

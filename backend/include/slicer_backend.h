@@ -75,6 +75,14 @@ public:
     /// and any computed OpenVDB scalar/vector fields) under a new unique `object_id`.
     std::uint64_t cloneObject(std::uint64_t sourceObjectId, const std::string& cloneName);
 
+    /// Scales an object's mesh from its original unscaled base vertices along the axes of the
+    /// given unit quaternion frame `rotationXyzw = [qx, qy, qz, qw]` by `scaleXyz = [sx, sy, sz]`,
+    /// recomputing normals and bounds and invalidating cached volumetric fields.
+    bool setObjectScale(
+        std::uint64_t objectId,
+        const std::array<float, 3>& scaleXyz,
+        const std::array<float, 4>& rotationXyzw);
+
     /// Exports an object's underlying OCCT B-Rep TopoDS_Shape to a STEP file
     /// (returns false if the object originated from a pure triangle mesh).
     bool exportObjectStep(std::uint64_t objectId, const std::string& outFilePath) const;
@@ -288,6 +296,10 @@ rust::Vec<float> get_object_vertex_tool_axes(std::uint64_t object_id);
 rust::Vec<float> get_object_vertex_support_needed(std::uint64_t object_id);
 bool remove_cad_object(std::uint64_t object_id);
 std::uint64_t clone_cad_object(std::uint64_t source_object_id, rust::Str clone_name);
+bool set_object_scale(
+    std::uint64_t object_id,
+    std::array<float, 3> scale_xyz,
+    std::array<float, 4> rotation_xyzw);
 bool export_object_step_to_path(std::uint64_t object_id, rust::Str path);
 
 rust::Vec<rust::String> list_object_fields(std::uint64_t object_id);

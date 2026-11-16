@@ -2542,16 +2542,254 @@ pub fn ui_workspace_system(
                             if let Ok((mut tf, _)) = object_transforms.get_mut(obj_entity) {
                                 let (w_min, w_max) =
                                     plate.objects[obj_idx].compute_world_aabb(&tf);
-                                let extents = w_max - w_min;
-                                ui.small(format!(
-                                    "World Size: {:.2} × {:.2} × {:.2} mm",
-                                    extents.x, extents.y, extents.z
-                                ));
+                                let extents = (w_max - w_min).max(Vec3::splat(1.0e-4));
+                                let (b_min, b_max) =
+                                    plate.objects[obj_idx].compute_base_world_aabb(tf.rotation);
+                                let base_extents = (b_max - b_min).max(Vec3::splat(1.0e-4));
 
                                 let gcode_offset_xy = config.scene_to_gcode_offset().xy();
                                 let mut bed_x = tf.translation.x + gcode_offset_xy.x;
                                 let mut bed_y = tf.translation.y + gcode_offset_xy.y;
                                 let mut changed = false;
+
+                                // --- Scale by Proportion (%) or Bounding Box Dimension (mm) ---
+                                let cur_scale = plate.objects[obj_idx].scale_factors;
+                                let cur_scale_rot = plate.objects[obj_idx].scale_rotation;
+                                let is_uniform_scale = (cur_scale.x - cur_scale.y).abs() < 1.0e-5
+                                    && (cur_scale.y - cur_scale.z).abs() < 1.0e-5;
+                                let rot_matches =
+                                    is_uniform_scale || cur_scale_rot.angle_between(tf.rotation) < 1.0e-4;
+                                let effective_scale = if rot_matches {
+                                    cur_scale
+                                } else {
+                                    extents / base_extents
+                                };
+
+                                let mut scale_pct_x = effective_scale.x * 100.0;
+                                let mut scale_pct_y = effective_scale.y * 100.0;
+                                let mut scale_pct_z = effective_scale.z * 100.0;
+                                let mut dim_mm_x = extents.x;
+                                let mut dim_mm_y = extents.y;
+                                let mut dim_mm_z = extents.z;
+                                let mut pending_scale_change: Option<(Vec3, Quat)> = None;
+
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.checkbox(
+                                        &mut plate.objects[obj_idx].lock_scale_axes,
+                                        "Lock Axes (Uniform Scale)",
+                                    )
+                                    .on_hover_text(
+                                        "When checked, editing any X/Y/Z scale percentage or bounding-box dimension scales all three axes proportionally",
+                                    );
+                                    if ui
+                                        .small_button("50%")
+                                        .on_hover_text("Halve current object dimensions (×0.5)")
+                                        .clicked()
+                                    {
+                                        pending_scale_change =
+                                            Some((cur_scale * 0.5, cur_scale_rot));
+                                    }
+                                    if ui
+                                        .small_button("200%")
+                                        .on_hover_text("Double current object dimensions (×2.0)")
+                                        .clicked()
+                                    {
+                                        pending_scale_change =
+                                            Some((cur_scale * 2.0, cur_scale_rot));
+                                    }
+                                    if ui
+                                        .small_button("in→mm")
+                                        .on_hover_text(
+                                            "Convert inches to millimeters (scale by 2540% / ×25.4)",
+                                        )
+                                        .clicked()
+                                    {
+                                        pending_scale_change =
+                                            Some((cur_scale * 25.4, cur_scale_rot));
+                                    }
+                                    if render_icon_button(
+                                        ui,
+                                        UiIcon::ResetTransform,
+                                        "100%",
+                                        false,
+                                        (cur_scale - Vec3::ONE).abs().max_element() > 1.0e-4,
+                                    )
+                                    .on_hover_text("Reset scale to original 100% imported dimensions")
+                                    .clicked()
+                                    {
+                                        pending_scale_change =
+                                            Some((Vec3::ONE, Quat::IDENTITY));
+                                    }
+                                });
+
+                                let lock_axes = plate.objects[obj_idx].lock_scale_axes;
+                                ui.horizontal(|ui| {
+                                    ui.label("Scale (%):");
+                                    ui.label("X");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut scale_pct_x)
+                                                .speed(0.5)
+                                                .range(0.1..=100_000.0)
+                                                .max_decimals(2)
+                                                .suffix("%"),
+                                        )
+                                        .changed()
+                                    {
+                                        let new_fx = (scale_pct_x / 100.0).clamp(0.001, 1000.0);
+                                        if lock_axes {
+                                            let ratio = new_fx / effective_scale.x.max(1.0e-5);
+                                            pending_scale_change =
+                                                Some((cur_scale * ratio, cur_scale_rot));
+                                        } else {
+                                            let mut s = effective_scale;
+                                            s.x = new_fx;
+                                            pending_scale_change = Some((s, tf.rotation));
+                                        }
+                                    }
+                                    ui.label("Y");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut scale_pct_y)
+                                                .speed(0.5)
+                                                .range(0.1..=100_000.0)
+                                                .max_decimals(2)
+                                                .suffix("%"),
+                                        )
+                                        .changed()
+                                    {
+                                        let new_fy = (scale_pct_y / 100.0).clamp(0.001, 1000.0);
+                                        if lock_axes {
+                                            let ratio = new_fy / effective_scale.y.max(1.0e-5);
+                                            pending_scale_change =
+                                                Some((cur_scale * ratio, cur_scale_rot));
+                                        } else {
+                                            let mut s = effective_scale;
+                                            s.y = new_fy;
+                                            pending_scale_change = Some((s, tf.rotation));
+                                        }
+                                    }
+                                    ui.label("Z");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut scale_pct_z)
+                                                .speed(0.5)
+                                                .range(0.1..=100_000.0)
+                                                .max_decimals(2)
+                                                .suffix("%"),
+                                        )
+                                        .changed()
+                                    {
+                                        let new_fz = (scale_pct_z / 100.0).clamp(0.001, 1000.0);
+                                        if lock_axes {
+                                            let ratio = new_fz / effective_scale.z.max(1.0e-5);
+                                            pending_scale_change =
+                                                Some((cur_scale * ratio, cur_scale_rot));
+                                        } else {
+                                            let mut s = effective_scale;
+                                            s.z = new_fz;
+                                            pending_scale_change = Some((s, tf.rotation));
+                                        }
+                                    }
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Size (mm):");
+                                    ui.label("X");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut dim_mm_x)
+                                                .speed(0.25)
+                                                .range(0.05..=100_000.0)
+                                                .max_decimals(2)
+                                                .suffix(" mm"),
+                                        )
+                                        .changed()
+                                    {
+                                        let target_x = dim_mm_x.clamp(0.05, 100_000.0);
+                                        if lock_axes {
+                                            let ratio = target_x / extents.x.max(1.0e-5);
+                                            pending_scale_change =
+                                                Some((cur_scale * ratio, cur_scale_rot));
+                                        } else {
+                                            let mut s = effective_scale;
+                                            s.x = (target_x / base_extents.x).clamp(0.001, 1000.0);
+                                            pending_scale_change = Some((s, tf.rotation));
+                                        }
+                                    }
+                                    ui.label("Y");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut dim_mm_y)
+                                                .speed(0.25)
+                                                .range(0.05..=100_000.0)
+                                                .max_decimals(2)
+                                                .suffix(" mm"),
+                                        )
+                                        .changed()
+                                    {
+                                        let target_y = dim_mm_y.clamp(0.05, 100_000.0);
+                                        if lock_axes {
+                                            let ratio = target_y / extents.y.max(1.0e-5);
+                                            pending_scale_change =
+                                                Some((cur_scale * ratio, cur_scale_rot));
+                                        } else {
+                                            let mut s = effective_scale;
+                                            s.y = (target_y / base_extents.y).clamp(0.001, 1000.0);
+                                            pending_scale_change = Some((s, tf.rotation));
+                                        }
+                                    }
+                                    ui.label("Z");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut dim_mm_z)
+                                                .speed(0.25)
+                                                .range(0.05..=100_000.0)
+                                                .max_decimals(2)
+                                                .suffix(" mm"),
+                                        )
+                                        .changed()
+                                    {
+                                        let target_z = dim_mm_z.clamp(0.05, 100_000.0);
+                                        if lock_axes {
+                                            let ratio = target_z / extents.z.max(1.0e-5);
+                                            pending_scale_change =
+                                                Some((cur_scale * ratio, cur_scale_rot));
+                                        } else {
+                                            let mut s = effective_scale;
+                                            s.z = (target_z / base_extents.z).clamp(0.001, 1000.0);
+                                            pending_scale_change = Some((s, tf.rotation));
+                                        }
+                                    }
+                                });
+
+                                if let Some((new_scale, new_rot)) = pending_scale_change {
+                                    if plate.objects[obj_idx].apply_scale_in_frame(
+                                        &mut commands,
+                                        render_device.as_deref(),
+                                        &mut meshes,
+                                        &mut config,
+                                        &mut vis_state,
+                                        new_scale,
+                                        new_rot,
+                                    ) {
+                                        changed = true;
+                                        let (n_min, n_max) =
+                                            plate.objects[obj_idx].compute_world_aabb(&tf);
+                                        let n_ext = n_max - n_min;
+                                        let s = plate.objects[obj_idx].scale_factors;
+                                        plate.status_message = format!(
+                                            "Scaled '{}' to {:.1}% × {:.1}% × {:.1}% ({:.2} × {:.2} × {:.2} mm).",
+                                            obj_name,
+                                            s.x * 100.0,
+                                            s.y * 100.0,
+                                            s.z * 100.0,
+                                            n_ext.x,
+                                            n_ext.y,
+                                            n_ext.z
+                                        );
+                                    }
+                                }
                                 ui.horizontal(|ui| {
                                     ui.label("Bed X (mm):");
                                     if ui

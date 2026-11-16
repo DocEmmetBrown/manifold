@@ -27,6 +27,14 @@ pub struct LoadedObjectData {
     pub plate_index: usize,
     pub initial_translation: Vec3,
     pub initial_rotation: Quat,
+    /// Original unscaled 100% mesh vertices in object-local coordinates.
+    pub base_vertices: Vec<RenderVertex>,
+    /// Per-axis scale multipliers (`Vec3::ONE` = `100%` across X, Y, Z).
+    pub scale_factors: Vec3,
+    /// Unit quaternion frame in which `scale_factors` is applied (`Quat::IDENTITY` by default).
+    pub scale_rotation: Quat,
+    /// Whether X, Y, Z scale axes are locked together (proportional scaling).
+    pub lock_scale_axes: bool,
     pub vertices: Vec<RenderVertex>,
     pub indices: Vec<u32>,
     pub local_min: Vec3,
@@ -195,6 +203,10 @@ pub fn build_loaded_object_from_part(
         // Place at the assembly's XY coordinates with z=0 sitting on the print bed
         initial_translation: Vec3::new(part.origin_x, part.origin_y, 0.0),
         initial_rotation: Quat::IDENTITY,
+        base_vertices: vertices.clone(),
+        scale_factors: Vec3::ONE,
+        scale_rotation: Quat::IDENTITY,
+        lock_scale_axes: true,
         vertices,
         indices,
         local_min,
@@ -221,5 +233,161 @@ pub fn compute_vertex_bounds(vertices: &[RenderVertex]) -> (Vec3, Vec3) {
         (Vec3::ZERO, Vec3::ZERO)
     } else {
         (min_pt, max_pt)
+    }
+}
+
+/// Scales `base_vertices` along the axes of unit quaternion frame `rotation` by `scale`,
+/// keeping the rotated XY centroid and Z minimum stationary and transforming normals by $R^{-1} S^{-1} R$.
+pub fn scale_vertices_in_frame(
+    base_vertices: &[RenderVertex],
+    scale: Vec3,
+    rotation: Quat,
+) -> Vec<RenderVertex> {
+    if base_vertices.is_empty() {
+        return Vec::new();
+    }
+    let rot = if rotation.is_finite() && rotation.length_squared() > 1.0e-8 {
+        rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    let inv_rot = rot.inverse();
+    let s = Vec3::new(
+        if scale.x.is_finite() { scale.x } else { 1.0 },
+        if scale.y.is_finite() { scale.y } else { 1.0 },
+        if scale.z.is_finite() { scale.z } else { 1.0 },
+    )
+    .clamp(Vec3::splat(0.001), Vec3::splat(1000.0));
+
+    let mut w_min = Vec3::splat(f32::INFINITY);
+    let mut w_max = Vec3::splat(f32::NEG_INFINITY);
+    for bv in base_vertices {
+        let pw = rot * Vec3::new(bv.x, bv.y, bv.z);
+        w_min = w_min.min(pw);
+        w_max = w_max.max(pw);
+    }
+    let pivot = Vec3::new(
+        0.5 * (w_min.x + w_max.x),
+        0.5 * (w_min.y + w_max.y),
+        w_min.z,
+    );
+
+    base_vertices
+        .iter()
+        .map(|bv| {
+            let pw = rot * Vec3::new(bv.x, bv.y, bv.z);
+            let pw_scaled = pivot + (pw - pivot) * s;
+            let pl = inv_rot * pw_scaled;
+
+            let nw = rot * Vec3::new(bv.nx, bv.ny, bv.nz);
+            let nw_scaled = Vec3::new(nw.x / s.x, nw.y / s.y, nw.z / s.z);
+            let nl = (inv_rot * nw_scaled).normalize_or_zero();
+            let nl = if nl.length_squared() > 0.5 {
+                nl
+            } else {
+                Vec3::new(bv.nx, bv.ny, bv.nz)
+            };
+            RenderVertex {
+                x: pl.x,
+                y: pl.y,
+                z: pl.z,
+                nx: nl.x,
+                ny: nl.y,
+                nz: nl.z,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_object_scaling_uniform_nonuniform_and_bbox_dimensions() {
+        let _guard = crate::bridge::TEST_BACKEND_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Register a 10 x 20 x 30 mm box in the C++ backend
+        let positions: [f32; 24] = [
+            -5.0, -10.0, 0.0,  5.0, -10.0, 0.0,  5.0, 10.0, 0.0, -5.0, 10.0, 0.0,
+            -5.0, -10.0, 30.0, 5.0, -10.0, 30.0, 5.0, 10.0, 30.0, -5.0, 10.0, 30.0,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2, // bottom
+            4, 5, 6, 4, 6, 7, // top
+            0, 1, 5, 0, 5, 4, // front
+            1, 2, 6, 1, 6, 5, // right
+            2, 3, 7, 2, 7, 6, // back
+            3, 0, 4, 3, 4, 7, // left
+        ];
+        let part = ffi::register_triangle_mesh("scale_test_box", &positions, &indices);
+        assert!(part.object_id > 0);
+        let obj = build_loaded_object_from_part(part, "scale_test.stl").expect("loaded box");
+
+        let base_ext = obj.local_max - obj.local_min;
+        assert!((base_ext - Vec3::new(10.0, 20.0, 30.0)).length() < 1e-4);
+
+        // 1. Uniform proportional scale (150%) -> 15 x 30 x 45 mm
+        let s_uniform = Vec3::splat(1.5);
+        assert!(ffi::set_object_scale(
+            obj.object_id,
+            s_uniform.to_array(),
+            Quat::IDENTITY.to_array()
+        ));
+        let v_uniform = scale_vertices_in_frame(&obj.base_vertices, s_uniform, Quat::IDENTITY);
+        let (min_u, max_u) = compute_vertex_bounds(&v_uniform);
+        assert!(((max_u - min_u) - Vec3::new(15.0, 30.0, 45.0)).length() < 1e-4);
+
+        let cpp_v_u = ffi::get_object_vertices(obj.object_id);
+        let (cpp_min_u, cpp_max_u) = compute_vertex_bounds(&cpp_v_u);
+        assert!(((cpp_max_u - cpp_min_u) - Vec3::new(15.0, 30.0, 45.0)).length() < 1e-4);
+
+        // 2. Non-uniform scale to specific bounding-box dimensions (25 x 40 x 15 mm) under a 35-deg X rotation
+        let rot = Quat::from_rotation_x(35.0_f32.to_radians());
+        let mut b_min = Vec3::splat(f32::INFINITY);
+        let mut b_max = Vec3::splat(f32::NEG_INFINITY);
+        for bv in &obj.base_vertices {
+            let pw = rot * Vec3::new(bv.x, bv.y, bv.z);
+            b_min = b_min.min(pw);
+            b_max = b_max.max(pw);
+        }
+        let rot_base_ext = b_max - b_min;
+        let target_bbox = Vec3::new(25.0, 40.0, 15.0);
+        let s_nonuniform = target_bbox / rot_base_ext;
+
+        assert!(ffi::set_object_scale(
+            obj.object_id,
+            s_nonuniform.to_array(),
+            rot.to_array()
+        ));
+        let v_nonuniform = scale_vertices_in_frame(&obj.base_vertices, s_nonuniform, rot);
+
+        let mut w_min = Vec3::splat(f32::INFINITY);
+        let mut w_max = Vec3::splat(f32::NEG_INFINITY);
+        for v in &v_nonuniform {
+            let pw = rot * Vec3::new(v.x, v.y, v.z);
+            w_min = w_min.min(pw);
+            w_max = w_max.max(pw);
+        }
+        assert!(
+            ((w_max - w_min) - target_bbox).length() < 1e-3,
+            "Expected world bbox {:?}, got {:?}",
+            target_bbox,
+            w_max - w_min
+        );
+
+        // 3. Reset to 100% -> restores 10 x 20 x 30 mm
+        assert!(ffi::set_object_scale(
+            obj.object_id,
+            Vec3::ONE.to_array(),
+            Quat::IDENTITY.to_array()
+        ));
+        let cpp_v_reset = ffi::get_object_vertices(obj.object_id);
+        let (r_min, r_max) = compute_vertex_bounds(&cpp_v_reset);
+        assert!(((r_max - r_min) - Vec3::new(10.0, 20.0, 30.0)).length() < 1e-4);
+
+        let _ = ffi::remove_cad_object(obj.object_id);
     }
 }
