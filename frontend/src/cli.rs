@@ -1440,9 +1440,12 @@ pub fn execute_headless_slice(opts: &SliceCommandOptions) -> Result<HeadlessSlic
             .objects
             .iter()
             .enumerate()
-            .filter(|(_, o)| o.plate_index == p_idx)
+            .filter(|(_, o)| o.plate_index == p_idx && o.printable)
             .map(|(i, _)| i)
             .collect();
+        if obj_indices.is_empty() {
+            continue;
+        }
 
         let should_arrange = match opts.arrange_override {
             Some(flag) => flag,
@@ -1476,6 +1479,7 @@ pub fn execute_headless_slice(opts: &SliceCommandOptions) -> Result<HeadlessSlic
                 object_id: obj.object_id,
                 name: obj.name.clone(),
                 has_brep: obj.has_brep,
+                printable: obj.printable,
                 plate_index: obj.plate_index,
                 transform: *tf,
                 vertices: obj.vertices.clone(),
@@ -1511,9 +1515,12 @@ pub fn execute_headless_slice(opts: &SliceCommandOptions) -> Result<HeadlessSlic
             .objects
             .iter()
             .enumerate()
-            .filter(|(_, o)| o.plate_index == p_idx)
+            .filter(|(_, o)| o.plate_index == p_idx && o.printable)
             .map(|(i, _)| i)
             .collect();
+        if obj_indices.is_empty() {
+            continue;
+        }
 
         if !opts.quiet {
             eprintln!(

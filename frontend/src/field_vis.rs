@@ -444,6 +444,15 @@ pub struct FieldVisualizationState {
     pub cached_unmixed_toolpaths: Option<ObjectToolpathsResult>,
     pub cached_toolpaths: Option<ObjectToolpathsResult>,
     pub cached_planned_gcode: Option<crate::gcode::PlannedGcodeResult>,
+    /// Per-object cached unmixed toolpaths keyed by `object_id` across the build plate.
+    pub plate_unmixed_toolpaths: std::collections::HashMap<u64, ObjectToolpathsResult>,
+    /// Per-object cached optical-mixed toolpaths keyed by `object_id` across the build plate.
+    pub plate_mixed_toolpaths: std::collections::HashMap<u64, ObjectToolpathsResult>,
+    /// True when `cached_planned_gcode` segments are stored in scene world coordinates
+    /// (so the toolpath mesh entity is placed at `Transform::IDENTITY`).
+    pub planned_gcode_is_world_space: bool,
+    /// Cached signature of active plate printable objects & transforms used to build `cached_planned_gcode`.
+    pub last_plate_gcode_signature: u64,
     pub toolpaths_entity: Option<Entity>,
     pub toolpaths_mesh_handle: Option<Handle<Mesh>>,
     pub toolpaths_mat_handle: Option<Handle<StandardMaterial>>,
@@ -476,7 +485,7 @@ pub struct FieldVisualizationState {
         u64,
         bevy::tasks::Task<(
             Option<SelectedIsosurfacesResult>,
-            Option<ObjectToolpathsResult>,
+            Vec<(u64, ObjectToolpathsResult)>,
         )>,
     )>,
     /// True while the user is actively holding down the pointer on a UI slider/drag widget.
@@ -555,6 +564,10 @@ impl Default for FieldVisualizationState {
             cached_unmixed_toolpaths: None,
             cached_toolpaths: None,
             cached_planned_gcode: None,
+            plate_unmixed_toolpaths: std::collections::HashMap::new(),
+            plate_mixed_toolpaths: std::collections::HashMap::new(),
+            planned_gcode_is_world_space: false,
+            last_plate_gcode_signature: 0,
             toolpaths_entity: None,
             toolpaths_mesh_handle: None,
             toolpaths_mat_handle: None,
@@ -595,6 +608,10 @@ impl FieldVisualizationState {
         self.cached_unmixed_toolpaths = None;
         self.cached_toolpaths = None;
         self.cached_planned_gcode = None;
+        self.plate_unmixed_toolpaths.clear();
+        self.plate_mixed_toolpaths.clear();
+        self.planned_gcode_is_world_space = false;
+        self.last_plate_gcode_signature = 0;
         self.layer_move_scrub_limit = None;
         self.dirty_isosurface = true;
         self.dirty_selected_layers = true;
@@ -612,6 +629,26 @@ impl FieldVisualizationState {
     pub fn spawn_slicing_task(
         &mut self,
         object_id: u64,
+        config: &SlicerConfig,
+        need_layers: bool,
+        need_toolpaths: bool,
+    ) {
+        self.spawn_slicing_task_for_objects(
+            object_id,
+            vec![object_id],
+            config,
+            need_layers,
+            need_toolpaths,
+        );
+    }
+
+    /// Spawns an asynchronous background task on `IoTaskPool` to compute selected slicing
+    /// isosurfaces for `object_id` and/or non-planar shell toolpaths for all `printable_object_ids`
+    /// on the active build plate.
+    pub fn spawn_slicing_task_for_objects(
+        &mut self,
+        object_id: u64,
+        printable_object_ids: Vec<u64>,
         config: &SlicerConfig,
         need_layers: bool,
         need_toolpaths: bool,
@@ -718,12 +755,19 @@ impl FieldVisualizationState {
             } else {
                 None
             };
-            let tp_res = if need_toolpaths {
-                Some(ffi::generate_object_shell_toolpaths(object_id, adaptivity))
-            } else {
-                None
-            };
-            (layers_res, tp_res)
+            let mut tp_list = Vec::new();
+            if need_toolpaths {
+                let ids = if printable_object_ids.is_empty() {
+                    vec![object_id]
+                } else {
+                    printable_object_ids
+                };
+                for oid in ids {
+                    let tp = ffi::generate_object_shell_toolpaths(oid, adaptivity);
+                    tp_list.push((oid, tp));
+                }
+            }
+            (layers_res, tp_list)
         });
 
         self.pending_slicing_task = Some((object_id, task));
@@ -732,7 +776,7 @@ impl FieldVisualizationState {
     pub fn apply_slicing_task_result(
         &mut self,
         layers_opt: Option<SelectedIsosurfacesResult>,
-        toolpaths_opt: Option<ObjectToolpathsResult>,
+        plate_toolpaths: Vec<(u64, ObjectToolpathsResult)>,
     ) {
         if let Some(res) = layers_opt {
             if res.valid && !res.layers.is_empty() {
@@ -753,17 +797,26 @@ impl FieldVisualizationState {
             self.dirty_slice = true;
         }
 
-        if let Some(res) = toolpaths_opt {
-            if res.valid && !res.layers.is_empty() {
-                if self.selected_layer_max_idx == 0 && res.layers.len() > 1 {
-                    self.selected_layer_max_idx = res.layers.len() - 1;
+        if !plate_toolpaths.is_empty() {
+            let mut any_valid = false;
+            for (oid, res) in plate_toolpaths {
+                if res.valid && !res.layers.is_empty() {
+                    any_valid = true;
+                    if self.selected_layer_max_idx == 0 && res.layers.len() > 1 {
+                        self.selected_layer_max_idx = res.layers.len() - 1;
+                    }
+                    if Some(oid) == self.last_object_id || self.cached_toolpaths.is_none() {
+                        self.cached_unmixed_toolpaths = Some(res.clone());
+                        self.cached_toolpaths = Some(res.clone());
+                    }
+                    self.plate_unmixed_toolpaths.insert(oid, res.clone());
+                    self.plate_mixed_toolpaths.insert(oid, res);
                 }
-                self.layer_move_scrub_limit = None;
-                self.cached_unmixed_toolpaths = Some(res.clone());
-                self.cached_toolpaths = Some(res);
+            }
+            self.layer_move_scrub_limit = None;
+            if any_valid {
                 self.dirty_color_mixing = true;
             } else {
-                self.layer_move_scrub_limit = None;
                 self.cached_unmixed_toolpaths = None;
                 self.cached_toolpaths = None;
                 self.cached_planned_gcode = None;
@@ -909,18 +962,17 @@ pub fn sync_field_visualization_system(
         vis_state.available_fields.clear();
         vis_state.cached_stats = None;
         vis_state.cached_selected_layers = None;
-        vis_state.cached_unmixed_toolpaths = None;
-        vis_state.cached_toolpaths = None;
-        vis_state.cached_planned_gcode = None;
+        vis_state.cached_unmixed_toolpaths = selected_id
+            .and_then(|id| vis_state.plate_unmixed_toolpaths.get(&id).cloned());
+        vis_state.cached_toolpaths = selected_id
+            .and_then(|id| vis_state.plate_mixed_toolpaths.get(&id).cloned());
         vis_state.layer_move_scrub_limit = None;
         vis_state.contour_segments_local.clear();
         vis_state.dirty_isosurface = true;
         vis_state.dirty_selected_layers = true;
         vis_state.dirty_selected_layers_mesh = true;
-        vis_state.dirty_toolpaths = true;
+        vis_state.dirty_toolpaths = vis_state.cached_toolpaths.is_none();
         vis_state.dirty_color_mixing = false;
-        vis_state.dirty_planned_gcode = true;
-        vis_state.dirty_toolpaths_mesh = true;
         vis_state.dirty_slice = true;
         vis_state.dirty_surface_colors = true;
         vis_state.last_surface_color_transform = None;
@@ -1070,7 +1122,19 @@ pub fn sync_field_visualization_system(
     {
         let need_layers =
             want_layers || (want_toolpaths && vis_state.cached_selected_layers.is_none());
-        vis_state.spawn_slicing_task(obj_id, &config, need_layers, want_toolpaths);
+        let printable_ids: Vec<u64> = plate
+            .objects
+            .iter()
+            .filter(|o| o.plate_index == plate.active_plate_index && o.printable)
+            .map(|o| o.object_id)
+            .collect();
+        vis_state.spawn_slicing_task_for_objects(
+            obj_id,
+            printable_ids,
+            &config,
+            need_layers,
+            want_toolpaths,
+        );
     }
 
     // 2. Update 3D Isosurface Mesh in-place (opaque depth-tested mesh with per-vertex colors)
@@ -1423,37 +1487,123 @@ pub fn sync_field_visualization_system(
     }
 
     // 2c-ii. Apply Kubelka-Munk optical filament mixing across layers & short extrusions when dirty
-    if vis_state.cached_unmixed_toolpaths.is_some()
+    if (!vis_state.plate_unmixed_toolpaths.is_empty() || vis_state.cached_unmixed_toolpaths.is_some())
         && (vis_state.dirty_color_mixing || vis_state.cached_toolpaths.is_none())
         && !vis_state.ui_pointer_down
     {
         vis_state.dirty_color_mixing = false;
-        if let Some(ref raw_tp) = vis_state.cached_unmixed_toolpaths {
-            let mixed = build_mixed_toolpaths_for_object(obj_id, raw_tp, &config);
-            vis_state.cached_toolpaths = Some(mixed);
+        let unmixed_ids: Vec<u64> = vis_state.plate_unmixed_toolpaths.keys().copied().collect();
+        for oid in unmixed_ids {
+            if let Some(raw_tp) = vis_state.plate_unmixed_toolpaths.get(&oid) {
+                let mixed = build_mixed_toolpaths_for_object(oid, raw_tp, &config);
+                if oid == obj_id {
+                    vis_state.cached_toolpaths = Some(mixed.clone());
+                }
+                vis_state.plate_mixed_toolpaths.insert(oid, mixed);
+            }
+        }
+        if !vis_state.plate_mixed_toolpaths.contains_key(&obj_id) {
+            if let Some(ref raw_tp) = vis_state.cached_unmixed_toolpaths {
+                let mixed = build_mixed_toolpaths_for_object(obj_id, raw_tp, &config);
+                vis_state.cached_toolpaths = Some(mixed.clone());
+                vis_state.plate_mixed_toolpaths.insert(obj_id, mixed);
+            }
+        }
+        vis_state.dirty_planned_gcode = true;
+        vis_state.dirty_toolpaths_mesh = true;
+    }
+
+    // Track changes to active plate printable objects & their transforms
+    {
+        use std::hash::{Hash, Hasher};
+        let mut sig_hasher = std::collections::hash_map::DefaultHasher::new();
+        plate.active_plate_index.hash(&mut sig_hasher);
+        for o in &plate.objects {
+            if o.plate_index == plate.active_plate_index {
+                o.object_id.hash(&mut sig_hasher);
+                o.printable.hash(&mut sig_hasher);
+                let tf = object_transforms
+                    .get(o.entity)
+                    .copied()
+                    .unwrap_or(Transform::IDENTITY);
+                tf.translation.x.to_bits().hash(&mut sig_hasher);
+                tf.translation.y.to_bits().hash(&mut sig_hasher);
+                tf.translation.z.to_bits().hash(&mut sig_hasher);
+                tf.rotation.x.to_bits().hash(&mut sig_hasher);
+                tf.rotation.y.to_bits().hash(&mut sig_hasher);
+                tf.rotation.z.to_bits().hash(&mut sig_hasher);
+                tf.rotation.w.to_bits().hash(&mut sig_hasher);
+            }
+        }
+        let plate_sig = sig_hasher.finish();
+        if vis_state.last_plate_gcode_signature != plate_sig {
+            vis_state.last_plate_gcode_signature = plate_sig;
             vis_state.dirty_planned_gcode = true;
-            vis_state.dirty_toolpaths_mesh = true;
         }
     }
 
-    // 2d. Plan G-code & Render Non-Planar Toolpaths (3D Variable-Width Extruded Bead Mesh)
-    if vis_state.cached_toolpaths.is_some()
+    // 2d. Plan G-code & Render Non-Planar Toolpaths across all printable objects on the active plate
+    if (!vis_state.plate_mixed_toolpaths.is_empty() || vis_state.cached_toolpaths.is_some())
         && (vis_state.dirty_planned_gcode || vis_state.cached_planned_gcode.is_none())
         && !vis_state.ui_pointer_down
     {
         vis_state.dirty_planned_gcode = false;
-        if let Some(ref tp_res) = vis_state.cached_toolpaths {
-            let planned = crate::gcode::plan_and_emit_gcode_for_object(
-                &scene_obj.name,
-                scene_obj.object_id,
-                tp_res,
-                obj_world_tf,
-                &config,
-            );
-            vis_state.cached_planned_gcode = Some(planned);
-            vis_state.dirty_toolpaths_mesh = true;
+        let mut planned_objects: Vec<(String, crate::gcode::PlannedGcodeResult, Transform)> =
+            Vec::new();
+        for o in &plate.objects {
+            if o.plate_index != plate.active_plate_index || !o.printable {
+                continue;
+            }
+            let o_tf = object_transforms
+                .get(o.entity)
+                .copied()
+                .unwrap_or(Transform::IDENTITY);
+            let tp_opt = vis_state
+                .plate_mixed_toolpaths
+                .get(&o.object_id)
+                .or_else(|| {
+                    if o.object_id == obj_id {
+                        vis_state.cached_toolpaths.as_ref()
+                    } else {
+                        None
+                    }
+                });
+            if let Some(tp_res) = tp_opt {
+                if tp_res.valid && !tp_res.layers.is_empty() {
+                    let p = crate::gcode::plan_and_emit_gcode_for_object(
+                        &o.name,
+                        o.object_id,
+                        tp_res,
+                        o_tf,
+                        &config,
+                    );
+                    planned_objects.push((o.name.clone(), p, o_tf));
+                }
+            }
         }
+
+        if planned_objects.is_empty() {
+            vis_state.cached_planned_gcode = None;
+            vis_state.planned_gcode_is_world_space = false;
+        } else {
+            let combined =
+                crate::gcode::combine_planned_objects_into_plate_result(&planned_objects, &config);
+            if !combined.layers.is_empty() {
+                vis_state.selected_layer_max_idx =
+                    vis_state.selected_layer_max_idx.min(combined.layers.len() - 1);
+            }
+            vis_state.cached_planned_gcode = Some(combined);
+            vis_state.planned_gcode_is_world_space = true;
+        }
+        vis_state.dirty_toolpaths_mesh = true;
     }
+
+    let toolpath_render_tf =
+        if vis_state.planned_gcode_is_world_space && vis_state.cached_planned_gcode.is_some() {
+            Transform::IDENTITY
+        } else {
+            obj_world_tf
+        };
 
     if !vis_state.show_toolpaths {
         hide_all_toolpath_entities(&vis_state, &mut toolpaths_query);
@@ -1466,7 +1616,7 @@ pub fn sync_field_visualization_system(
             &mut meshes,
             &mut materials,
             &mut toolpaths_query,
-            obj_world_tf,
+            toolpath_render_tf,
         );
     }
 
@@ -1526,8 +1676,8 @@ pub fn sync_field_visualization_system(
                             (rgba[1] * 1.15).min(1.0),
                             (rgba[2] * 1.15).min(1.0),
                         );
-                        let p0 = obj_world_tf.transform_point(seg.p0_local);
-                        let p1 = obj_world_tf.transform_point(seg.p1_local);
+                        let p0 = toolpath_render_tf.transform_point(seg.p0_local);
+                        let p1 = toolpath_render_tf.transform_point(seg.p1_local);
                         gizmos.line(p0, p1, line_col);
                     }
                 }
@@ -1704,16 +1854,16 @@ pub fn sync_field_visualization_system(
         let mut tf_moved = false;
         if let Some(ent) = vis_state.toolpaths_entity {
             if let Ok((mut tf, _)) = toolpaths_query.get_mut(ent) {
-                if *tf != obj_world_tf {
-                    *tf = obj_world_tf;
+                if *tf != toolpath_render_tf {
+                    *tf = toolpath_render_tf;
                     tf_moved = true;
                 }
             }
         }
         for part in &vis_state.hq_toolpath_parts {
             if let Ok((mut tf, _)) = toolpaths_query.get_mut(part.entity) {
-                if *tf != obj_world_tf {
-                    *tf = obj_world_tf;
+                if *tf != toolpath_render_tf {
+                    *tf = toolpath_render_tf;
                     tf_moved = true;
                 }
             }
@@ -1900,12 +2050,17 @@ impl FieldVisualizationState {
                     };
 
                     if let Some(seg) = seg_opt {
-                        let seg_start_bed = obj_world_tf.transform_point(seg.p0_local);
-                        let tip_bed = obj_world_tf.transform_point(seg.p1_local);
+                        let pose_tf = if self.planned_gcode_is_world_space {
+                            Transform::IDENTITY
+                        } else {
+                            obj_world_tf
+                        };
+                        let seg_start_bed = pose_tf.transform_point(seg.p0_local);
+                        let tip_bed = pose_tf.transform_point(seg.p1_local);
                         let travel_dir_bed = (tip_bed - seg_start_bed)
                             .try_normalize()
                             .unwrap_or(Vec3::X);
-                        let nozzle_axis_bed = (obj_world_tf.rotation * seg.nozzle_local_1)
+                        let nozzle_axis_bed = (pose_tf.rotation * seg.nozzle_local_1)
                             .try_normalize()
                             .or_else(|| seg.nozzle_bed_1.try_normalize())
                             .unwrap_or_else(|| {

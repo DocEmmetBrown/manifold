@@ -5609,6 +5609,343 @@ pub fn plan_and_emit_gcode_for_object(
     }
 }
 
+/// Combines one or more per-object `PlannedGcodeResult`s (with their scene `Transform`s) on a build
+/// plate into a unified plate-level `PlannedGcodeResult`:
+/// - Transforms every segment's `p0_local` / `p1_local` and `nozzle_local_*` into scene world
+///   coordinates so a single `Transform::IDENTITY` mesh displays all printable objects on the plate.
+/// - Merges corresponding layer indices `0..max_layers` across objects for synchronized 3D layer
+///   and move scrubbing.
+/// - Emits a combined multi-object `gcode_text` with per-object `EXCLUDE_OBJECT_DEFINE` definitions,
+///   safe inter-object Z-clearance hops, combined thumbnails, and aggregated filament/time metadata.
+pub fn combine_planned_objects_into_plate_result(
+    planned_objects: &[(String, PlannedGcodeResult, Transform)],
+    config: &SlicerConfig,
+) -> PlannedGcodeResult {
+    if planned_objects.is_empty() {
+        return PlannedGcodeResult {
+            layers: Vec::new(),
+            gcode_text: String::new(),
+            total_time_s: 0.0,
+            total_filament_mm: 0.0,
+            total_filament_volume_mm3: 0.0,
+            total_filament_grams: 0.0,
+            bbox_min_bed: Vec3::ZERO,
+            bbox_max_bed: Vec3::ZERO,
+            exclude_object_name: String::new(),
+            exclude_object_center_bed: [0.0, 0.0],
+            exclude_object_polygon_bed: Vec::new(),
+            extruding_move_count: 0,
+            travel_move_count: 0,
+            retract_count: 0,
+            toolchange_count: 0,
+            min_speed_mms: 0.0,
+            max_speed_mms: 100.0,
+            min_accel_mms2: 0.0,
+            max_accel_mms2: 1000.0,
+            min_flow_mm3s: 0.0,
+            max_flow_mm3s: 10.0,
+            min_flow_mult: 0.9,
+            max_flow_mult: 1.1,
+            min_pa_s: 0.0,
+            max_pa_s: 0.05,
+            min_pressure_mm3s: 0.0,
+            max_pressure_mm3s: 10.0,
+            min_width_mm: 0.2,
+            max_width_mm: 0.6,
+            min_height_mm: 0.1,
+            max_height_mm: 0.4,
+            min_tool_iso_angle_deg: 0.0,
+            max_tool_iso_angle_deg: 45.0,
+        };
+    }
+
+    if planned_objects.len() == 1 {
+        let (_, mut single, obj_tf) = planned_objects[0].clone();
+        for layer in &mut single.layers {
+            for seg in &mut layer.segments {
+                seg.p0_local = obj_tf.transform_point(seg.p0_local);
+                seg.p1_local = obj_tf.transform_point(seg.p1_local);
+                seg.nozzle_local_0 = (obj_tf.rotation * seg.nozzle_local_0).normalize_or_zero();
+                seg.nozzle_local_1 = (obj_tf.rotation * seg.nozzle_local_1).normalize_or_zero();
+            }
+        }
+        return single;
+    }
+
+    let mut gcfg = config.gcode.clone();
+    gcfg.sanitize();
+    let active_tool = config.active_tool();
+    let tool_id = active_tool.map(|t| t.id).unwrap_or(0);
+    let nozzle_diam_mm = active_tool
+        .map(|t| t.nozzle_diameter_mm)
+        .unwrap_or(0.40)
+        .max(0.10);
+    let nozzle_temp_c = active_tool.map(|t| t.temperature_celsius).unwrap_or(215.0);
+    let active_tool_gcfg = active_tool
+        .map(|t| t.effective_gcode_config(&gcfg))
+        .unwrap_or_else(|| gcfg.clone());
+    let gravity_bed = config.query_gravity_bed(Vec3::ZERO);
+    let up_bed = (-gravity_bed).try_normalize().unwrap_or(Vec3::Z);
+
+    let max_layers = planned_objects
+        .iter()
+        .map(|(_, p, _)| p.layers.len())
+        .max()
+        .unwrap_or(0);
+    let mut merged_layers: Vec<PlannedLayerGcode> = (0..max_layers)
+        .map(|idx| PlannedLayerGcode {
+            layer_index: idx as u32,
+            branch_id: 0,
+            isovalue: 0.0,
+            segments: Vec::new(),
+        })
+        .collect();
+
+    let mut all_layers_for_thumb: Vec<PlannedLayerGcode> = Vec::new();
+    let mut bbox_min = Vec3::splat(f32::MAX);
+    let mut bbox_max = Vec3::splat(f32::MIN);
+    let mut total_layers_sum = 0usize;
+    let mut total_time_s = 0.0f32;
+    let mut total_filament_mm = 0.0f32;
+    let mut total_filament_vol = 0.0f32;
+    let mut total_filament_g = 0.0f32;
+    let mut extruding_move_count = 0usize;
+    let mut travel_move_count = 0usize;
+    let mut retract_count = 0usize;
+    let mut toolchange_count = 0usize;
+
+    let mut min_speed = f32::MAX;
+    let mut max_speed = 0.0f32;
+    let mut min_accel = f32::MAX;
+    let mut max_accel = 0.0f32;
+    let mut min_flow = f32::MAX;
+    let mut max_flow = 0.0f32;
+    let mut min_mult = f32::MAX;
+    let mut max_mult = 0.0f32;
+    let mut min_pa = f32::MAX;
+    let mut max_pa = 0.0f32;
+    let mut min_press = f32::MAX;
+    let mut max_press = 0.0f32;
+    let mut min_w = f32::MAX;
+    let mut max_w = 0.0f32;
+    let mut min_h = f32::MAX;
+    let mut max_h = 0.0f32;
+    let mut min_iso_angle = f32::MAX;
+    let mut max_iso_angle = 0.0f32;
+    let mut used_types: Vec<String> = Vec::new();
+
+    for (_, p, obj_tf) in planned_objects {
+        total_layers_sum += p.layers.len();
+        total_time_s += p.total_time_s;
+        total_filament_mm += p.total_filament_mm;
+        total_filament_vol += p.total_filament_volume_mm3;
+        total_filament_g += p.total_filament_grams;
+        extruding_move_count += p.extruding_move_count;
+        travel_move_count += p.travel_move_count;
+        retract_count += p.retract_count;
+        toolchange_count += p.toolchange_count;
+
+        min_speed = min_speed.min(p.min_speed_mms);
+        max_speed = max_speed.max(p.max_speed_mms);
+        min_accel = min_accel.min(p.min_accel_mms2);
+        max_accel = max_accel.max(p.max_accel_mms2);
+        min_flow = min_flow.min(p.min_flow_mm3s);
+        max_flow = max_flow.max(p.max_flow_mm3s);
+        min_mult = min_mult.min(p.min_flow_mult);
+        max_mult = max_mult.max(p.max_flow_mult);
+        min_pa = min_pa.min(p.min_pa_s);
+        max_pa = max_pa.max(p.max_pa_s);
+        min_press = min_press.min(p.min_pressure_mm3s);
+        max_press = max_press.max(p.max_pressure_mm3s);
+        min_w = min_w.min(p.min_width_mm);
+        max_w = max_w.max(p.max_width_mm);
+        min_h = min_h.min(p.min_height_mm);
+        max_h = max_h.max(p.max_height_mm);
+        min_iso_angle = min_iso_angle.min(p.min_tool_iso_angle_deg);
+        max_iso_angle = max_iso_angle.max(p.max_tool_iso_angle_deg);
+
+        for (l_idx, layer) in p.layers.iter().enumerate() {
+            if merged_layers[l_idx].isovalue == 0.0 {
+                merged_layers[l_idx].isovalue = layer.isovalue;
+                merged_layers[l_idx].branch_id = layer.branch_id;
+            }
+            for seg in &layer.segments {
+                if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
+                    bbox_min = bbox_min.min(seg.p0_bed).min(seg.p1_bed);
+                    bbox_max = bbox_max.max(seg.p0_bed).max(seg.p1_bed);
+                    let ft = config
+                        .tools
+                        .iter()
+                        .find(|t| t.id == seg.tool_id)
+                        .map(|t| t.filament_type.trim().to_string())
+                        .filter(|ft| !ft.is_empty())
+                        .unwrap_or_else(|| active_tool_gcfg.filament_type.clone());
+                    if !used_types.iter().any(|e| e.eq_ignore_ascii_case(&ft)) {
+                        used_types.push(ft);
+                    }
+                }
+                let mut world_seg = seg.clone();
+                world_seg.p0_local = obj_tf.transform_point(seg.p0_local);
+                world_seg.p1_local = obj_tf.transform_point(seg.p1_local);
+                world_seg.nozzle_local_0 =
+                    (obj_tf.rotation * seg.nozzle_local_0).normalize_or_zero();
+                world_seg.nozzle_local_1 =
+                    (obj_tf.rotation * seg.nozzle_local_1).normalize_or_zero();
+                merged_layers[l_idx].segments.push(world_seg);
+            }
+            all_layers_for_thumb.push(layer.clone());
+        }
+    }
+
+    if !bbox_min.is_finite() || bbox_min.x > bbox_max.x {
+        bbox_min = Vec3::ZERO;
+        bbox_max = Vec3::ZERO;
+    }
+
+    let mut out = String::with_capacity(128 * 1024);
+    out.push_str("; generated by PrusaSlicer 2.8.0-Manifold2 on 2026-10-20 at 00:00:00 UTC\n");
+    if gcfg.emit_thumbnails && !all_layers_for_thumb.is_empty() {
+        out.push_str(&render_toolpath_preview_thumbnails(
+            &all_layers_for_thumb,
+            bbox_min,
+            bbox_max,
+            up_bed,
+        ));
+    }
+    if gcfg.emit_exclude_object {
+        match gcfg.gcode_dialect {
+            crate::config::GcodeDialect::Klipper => {
+                for (_, p, _) in planned_objects {
+                    out.push_str(&format_exclude_object_define(
+                        &p.exclude_object_name,
+                        p.exclude_object_center_bed,
+                        &p.exclude_object_polygon_bed,
+                    ));
+                    out.push('\n');
+                }
+            }
+            crate::config::GcodeDialect::RepRapFirmware => {
+                out.push_str(&format!(
+                    "M486 T{} ; RepRapFirmware object cancellation count\n",
+                    planned_objects.len()
+                ));
+            }
+        }
+    }
+
+    let start_expanded = expand_gcode_template(
+        &gcfg.start_gcode_template,
+        tool_id,
+        nozzle_temp_c,
+        gcfg.bed_temperature_celsius,
+        nozzle_diam_mm,
+        bbox_min,
+        bbox_max,
+        total_layers_sum,
+    );
+    out.push_str(&start_expanded);
+    if !start_expanded.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("M83 ; Ensure relative extrusion\n");
+
+    for (idx, (obj_name, p, _)) in planned_objects.iter().enumerate() {
+        out.push_str(&format!("\n; === OBJECT {}: {} ===\n", idx + 1, obj_name));
+        if idx > 0 {
+            let safe_z = (bbox_max.z + gcfg.z_hop_mm.max(2.0)).min(config.bed.height_z);
+            let z_feed = (gcfg.z_hop_speed_mms * 60.0).max(120.0);
+            out.push_str(&format!(
+                "G0 Z{safe_z:.3} F{z_feed:.0} ; Safe inter-object Z clearance\n"
+            ));
+        }
+        if let Some(start_pos) = p.gcode_text.find("\n; --- LAYER ") {
+            let body_slice = &p.gcode_text[start_pos..];
+            let end_pos = body_slice
+                .find("\n; --- Manifold2 Non-Planar Print End ---")
+                .or_else(|| body_slice.find("\n; --- Manifold2 5-Axis RRF (XYZ + BC) Print End ---"))
+                .or_else(|| body_slice.find("\n; --- Moonraker / PrusaSlicer Metadata Footer ---"))
+                .unwrap_or(body_slice.len());
+            out.push_str(&body_slice[..end_pos]);
+            out.push('\n');
+        }
+    }
+
+    out.push('\n');
+    let end_expanded = expand_gcode_template(
+        &gcfg.end_gcode_template,
+        tool_id,
+        nozzle_temp_c,
+        gcfg.bed_temperature_celsius,
+        nozzle_diam_mm,
+        bbox_min,
+        bbox_max,
+        total_layers_sum,
+    );
+    out.push_str(&end_expanded);
+    if !end_expanded.ends_with('\n') {
+        out.push('\n');
+    }
+
+    let footer_filament_type = if used_types.is_empty() {
+        active_tool_gcfg.filament_type
+    } else {
+        used_types.join(";")
+    };
+
+    out.push_str(&format_moonraker_metadata_footer(
+        total_time_s,
+        total_filament_mm,
+        total_filament_vol,
+        total_filament_g,
+        config.slicing.layer_height.first_layer_mm,
+        config.slicing.layer_height.target_mm,
+        bbox_max.z,
+        total_layers_sum,
+        nozzle_diam_mm,
+        gcfg.filament_diameter_mm,
+        &footer_filament_type,
+        gcfg.bed_temperature_celsius,
+        nozzle_temp_c,
+    ));
+
+    let first_p = &planned_objects[0].1;
+    PlannedGcodeResult {
+        layers: merged_layers,
+        gcode_text: out,
+        total_time_s,
+        total_filament_mm,
+        total_filament_volume_mm3: total_filament_vol,
+        total_filament_grams: total_filament_g,
+        bbox_min_bed: bbox_min,
+        bbox_max_bed: bbox_max,
+        exclude_object_name: first_p.exclude_object_name.clone(),
+        exclude_object_center_bed: first_p.exclude_object_center_bed,
+        exclude_object_polygon_bed: first_p.exclude_object_polygon_bed.clone(),
+        extruding_move_count,
+        travel_move_count,
+        retract_count,
+        toolchange_count,
+        min_speed_mms: min_speed,
+        max_speed_mms: max_speed,
+        min_accel_mms2: min_accel,
+        max_accel_mms2: max_accel,
+        min_flow_mm3s: min_flow,
+        max_flow_mm3s: max_flow,
+        min_flow_mult: min_mult,
+        max_flow_mult: max_mult,
+        min_pa_s: min_pa,
+        max_pa_s: max_pa,
+        min_pressure_mm3s: min_press,
+        max_pressure_mm3s: max_press,
+        min_width_mm: min_w,
+        max_width_mm: max_w,
+        min_height_mm: min_h,
+        max_height_mm: max_h,
+        min_tool_iso_angle_deg: min_iso_angle,
+        max_tool_iso_angle_deg: max_iso_angle,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7089,5 +7426,82 @@ mod tests {
             "Expected Moonraker footer '; filament_type = PLA;ABS', got:\n{}",
             res.gcode_text
         );
+    }
+
+    #[test]
+    fn test_combine_planned_objects_into_plate_result_multi_object_gcode_and_preview() {
+        let mut cfg = SlicerConfig::default();
+        cfg.gcode.emit_thumbnails = false;
+        cfg.gcode.emit_exclude_object = true;
+
+        let raw = crate::bridge::ffi::ObjectToolpathsResult {
+            valid: true,
+            total_path_count: 1,
+            outer_wall_count: 1,
+            inner_wall_count: 0,
+            solid_infill_count: 0,
+            sparse_infill_count: 0,
+            bridge_count: 0,
+            wave_overhang_count: 0,
+            support_count: 0,
+            support_interface_count: 0,
+            layers: vec![LayerToolpaths {
+                layer_index: 0,
+                branch_id: 0,
+                isovalue: 0.2,
+                paths: vec![ExtrusionPath {
+                    feature_kind: 0, // OuterWall
+                    wall_index: 0,
+                    is_closed: false,
+                    filament_slot: 0,
+                    total_length_mm: 10.0,
+                    mean_width_mm: 0.42,
+                    points: vec![
+                        make_pt(0.0, 0.0, 0.2, 0.42, 0.20),
+                        make_pt(10.0, 0.0, 0.2, 0.42, 0.20),
+                    ],
+                }],
+            }],
+        };
+
+        let tf_a = Transform::from_xyz(-30.0, 0.0, 0.0);
+        let tf_b = Transform::from_xyz(30.0, 0.0, 0.0);
+        let planned_a = plan_and_emit_gcode_for_object("Part_Left", 1, &raw, tf_a, &cfg);
+        let planned_b = plan_and_emit_gcode_for_object("Part_Right", 2, &raw, tf_b, &cfg);
+
+        let combined = combine_planned_objects_into_plate_result(
+            &[
+                ("Part_Left".to_string(), planned_a.clone(), tf_a),
+                ("Part_Right".to_string(), planned_b.clone(), tf_b),
+            ],
+            &cfg,
+        );
+
+        assert_eq!(combined.layers.len(), 1);
+        assert!(
+            combined.extruding_move_count
+                >= planned_a.extruding_move_count + planned_b.extruding_move_count
+        );
+        // Verify world-space segment transformation for both objects in the 3D preview
+        let has_left_seg = combined
+            .layers[0]
+            .segments
+            .iter()
+            .any(|s| s.kind.is_extruding() && s.p0_local.x < -15.0);
+        let has_right_seg = combined
+            .layers[0]
+            .segments
+            .iter()
+            .any(|s| s.kind.is_extruding() && s.p0_local.x > 15.0);
+        assert!(has_left_seg, "Combined preview must include Part_Left segments in world space");
+        assert!(has_right_seg, "Combined preview must include Part_Right segments in world space");
+
+        // Verify Klipper EXCLUDE_OBJECT definitions and start/end markers for both objects
+        assert!(combined.gcode_text.contains("EXCLUDE_OBJECT_DEFINE NAME=Part_Left"));
+        assert!(combined.gcode_text.contains("EXCLUDE_OBJECT_DEFINE NAME=Part_Right"));
+        assert!(combined.gcode_text.contains("EXCLUDE_OBJECT_START NAME=Part_Left"));
+        assert!(combined.gcode_text.contains("EXCLUDE_OBJECT_END NAME=Part_Left"));
+        assert!(combined.gcode_text.contains("EXCLUDE_OBJECT_START NAME=Part_Right"));
+        assert!(combined.gcode_text.contains("EXCLUDE_OBJECT_END NAME=Part_Right"));
     }
 }

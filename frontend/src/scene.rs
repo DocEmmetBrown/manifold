@@ -93,6 +93,7 @@ pub struct SceneObject {
     pub name: String,
     pub source_file: String,
     pub has_brep: bool,
+    pub printable: bool,
     pub plate_index: usize,
     pub entity: Entity,
     pub mesh_handle: Handle<Mesh>,
@@ -100,6 +101,7 @@ pub struct SceneObject {
     pub base_vertices: Vec<RenderVertex>,
     pub scale_factors: Vec3,
     pub scale_rotation: Quat,
+    pub cached_rotation: Quat,
     pub lock_scale_axes: bool,
     pub vertices: Vec<RenderVertex>,
     pub indices: Vec<u32>,
@@ -313,6 +315,8 @@ impl SceneObject {
             }
         }
 
+        vis_state.plate_unmixed_toolpaths.remove(&self.object_id);
+        vis_state.plate_mixed_toolpaths.remove(&self.object_id);
         if vis_state.last_object_id == Some(self.object_id) {
             vis_state.available_fields.clear();
             vis_state.cached_stats = None;
@@ -571,6 +575,14 @@ impl BuildPlateState {
 
     pub fn active_plate_object_count(&self) -> usize {
         self.plate_object_count(self.active_plate_index)
+    }
+
+    pub fn active_plate_printable_object_ids(&self) -> Vec<u64> {
+        self.objects
+            .iter()
+            .filter(|o| o.plate_index == self.active_plate_index && o.printable)
+            .map(|o| o.object_id)
+            .collect()
     }
 
     pub fn plate_names(&self) -> Vec<String> {
@@ -842,6 +854,7 @@ pub fn spawn_loaded_objects(
             name: data.name,
             source_file: data.source_file,
             has_brep: data.has_brep,
+            printable: data.printable,
             plate_index: data.plate_index,
             entity,
             mesh_handle,
@@ -849,6 +862,7 @@ pub fn spawn_loaded_objects(
             base_vertices,
             scale_factors,
             scale_rotation,
+            cached_rotation: initial_transform.rotation,
             lock_scale_axes: data.lock_scale_axes,
             vertices: data.vertices,
             indices: data.indices,
@@ -984,6 +998,7 @@ pub fn clone_object_on_plate(
     let base_name = strip_clone_number_suffix(&plate.objects[src_idx].name).to_string();
     let src_source_file = plate.objects[src_idx].source_file.clone();
     let src_has_brep = plate.objects[src_idx].has_brep;
+    let src_printable = plate.objects[src_idx].printable;
     let src_base_vertices = plate.objects[src_idx].base_vertices.clone();
     let src_scale_factors = plate.objects[src_idx].scale_factors;
     let src_scale_rotation = plate.objects[src_idx].scale_rotation;
@@ -1093,6 +1108,7 @@ pub fn clone_object_on_plate(
             name: clone_name,
             source_file: src_source_file.clone(),
             has_brep: src_has_brep,
+            printable: src_printable,
             plate_index: target_plate_index,
             initial_translation: Vec3::new(target_translation_xy.x, target_translation_xy.y, 0.0),
             initial_rotation: src_tf.rotation,
@@ -1223,6 +1239,13 @@ pub fn update_selection_materials_system(
         let hq_pbr = vis_state.toolpath_quality_mode
             == crate::field_vis::ToolpathQualityMode::HighQualityPbr;
 
+        let any_vis_active = (is_selected
+            && (vis_state.show_isosurface
+                || vis_state.show_slice_plane
+                || vis_state.show_selected_layers
+                || vis_state.show_toolpaths))
+            || (vis_state.show_toolpaths && obj.printable);
+
         let (
             target_base,
             target_metallic,
@@ -1234,18 +1257,15 @@ pub fn update_selection_materials_system(
             target_depth_bias,
             target_cull,
             target_double_sided,
-        ) = if is_selected {
-            let any_vis_active = vis_state.show_isosurface
-                || vis_state.show_slice_plane
-                || vis_state.show_selected_layers
-                || vis_state.show_toolpaths;
+        ) = if is_selected || any_vis_active {
             let alpha = if any_vis_active {
                 vis_state.solid_opacity.clamp(0.0, 1.0)
             } else {
                 1.0
             };
-            let use_vertex_colormap = vis_state.surface_color_mode
-                != crate::field_vis::ObjectSurfaceColorMode::DefaultCad
+            let use_vertex_colormap = (is_selected
+                && vis_state.surface_color_mode
+                    != crate::field_vis::ObjectSurfaceColorMode::DefaultCad)
                 || !obj.vertex_filament_slots.is_empty()
                 || !obj.vertex_colors_rgba.is_empty();
 
@@ -1282,6 +1302,19 @@ pub fn update_selection_materials_system(
                     Some(wgpu::Face::Back),
                     false,
                 )
+            } else if !obj.printable {
+                (
+                    Color::srgba(0.45, 0.48, 0.52, 1.0),
+                    0.08,
+                    0.65,
+                    0.25,
+                    0.0,
+                    0.0,
+                    AlphaMode::Opaque,
+                    0.0,
+                    None,
+                    true,
+                )
             } else if use_vertex_colormap {
                 (
                     Color::srgba(1.0, 1.0, 1.0, 1.0),
@@ -1309,6 +1342,19 @@ pub fn update_selection_materials_system(
                     true,
                 )
             }
+        } else if !obj.printable {
+            (
+                Color::srgba(0.38, 0.40, 0.44, 1.0),
+                0.08,
+                0.68,
+                0.22,
+                0.0,
+                0.0,
+                AlphaMode::Opaque,
+                0.0,
+                None,
+                true,
+            )
         } else if !obj.vertex_filament_slots.is_empty() || !obj.vertex_colors_rgba.is_empty() {
             (
                 Color::srgba(1.0, 1.0, 1.0, 1.0),

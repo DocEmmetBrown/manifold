@@ -1619,16 +1619,18 @@ pub fn ui_workspace_system(
     let is_computing = vis_state.is_busy();
     let has_eikonal = vis_state.available_fields.iter().any(|f| f == "eikonal");
 
+    for obj in &mut plate.objects {
+        if let Ok((t, _)) = object_transforms.get(obj.entity) {
+            obj.cached_rotation = t.rotation;
+        }
+    }
+
     // Pre-fetch selected object info for the workflow bar and panels
     let selected_obj_info: Option<(u64, usize, String, Quat)> =
         plate.selected_object_id.and_then(|sel_id| {
             let idx = plate.objects.iter().position(|o| o.object_id == sel_id)?;
             let name = plate.objects[idx].name.clone();
-            let ent = plate.objects[idx].entity;
-            let rot = object_transforms
-                .get(ent)
-                .map(|(t, _)| t.rotation)
-                .unwrap_or(Quat::IDENTITY);
+            let rot = plate.objects[idx].cached_rotation;
             Some((sel_id, idx, name, rot))
         });
 
@@ -1691,6 +1693,7 @@ pub fn ui_workspace_system(
                         object_id: obj.object_id,
                         name: obj.name.clone(),
                         has_brep: obj.has_brep,
+                        printable: obj.printable,
                         plate_index: obj.plate_index,
                         transform: tf,
                         vertices: obj.vertices.clone(),
@@ -1911,6 +1914,8 @@ pub fn ui_workspace_system(
             }
             if let Some(new_p_idx) = switch_to_plate {
                 plate.switch_active_plate(new_p_idx, &mut object_transforms);
+                vis_state.dirty_planned_gcode = true;
+                vis_state.dirty_toolpaths_mesh = true;
                 let active_name = plate.active_plate_name().to_string();
                 let active_cnt = plate.active_plate_object_count();
                 plate.status_message =
@@ -1992,9 +1997,20 @@ pub fn ui_workspace_system(
                     if vis_state.solid_opacity > 0.45 {
                         vis_state.solid_opacity = 0.12;
                     }
-                    if has_eikonal {
+                    let printable_ids = plate.active_plate_printable_object_ids();
+                    let all_have_eikonal = has_eikonal
+                        && printable_ids
+                            .iter()
+                            .all(|&id| ffi::list_object_fields(id).iter().any(|f| f == "eikonal"));
+                    if all_have_eikonal {
                         let need_toolpaths = vis_state.show_toolpaths;
-                        vis_state.spawn_slicing_task(sel_id, &config, true, need_toolpaths);
+                        vis_state.spawn_slicing_task_for_objects(
+                            sel_id,
+                            printable_ids,
+                            &config,
+                            true,
+                            need_toolpaths,
+                        );
                         plate.status_message = format!(
                             "Selecting non-planar isosurfaces for '{obj_name}' in background..."
                         );
@@ -2011,7 +2027,18 @@ pub fn ui_workspace_system(
                 }
 
                 let step3_label = if let Some(ref tp) = vis_state.cached_toolpaths {
-                    format!("3. Generate Toolpaths & G-code ({} paths)", tp.total_path_count)
+                    let active_printable_ids = plate.active_plate_printable_object_ids();
+                    let plate_paths: u32 = active_printable_ids
+                        .iter()
+                        .filter_map(|id| vis_state.plate_unmixed_toolpaths.get(id))
+                        .map(|t| t.total_path_count)
+                        .sum();
+                    let count = if plate_paths > 0 {
+                        plate_paths
+                    } else {
+                        tp.total_path_count
+                    };
+                    format!("3. Generate Toolpaths & G-code ({count} paths)")
                 } else {
                     "3. Generate Toolpaths & G-code".to_string()
                 };
@@ -2024,12 +2051,24 @@ pub fn ui_workspace_system(
                     if vis_state.solid_opacity > 0.35 {
                         vis_state.solid_opacity = 0.10;
                     }
-                    if has_eikonal {
+                    let printable_ids = plate.active_plate_printable_object_ids();
+                    let all_have_eikonal = has_eikonal
+                        && printable_ids
+                            .iter()
+                            .all(|&id| ffi::list_object_fields(id).iter().any(|f| f == "eikonal"));
+                    if all_have_eikonal {
+                        let printable_cnt = printable_ids.len().max(1);
                         let need_layers = vis_state.cached_selected_layers.is_none()
                             || vis_state.dirty_selected_layers;
-                        vis_state.spawn_slicing_task(sel_id, &config, need_layers, true);
+                        vis_state.spawn_slicing_task_for_objects(
+                            sel_id,
+                            printable_ids,
+                            &config,
+                            need_layers,
+                            true,
+                        );
                         plate.status_message = format!(
-                            "Generating non-planar toolpaths & G-code for '{obj_name}' in background..."
+                            "Generating non-planar toolpaths & G-code for {printable_cnt} printable object(s) in background..."
                         );
                     } else {
                         spawn_field_compute_task(
@@ -2304,8 +2343,12 @@ pub fn ui_workspace_system(
                                 .map(|o| o.object_id)
                                 .collect();
                             for id in plate_ids {
+                                vis_state.plate_unmixed_toolpaths.remove(&id);
+                                vis_state.plate_mixed_toolpaths.remove(&id);
                                 remove_object_from_plate(&mut commands, &mut plate, id);
                             }
+                            vis_state.dirty_planned_gcode = true;
+                            vis_state.dirty_toolpaths_mesh = true;
                         }
                         if plate.plates.len() > 1
                             && !plate.objects.is_empty()
@@ -2321,8 +2364,12 @@ pub fn ui_workspace_system(
                             let all_ids: Vec<u64> =
                                 plate.objects.iter().map(|o| o.object_id).collect();
                             for id in all_ids {
+                                vis_state.plate_unmixed_toolpaths.remove(&id);
+                                vis_state.plate_mixed_toolpaths.remove(&id);
                                 remove_object_from_plate(&mut commands, &mut plate, id);
                             }
+                            vis_state.dirty_planned_gcode = true;
+                            vis_state.dirty_toolpaths_mesh = true;
                         }
                     });
 
@@ -2342,7 +2389,11 @@ pub fn ui_workspace_system(
                             }
                             let is_selected = current_selected_id == Some(obj.object_id);
                             ui.horizontal(|ui| {
-                                if ui.checkbox(&mut obj.visible, "").changed() {
+                                if ui
+                                    .checkbox(&mut obj.visible, "")
+                                    .on_hover_text("Show/hide object in the 3D viewport")
+                                    .changed()
+                                {
                                     if let Ok((_, mut vis)) = object_transforms.get_mut(obj.entity)
                                     {
                                         *vis = if obj.visible {
@@ -2351,6 +2402,17 @@ pub fn ui_workspace_system(
                                             Visibility::Hidden
                                         };
                                     }
+                                }
+
+                                if ui
+                                    .checkbox(&mut obj.printable, "Print")
+                                    .on_hover_text(
+                                        "Include this object when slicing and generating G-code (.3mf printable attribute)",
+                                    )
+                                    .changed()
+                                {
+                                    vis_state.dirty_planned_gcode = true;
+                                    vis_state.dirty_toolpaths_mesh = true;
                                 }
 
                                 let tag = if obj.has_brep { "[STEP]" } else { "[Mesh]" };
@@ -2386,6 +2448,7 @@ pub fn ui_workspace_system(
                             plate.selected_object_id = Some(id);
                         }
                         if let Some(id) = clone_id {
+                            let prev_len = plate.objects.len();
                             clone_object_on_plate(
                                 &mut commands,
                                 render_device.as_deref(),
@@ -2397,9 +2460,32 @@ pub fn ui_workspace_system(
                                 id,
                                 1,
                             );
+                            let new_ids: Vec<u64> = plate.objects[prev_len..]
+                                .iter()
+                                .map(|o| o.object_id)
+                                .collect();
+                            if let Some(unmixed) = vis_state.plate_unmixed_toolpaths.get(&id).cloned()
+                            {
+                                for nid in &new_ids {
+                                    vis_state
+                                        .plate_unmixed_toolpaths
+                                        .insert(*nid, unmixed.clone());
+                                }
+                            }
+                            if let Some(mixed) = vis_state.plate_mixed_toolpaths.get(&id).cloned() {
+                                for nid in &new_ids {
+                                    vis_state.plate_mixed_toolpaths.insert(*nid, mixed.clone());
+                                }
+                            }
+                            vis_state.dirty_planned_gcode = true;
+                            vis_state.dirty_toolpaths_mesh = true;
                         }
                         if let Some(id) = remove_id {
+                            vis_state.plate_unmixed_toolpaths.remove(&id);
+                            vis_state.plate_mixed_toolpaths.remove(&id);
                             remove_object_from_plate(&mut commands, &mut plate, id);
+                            vis_state.dirty_planned_gcode = true;
+                            vis_state.dirty_toolpaths_mesh = true;
                         }
                     }
 
@@ -2433,6 +2519,19 @@ pub fn ui_workspace_system(
                             let hull_face_count = plate.objects[obj_idx].hull.faces.len();
 
                             ui.heading(format!("Selected: {obj_name}"));
+                            if ui
+                                .checkbox(
+                                    &mut plate.objects[obj_idx].printable,
+                                    "Printable (Include in Slice & G-code)",
+                                )
+                                .on_hover_text(
+                                    "When unchecked, this object is excluded from slicing, toolpath preview, and G-code output (saved to .3mf as printable=0).",
+                                )
+                                .changed()
+                            {
+                                vis_state.dirty_planned_gcode = true;
+                                vis_state.dirty_toolpaths_mesh = true;
+                            }
 
                             // Move object between build plates
                             let mut move_to_plate: Option<usize> = None;
@@ -2487,6 +2586,8 @@ pub fn ui_workspace_system(
                                 plate.active_plate_index = target_p_idx;
                                 plate.selected_object_id = Some(sel_id);
                                 plate.sync_plate_visibility(&mut object_transforms);
+                                vis_state.dirty_planned_gcode = true;
+                                vis_state.dirty_toolpaths_mesh = true;
                                 let target_name = plate.active_plate_name().to_string();
                                 plate.status_message =
                                     format!("Moved '{obj_name}' to {target_name}.");
@@ -2527,6 +2628,7 @@ pub fn ui_workspace_system(
                                 }
                             });
                             if let Some(copies) = pending_clone_copies {
+                                let prev_len = plate.objects.len();
                                 clone_object_on_plate(
                                     &mut commands,
                                     render_device.as_deref(),
@@ -2538,6 +2640,30 @@ pub fn ui_workspace_system(
                                     sel_id,
                                     copies,
                                 );
+                                let new_ids: Vec<u64> = plate.objects[prev_len..]
+                                    .iter()
+                                    .map(|o| o.object_id)
+                                    .collect();
+                                if let Some(unmixed) =
+                                    vis_state.plate_unmixed_toolpaths.get(&sel_id).cloned()
+                                {
+                                    for nid in &new_ids {
+                                        vis_state
+                                            .plate_unmixed_toolpaths
+                                            .insert(*nid, unmixed.clone());
+                                    }
+                                }
+                                if let Some(mixed) =
+                                    vis_state.plate_mixed_toolpaths.get(&sel_id).cloned()
+                                {
+                                    for nid in &new_ids {
+                                        vis_state
+                                            .plate_mixed_toolpaths
+                                            .insert(*nid, mixed.clone());
+                                    }
+                                }
+                                vis_state.dirty_planned_gcode = true;
+                                vis_state.dirty_toolpaths_mesh = true;
                             }
 
                             if let Ok((mut tf, _)) = object_transforms.get_mut(obj_entity) {
@@ -8595,13 +8721,12 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
 }
 
 /// Compiles all active surface-face hints and 3D point hints for `object_id` into
-/// backend `ffi::SpatialOrientationHint` records (in object-local OpenVDB coordinates)
-/// and pushes them to the C++ Eikonal solver.
-pub fn sync_object_hints_to_backend(
+/// backend `ffi::SpatialOrientationHint` records (in object-local OpenVDB coordinates).
+pub fn collect_object_hints_for_backend(
     config: &SlicerConfig,
     plate: &BuildPlateState,
     object_id: u64,
-) {
+) -> Vec<ffi::SpatialOrientationHint> {
     let mut ffi_hints = Vec::new();
 
     if let Some(obj) = plate.objects.iter().find(|o| o.object_id == object_id) {
@@ -8653,11 +8778,24 @@ pub fn sync_object_hints_to_backend(
         });
     }
 
+    ffi_hints
+}
+
+/// Compiles all active surface-face hints and 3D point hints for `object_id` into
+/// backend `ffi::SpatialOrientationHint` records (in object-local OpenVDB coordinates)
+/// and pushes them to the C++ Eikonal solver.
+pub fn sync_object_hints_to_backend(
+    config: &SlicerConfig,
+    plate: &BuildPlateState,
+    object_id: u64,
+) {
+    let ffi_hints = collect_object_hints_for_backend(config, plate, object_id);
     ffi::set_spatial_orientation_hints(&ffi_hints);
 }
 
 /// Spawns an asynchronous background task to compute OpenVDB SDF, constrained Eikonal,
-/// overhang, and 5/6-axis tool orientation fields without blocking the UI thread.
+/// overhang, and 5/6-axis tool orientation fields for all printable objects on the active
+/// build plate (plus `object_id` if explicitly selected) without blocking the UI thread.
 fn spawn_field_compute_task(
     vis_state: &mut FieldVisualizationState,
     plate: &mut BuildPlateState,
@@ -8667,27 +8805,60 @@ fn spawn_field_compute_task(
     obj_rotation: Quat,
 ) {
     sync_config_to_backend(config);
-    let inv_rot = obj_rotation.inverse();
-    let local_nozzle = (inv_rot * Vec3::from_array(config.machine.nozzle_axis_bed))
-        .normalize_or_zero();
-    if local_nozzle.length_squared() > 1.0e-6 {
-        ffi::set_nozzle_axis_bed(local_nozzle.to_array());
+    let nozzle_bed = Vec3::from_array(config.machine.nozzle_axis_bed);
+    let gravity_bed = Vec3::from_array(config.machine.gravity_direction_bed);
+    let active_plate_idx = plate.active_plate_index;
+
+    let mut batch: Vec<(u64, Quat, Vec<ffi::SpatialOrientationHint>)> = Vec::new();
+    for obj in &plate.objects {
+        if obj.plate_index == active_plate_idx && obj.printable && obj.object_id != object_id {
+            batch.push((
+                obj.object_id,
+                obj.cached_rotation,
+                collect_object_hints_for_backend(config, plate, obj.object_id),
+            ));
+        }
     }
-    let local_gravity = (inv_rot * Vec3::from_array(config.machine.gravity_direction_bed))
-        .normalize_or_zero();
-    if local_gravity.length_squared() > 1.0e-6 {
-        ffi::set_gravity_direction_bed(local_gravity.to_array());
-    }
-    sync_object_hints_to_backend(config, plate, object_id);
+    // Always place `object_id` last so the backend's global nozzle/gravity/hints state matches
+    // the selected object when the background task finishes.
+    batch.push((
+        object_id,
+        obj_rotation,
+        collect_object_hints_for_backend(config, plate, object_id),
+    ));
+
+    let batch_count = batch.len();
     let voxel_size = config.eikonal.voxel_size_mm;
     let narrow_band = config.eikonal.narrow_band_width_voxels as f32;
     let task = IoTaskPool::get().spawn(async move {
-        ffi::recompute_object_fields(object_id, voxel_size, narrow_band)
+        let mut selected_ok = false;
+        for (oid, rot, hints) in batch {
+            let inv_rot = rot.inverse();
+            let local_nozzle = (inv_rot * nozzle_bed).normalize_or_zero();
+            if local_nozzle.length_squared() > 1.0e-6 {
+                ffi::set_nozzle_axis_bed(local_nozzle.to_array());
+            }
+            let local_gravity = (inv_rot * gravity_bed).normalize_or_zero();
+            if local_gravity.length_squared() > 1.0e-6 {
+                ffi::set_gravity_direction_bed(local_gravity.to_array());
+            }
+            ffi::set_spatial_orientation_hints(&hints);
+            let ok = ffi::recompute_object_fields(oid, voxel_size, narrow_band);
+            if oid == object_id {
+                selected_ok = ok;
+            }
+        }
+        selected_ok
     });
     vis_state.last_solved_field_rotation = Some(obj_rotation);
-    vis_state.pending_field_task = Some((object_id, object_name.to_string(), task));
+    let status_target = if batch_count > 1 {
+        format!("{batch_count} objects on {}", plate.active_plate_name())
+    } else {
+        format!("'{object_name}'")
+    };
+    vis_state.pending_field_task = Some((object_id, status_target.clone(), task));
     plate.status_message = format!(
-        "Computing OpenVDB scalar fields for '{object_name}' in background (voxel {voxel_size:.2} mm)..."
+        "Computing OpenVDB scalar fields for {status_target} in background (voxel {voxel_size:.2} mm)..."
     );
 }
 
@@ -8854,8 +9025,10 @@ pub fn poll_io_tasks_system(
                     vis_state.refresh_stats_for(obj_id);
                     if vis_state.show_selected_layers || vis_state.show_toolpaths {
                         let need_toolpaths = vis_state.show_toolpaths;
-                        vis_state.spawn_slicing_task(
+                        let printable_ids = plate.active_plate_printable_object_ids();
+                        vis_state.spawn_slicing_task_for_objects(
                             obj_id,
+                            printable_ids,
                             &config,
                             true,
                             need_toolpaths,
@@ -8877,7 +9050,7 @@ pub fn poll_io_tasks_system(
 
     // 4. Poll pending background layer selection & shell toolpath generation task
     if let Some((obj_id, ref mut task)) = vis_state.pending_slicing_task {
-        if let Some((layers_opt, toolpaths_opt)) = block_on(future::poll_once(task)) {
+        if let Some((layers_opt, plate_toolpaths)) = block_on(future::poll_once(task)) {
             vis_state.pending_slicing_task = None;
             if plate.selected_object_id == Some(obj_id) {
                 let num_layers = layers_opt
@@ -8885,11 +9058,21 @@ pub fn poll_io_tasks_system(
                     .map(|l| l.layers.len())
                     .or_else(|| vis_state.cached_selected_layers.as_ref().map(|l| l.layers.len()))
                     .unwrap_or(0);
-                let num_paths = toolpaths_opt.as_ref().map(|t| t.total_path_count);
-                vis_state.apply_slicing_task_result(layers_opt, toolpaths_opt);
+                let num_objs = plate_toolpaths.len();
+                let num_paths: Option<u32> = if plate_toolpaths.is_empty() {
+                    None
+                } else {
+                    Some(
+                        plate_toolpaths
+                            .iter()
+                            .map(|(_, t)| t.total_path_count)
+                            .sum(),
+                    )
+                };
+                vis_state.apply_slicing_task_result(layers_opt, plate_toolpaths);
                 if let Some(paths) = num_paths {
                     plate.status_message = format!(
-                        "Generated {paths} non-planar shell toolpaths across {num_layers} layers."
+                        "Generated {paths} non-planar shell toolpaths across {num_objs} printable object(s) ({num_layers} layers)."
                     );
                 } else {
                     plate.status_message = format!(

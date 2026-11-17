@@ -34,6 +34,10 @@ struct SavedSceneManifest {
     objects: Vec<SavedObjectEntry>,
 }
 
+fn default_true_bool() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SavedObjectEntry {
     name: String,
@@ -42,6 +46,8 @@ struct SavedObjectEntry {
     rotation_xyzw: [f32; 4],
     #[serde(default)]
     plate_index: usize,
+    #[serde(default = "default_true_bool")]
+    printable: bool,
 }
 
 /// Snapshot of an active build-plate object passed to the 3MF exporter.
@@ -49,6 +55,7 @@ pub struct ExportableObject {
     pub object_id: u64,
     pub name: String,
     pub has_brep: bool,
+    pub printable: bool,
     pub plate_index: usize,
     pub transform: Transform,
     pub vertices: Vec<RenderVertex>,
@@ -80,6 +87,10 @@ struct ParsedModelSettingsConfig {
     object_names: HashMap<String, String>,
     /// 1-based extruder index assigned at `<object id="...">` or `<part id="...">` level.
     object_extruders: HashMap<String, u8>,
+    /// Per-object `printable` flag parsed from `<object id="..."><metadata key="printable" .../>`.
+    object_printable: HashMap<String, bool>,
+    /// Per-instance `printable` flag parsed from `<model_instance><metadata key="printable" .../>`.
+    instance_printable: HashMap<(String, u32), bool>,
     /// Per-object `<volume firstid="..." lastid="...">` extruder assignments.
     volume_extruders: HashMap<String, Vec<ParsedVolumeExtruderRange>>,
     /// Multi-plate definitions ordered by `plater_id`.
@@ -95,6 +106,12 @@ impl ParsedModelSettingsConfig {
             if v > 0 {
                 self.object_extruders.insert(k, v);
             }
+        }
+        for (k, v) in other.object_printable {
+            self.object_printable.insert(k, v);
+        }
+        for (k, v) in other.instance_printable {
+            self.instance_printable.insert(k, v);
         }
         for (k, v) in other.volume_extruders {
             if !v.is_empty() {
@@ -214,6 +231,7 @@ struct ParsedBuildItem {
     object_id: String,
     model_path: Option<String>,
     transform: Mat4,
+    printable: Option<bool>,
 }
 
 /// All `<object>` resources, color/material/texture groups, and `<build>` items parsed from a `.model` XML stream.
@@ -505,6 +523,7 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                         for obj in &mut loaded_objs {
                             obj.name = saved_obj.name.clone();
                             obj.plate_index = saved_obj.plate_index;
+                            obj.printable = saved_obj.printable;
                             obj.initial_translation = Vec3::from_array(saved_obj.translation);
                             obj.initial_rotation =
                                 Quat::from_array(saved_obj.rotation_xyzw).normalize();
@@ -513,6 +532,7 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                             if loaded_objs.len() == 1 {
                                 last.name = saved_obj.name.clone();
                                 last.plate_index = saved_obj.plate_index;
+                                last.printable = saved_obj.printable;
                                 last.initial_translation = Vec3::from_array(saved_obj.translation);
                                 last.initial_rotation =
                                     Quat::from_array(saved_obj.rotation_xyzw).normalize();
@@ -660,6 +680,7 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                     .as_ref()
                     .and_then(|ms| ms.volume_extruders.get(&obj.id).map(Vec::as_slice))
                     .unwrap_or(&[]);
+                let prev_obj_len = report.objects.len();
                 instantiate_3mf_mesh(
                     &name,
                     &root_model,
@@ -674,6 +695,13 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                     &mut imported_filament_slots,
                     report,
                 );
+                let obj_printable = model_settings
+                    .as_ref()
+                    .and_then(|ms| ms.object_printable.get(&obj.id).copied())
+                    .unwrap_or(true);
+                for loaded in &mut report.objects[prev_obj_len..] {
+                    loaded.printable = obj_printable;
+                }
             }
         }
     } else {
@@ -731,6 +759,7 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                 .as_ref()
                 .and_then(|ms| ms.object_extruders.get(&item.object_id).copied())
                 .unwrap_or(1);
+            let prev_obj_len = report.objects.len();
             instantiate_3mf_object_recursive(
                 &model_files,
                 &target_model,
@@ -746,6 +775,27 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                 &mut visited,
                 report,
             );
+            let item_printable = scene_manifest
+                .as_ref()
+                .and_then(|m| m.objects.get(idx))
+                .map(|o| o.printable)
+                .or(item.printable)
+                .or_else(|| {
+                    model_settings.as_ref().and_then(|ms| {
+                        ms.instance_printable
+                            .get(&(item.object_id.clone(), inst_id))
+                            .copied()
+                    })
+                })
+                .or_else(|| {
+                    model_settings
+                        .as_ref()
+                        .and_then(|ms| ms.object_printable.get(&item.object_id).copied())
+                })
+                .unwrap_or(true);
+            for loaded in &mut report.objects[prev_obj_len..] {
+                loaded.printable = item_printable;
+            }
         }
     }
 
@@ -1624,8 +1674,9 @@ pub fn save_project_to_3mf(
     for (idx, obj) in objects.iter().enumerate() {
         let xml_id = idx + 1;
         let transform_str = format_3mf_transform(&obj.transform);
+        let printable_str = if obj.printable { "1" } else { "0" };
         model_xml.push_str(&format!(
-            "    <item objectid=\"{xml_id}\" transform=\"{transform_str}\"/>\n"
+            "    <item objectid=\"{xml_id}\" transform=\"{transform_str}\" printable=\"{printable_str}\"/>\n"
         ));
     }
     model_xml.push_str("  </build>\n</model>\n");
@@ -1642,8 +1693,9 @@ pub fn save_project_to_3mf(
     for (idx, obj) in objects.iter().enumerate() {
         let xml_id = idx + 1;
         let escaped_name = escape_xml_attr(&obj.name);
+        let printable_str = if obj.printable { "1" } else { "0" };
         model_settings_xml.push_str(&format!(
-            "  <object id=\"{xml_id}\">\n    <metadata key=\"name\" value=\"{escaped_name}\"/>\n  </object>\n"
+            "  <object id=\"{xml_id}\">\n    <metadata key=\"name\" value=\"{escaped_name}\"/>\n    <metadata key=\"printable\" value=\"{printable_str}\"/>\n  </object>\n"
         ));
     }
     for p_idx in 0..total_plates {
@@ -1659,8 +1711,9 @@ pub fn save_project_to_3mf(
         for (idx, obj) in objects.iter().enumerate() {
             if obj.plate_index == p_idx {
                 let xml_id = idx + 1;
+                let printable_str = if obj.printable { "1" } else { "0" };
                 model_settings_xml.push_str(&format!(
-                    "    <model_instance>\n      <metadata key=\"object_id\" value=\"{xml_id}\"/>\n      <metadata key=\"instance_id\" value=\"0\"/>\n    </model_instance>\n"
+                    "    <model_instance>\n      <metadata key=\"object_id\" value=\"{xml_id}\"/>\n      <metadata key=\"instance_id\" value=\"0\"/>\n      <metadata key=\"printable\" value=\"{printable_str}\"/>\n    </model_instance>\n"
                 ));
             }
         }
@@ -1721,6 +1774,7 @@ pub fn save_project_to_3mf(
             translation: obj.transform.translation.to_array(),
             rotation_xyzw: obj.transform.rotation.to_array(),
             plate_index: obj.plate_index,
+            printable: obj.printable,
         });
     }
 
@@ -2324,10 +2378,28 @@ fn parse_component_element(e: &quick_xml::events::BytesStart<'_>) -> Option<Pars
     }
 }
 
+fn parse_3mf_bool_attr(s: &str) -> Option<bool> {
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("0")
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+    {
+        Some(false)
+    } else if trimmed.eq_ignore_ascii_case("1")
+        || trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("yes")
+    {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 fn parse_build_item_element(e: &quick_xml::events::BytesStart<'_>) -> Option<ParsedBuildItem> {
     let mut object_id = String::new();
     let mut model_path = None;
     let mut transform = Mat4::IDENTITY;
+    let mut printable = None;
 
     for attr in e.attributes().flatten() {
         let val_str = String::from_utf8_lossy(&attr.value);
@@ -2335,6 +2407,7 @@ fn parse_build_item_element(e: &quick_xml::events::BytesStart<'_>) -> Option<Par
             b"objectid" => object_id = val_str.into_owned(),
             b"path" => model_path = Some(val_str.into_owned()),
             b"transform" => transform = parse_3mf_transform(&val_str),
+            b"printable" => printable = parse_3mf_bool_attr(&val_str),
             _ => {}
         }
     }
@@ -2346,6 +2419,7 @@ fn parse_build_item_element(e: &quick_xml::events::BytesStart<'_>) -> Option<Par
             object_id,
             model_path,
             transform,
+            printable,
         })
     }
 }
@@ -2409,7 +2483,7 @@ fn parse_model_settings_config_xml(xml_bytes: &[u8]) -> Result<ParsedModelSettin
     let mut current_part_id: Option<String> = None;
     let mut current_volume_range: Option<ParsedVolumeExtruderRange> = None;
     let mut current_plate: Option<ParsedConfigPlate> = None;
-    let mut current_instance: Option<(Option<String>, Option<u32>)> = None;
+    let mut current_instance: Option<(Option<String>, Option<u32>, Option<bool>)> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -2457,7 +2531,7 @@ fn parse_model_settings_config_xml(xml_bytes: &[u8]) -> Result<ParsedModelSettin
                         current_plate = Some(ParsedConfigPlate::default());
                     }
                     b"model_instance" => {
-                        current_instance = Some((None, None));
+                        current_instance = Some((None, None, None));
                     }
                     b"metadata" => {
                         handle_model_settings_metadata(
@@ -2514,10 +2588,14 @@ fn parse_model_settings_config_xml(xml_bytes: &[u8]) -> Result<ParsedModelSettin
                         }
                     }
                     b"model_instance" => {
-                        if let (Some(ref mut plate), Some((Some(obj_id), inst_opt))) =
+                        if let (Some(ref mut plate), Some((Some(obj_id), inst_opt, pr_opt))) =
                             (&mut current_plate, current_instance.take())
                         {
-                            plate.instances.push((obj_id, inst_opt.unwrap_or(0)));
+                            let inst_id = inst_opt.unwrap_or(0);
+                            if let Some(pr) = pr_opt {
+                                result.instance_printable.insert((obj_id.clone(), inst_id), pr);
+                            }
+                            plate.instances.push((obj_id, inst_id));
                         }
                     }
                     b"plate" => {
@@ -2556,7 +2634,7 @@ fn handle_model_settings_metadata(
     current_part_id: &Option<String>,
     current_volume_range: &mut Option<ParsedVolumeExtruderRange>,
     current_plate: &mut Option<ParsedConfigPlate>,
-    current_instance: &mut Option<(Option<String>, Option<u32>)>,
+    current_instance: &mut Option<(Option<String>, Option<u32>, Option<bool>)>,
     result: &mut ParsedModelSettingsConfig,
 ) {
     let mut key = String::new();
@@ -2569,10 +2647,11 @@ fn handle_model_settings_metadata(
         }
     }
 
-    if let Some((ref mut obj_id_slot, ref mut inst_id_slot)) = current_instance {
+    if let Some((ref mut obj_id_slot, ref mut inst_id_slot, ref mut pr_slot)) = current_instance {
         match key.as_str() {
             "object_id" => *obj_id_slot = Some(value),
             "instance_id" => *inst_id_slot = value.parse::<u32>().ok(),
+            "printable" => *pr_slot = parse_3mf_bool_attr(&value),
             _ => {}
         }
     } else if let Some(ref mut plate) = current_plate {
@@ -2602,6 +2681,12 @@ fn handle_model_settings_metadata(
         if key == "name" && !value.trim().is_empty() {
             if !in_part || !result.object_names.contains_key(obj_id) {
                 result.object_names.insert(obj_id.clone(), value);
+            }
+        } else if key == "printable" {
+            if let Some(pr) = parse_3mf_bool_attr(&value) {
+                if !in_part || !result.object_printable.contains_key(obj_id) {
+                    result.object_printable.insert(obj_id.clone(), pr);
+                }
             }
         } else if key == "extruder" {
             if let Ok(ext) = value.trim().parse::<u8>() {
@@ -2837,6 +2922,7 @@ mod tests {
                 object_id: 1,
                 name: "TetraA".to_string(),
                 has_brep: false,
+                printable: true,
                 plate_index: 0,
                 transform: Transform::IDENTITY,
                 vertices: vec![
@@ -2851,6 +2937,7 @@ mod tests {
                 object_id: 2,
                 name: "TetraB".to_string(),
                 has_brep: false,
+                printable: false,
                 plate_index: 1,
                 transform: Transform::from_xyz(15.0, -10.0, 0.0),
                 vertices: vec![
@@ -2881,8 +2968,10 @@ mod tests {
         assert_eq!(report.objects.len(), 2);
         assert_eq!(report.objects[0].name, "TetraA");
         assert_eq!(report.objects[0].plate_index, 0);
+        assert!(report.objects[0].printable);
         assert_eq!(report.objects[1].name, "TetraB");
         assert_eq!(report.objects[1].plate_index, 1);
+        assert!(!report.objects[1].printable);
         for obj in &report.objects {
             let _ = ffi::remove_cad_object(obj.object_id);
         }

@@ -23,6 +23,8 @@ pub struct LoadedObjectData {
     pub name: String,
     pub source_file: String,
     pub has_brep: bool,
+    /// Whether this object is included in slicing and G-code generation (default `true`; imported from `.3mf`).
+    pub printable: bool,
     /// Zero-based index of the build plate this object belongs to (`0` = Plate 1).
     pub plate_index: usize,
     pub initial_translation: Vec3,
@@ -199,6 +201,7 @@ pub fn build_loaded_object_from_part(
         name: part.name,
         source_file: source_file.to_string(),
         has_brep: part.has_brep,
+        printable: true,
         plate_index: 0,
         // Place at the assembly's XY coordinates with z=0 sitting on the print bed
         initial_translation: Vec3::new(part.origin_x, part.origin_y, 0.0),
