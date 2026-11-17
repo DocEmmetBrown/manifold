@@ -3872,14 +3872,21 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
                 std::vector<bool> isUnsupported(nV, false);
                 std::vector<bool> coveredByBridge(nV, false);
+                std::vector<bool> vertIsOverhangWall(nV, false);
                 bool anyUnsupported = false;
 
                 if (!layerInfo.is_first_layer) {
                     std::vector<bool> rawUnsupported(nV, false);
+                    std::vector<bool> canPropagateOutward(nV, false);
+                    constexpr float kBrickOverhangDisableSin = 0.42261826f; // sin(25 deg)
                     for (std::size_t i = 0; i < nV; ++i) {
                         const Vec3f p = shellMesh.verts[i].pos;
                         const Vec3f zNoz = shellMesh.verts[i].nozzleAxis;
-                        const float hStep = std::max(1.20f * shellMesh.verts[i].layerHeightMm, 1.15f * meanLayerH);
+                        const float hBedMm = std::max(0.0f, dot3(p, fallbackNozzle) - objectMinAxialBed);
+                        const float rawHStep = std::max(1.20f * shellMesh.verts[i].layerHeightMm, 1.15f * meanLayerH);
+                        const float hStep = (hBedMm > 0.35f * meanLayerH)
+                            ? std::min(rawHStep, std::max(0.25f * meanLayerH, hBedMm - 0.25f * meanLayerH))
+                            : rawHStep;
                         const float phiCurr = sampleSdf(p) - sdfZeroShift;
                         const float sdfDownNoz = sampleSdf(p - (zNoz * hStep)) - sdfZeroShift;
                         const float sdfDownGrav = sampleSdf(p + (gravityDirBed * hStep)) - sdfZeroShift;
@@ -3891,13 +3898,27 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         const bool exceedsOverhangAngle =
                             (ov <= -sinOverhangThresh) || (downwardSlope >= sinOverhangThresh);
 
+                        if (dOuter[i] <= 0.65f * localOuterWidth[i] &&
+                            hBedMm > 1.35f * meanLayerH &&
+                            ((ov <= -kBrickOverhangDisableSin) ||
+                             (downwardSlope >= kBrickOverhangDisableSin))) {
+                            vertIsOverhangWall[i] = true;
+                        }
+
                         // A vertex is only carved out for free-air Bridging / WaveOverhang if stepping
                         // one layer down genuinely exits the part into free air beyond the support of
                         // the previous layer's perimeter bead (never chopping normal 45..60 deg sloped walls!).
-                        const bool isFreeAirCeiling =
+                        const bool isHorizontalBottomCeiling =
                             (dOuter[i] > 0.55f * localOuterWidth[i]) &&
-                            (phiBelow > -0.05f * outerW.min_mm) &&
+                            (phiCurr > -0.35f * dOuter[i]) &&
+                            (phiBelow > 0.25f * meanLayerH) &&
                             exceedsOverhangAngle;
+
+                        const bool isFreeAirCeiling =
+                            ((dOuter[i] > 1.05f * localOuterWidth[i]) &&
+                             (phiBelow > -0.05f * outerW.min_mm) &&
+                             exceedsOverhangAngle) ||
+                            isHorizontalBottomCeiling;
 
                         const bool isCantileverPerimeter =
                             (dOuter[i] <= 1.05f * localOuterWidth[i]) &&
@@ -3911,6 +3932,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
                         if ((isFreeAirCeiling || isCantileverPerimeter) && !isSolidlySupportedAnchor) {
                             rawUnsupported[i] = true;
+                        }
+                        if (exceedsOverhangAngle && phiBelow > 0.0f) {
+                            canPropagateOutward[i] = true;
                         }
                     }
 
@@ -3930,6 +3954,31 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         }
                         if (nbUnsup) {
                             isUnsupported[i] = true;
+                        }
+                    }
+
+                    // Enforce outward monotonicity: if an interior perimeter vertex `u` is marked
+                    // unsupported over free air, any neighbor `nb` closer to the outer boundary
+                    // (`dOuter[nb] < dOuter[u]`) that also overhangs free air must also be marked
+                    // unsupported so a floating `OuterWall` is never left outside a `WaveOverhang`.
+                    {
+                        std::queue<std::uint32_t> outQ;
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            if (isUnsupported[i]) {
+                                outQ.push(static_cast<std::uint32_t>(i));
+                            }
+                        }
+                        while (!outQ.empty()) {
+                            const std::uint32_t u = outQ.front();
+                            outQ.pop();
+                            for (std::uint32_t nb : adj[u]) {
+                                if (!isUnsupported[nb] &&
+                                    canPropagateOutward[nb] &&
+                                    dOuter[nb] <= dOuter[u] + 0.05f * localOuterWidth[u]) {
+                                    isUnsupported[nb] = true;
+                                    outQ.push(nb);
+                                }
+                            }
                         }
                     }
 
@@ -4730,11 +4779,70 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 // When `brickLateralOddLayer` is active (`LateralSeamStagger` or `CombinedLateralAndVertical`
                 // on odd layers k > 0), inner wall 1 is widened by +0.5*w_inner and subsequent inner walls
                 // shift inward by +0.5*w_inner so each bead straddles the seam between two beads below.
+                // Special case: smoothly attenuate lateral brick stagger to 0 on overhanging walls and
+                // around unsupported Bridge / WaveOverhang regions so overhanging perimeters are never
+                // shifted out of contact or mis-categorised across alternating layers.
                 const bool brickLateralOddLayer =
                     brickLateralActive &&
                     !layerInfo.is_first_layer &&
                     !isConformalSkinLayer &&
                     ((layerInfo.layer_index % 2) == 1);
+
+                std::vector<float> brickLateralScale(nV, brickLateralOddLayer ? 1.0f : 0.0f);
+                if (brickLateralOddLayer) {
+                    std::vector<float> dFromOverhang(nV, kInf);
+                    std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> ovPq;
+                    bool anyOverhangSeed = false;
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (isUnsupported[i] || vertIsOverhangWall[i]) {
+                            dFromOverhang[i] = 0.0f;
+                            ovPq.push({0.0f, static_cast<std::uint32_t>(i)});
+                            anyOverhangSeed = true;
+                        }
+                    }
+                    if (anyOverhangSeed) {
+                        while (!ovPq.empty()) {
+                            const auto [dCurr, u] = ovPq.top();
+                            ovPq.pop();
+                            if (dCurr > dFromOverhang[u] + 1.0e-6f) {
+                                continue;
+                            }
+                            for (std::uint32_t v : adj[u]) {
+                                const float wEdge = dist3(shellMesh.verts[u].pos, shellMesh.verts[v].pos);
+                                if (dCurr + wEdge < dFromOverhang[v]) {
+                                    dFromOverhang[v] = dCurr + wEdge;
+                                    ovPq.push({dFromOverhang[v], v});
+                                }
+                            }
+                        }
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            const float rZero = totalWallSpan[i] + 1.0f * localInnerWidth[i];
+                            const float rFull = rZero + 2.0f * localInnerWidth[i];
+                            if (dFromOverhang[i] <= rZero) {
+                                brickLateralScale[i] = 0.0f;
+                            } else if (dFromOverhang[i] < rFull) {
+                                const float t = (dFromOverhang[i] - rZero) / std::max(1.0e-4f, rFull - rZero);
+                                brickLateralScale[i] = t * t * (3.0f - 2.0f * t);
+                            } else {
+                                brickLateralScale[i] = 1.0f;
+                            }
+                        }
+                        for (int pass = 0; pass < 2; ++pass) {
+                            std::vector<float> nextScale = brickLateralScale;
+                            for (std::size_t i = 0; i < nV; ++i) {
+                                if (adj[i].empty()) {
+                                    continue;
+                                }
+                                float sumS = brickLateralScale[i];
+                                for (std::uint32_t nb : adj[i]) {
+                                    sumS += brickLateralScale[nb];
+                                }
+                                nextScale[i] = sumS / static_cast<float>(adj[i].size() + 1);
+                            }
+                            brickLateralScale = std::move(nextScale);
+                        }
+                    }
+                }
 
                 for (std::uint32_t j = 1; j <= layerNumInnerWalls; ++j) {
                     const float minSpanForWallJ =
@@ -4745,14 +4853,15 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     for (std::size_t i = 0; i < nV; ++i) {
                         float centerOffset =
                             localOuterWidth[i] + (static_cast<float>(j) - 0.5f) * localInnerWidth[i];
-                        if (brickLateralOddLayer && activeInnerCount[i] >= j) {
+                        if (brickLateralOddLayer && activeInnerCount[i] >= j && brickLateralScale[i] > 1.0e-4f) {
                             const float extraAvail =
                                 std::max(0.0f, availableSpan[i] - totalWallSpan[i]);
-                            const float seamShift = (extraAvail >= 0.45f * localInnerWidth[i])
+                            const float rawShift = (extraAvail >= 0.45f * localInnerWidth[i])
                                 ? (0.50f * localInnerWidth[i])
                                 : ((activeInnerCount[i] >= 2)
                                        ? (0.35f * localInnerWidth[i])
                                        : std::min(extraAvail, 0.50f * localInnerWidth[i]));
+                            const float seamShift = rawShift * brickLateralScale[i];
                             if (j == 1) {
                                 const float w1 = localInnerWidth[i] + seamShift;
                                 wallJWidth[i] = w1;
@@ -4803,11 +4912,11 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
                 if (brickLateralOddLayer) {
                     for (std::size_t i = 0; i < nV; ++i) {
-                        if (activeInnerCount[i] >= 1) {
+                        if (activeInnerCount[i] >= 1 && brickLateralScale[i] > 1.0e-4f) {
                             const float extraAvail =
                                 std::max(0.0f, availableSpan[i] - totalWallSpan[i]);
                             const float spanAdvance =
-                                std::min(extraAvail, 0.50f * localInnerWidth[i]);
+                                std::min(extraAvail, 0.50f * localInnerWidth[i] * brickLateralScale[i]);
                             totalWallSpan[i] += spanAdvance;
                         }
                     }
@@ -4822,35 +4931,143 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 //     changes or the 3D centerline rotates around the existing extrusion.
                 // ------------------------------------------------------------
                 if (anyWaveOverhang) {
+                    // Collect all actually emitted supported perimeter wall segments (`OuterWall` &
+                    // `InnerWall`) on this layer so we can:
+                    // 1. Absorb any uncovered "dead-zone" perimeter vertices (where a wall's centerline
+                    //    was suppressed by `isUnsupported` or filtered by `minExtrusionLengthMm`) into
+                    //    `isWaveOverhang`, eliminating gaps between surviving walls and Pass 1; and
+                    // 2. Measure `dFromSupported` directly from the outer physical edge of the nearest
+                    //    emitted wall wherever the wave overhang borders the perimeter wall band.
+                    struct EmittedWallSeg {
+                        Vec3f a;
+                        Vec3f b;
+                        Vec3f ab;
+                        float abLenSq;
+                        float halfWidth;
+                    };
+                    std::vector<EmittedWallSeg> emittedWallSegs;
+                    for (const auto& ep : layerOut.paths) {
+                        if (ep.feature_kind != kFeatureOuterWall &&
+                            ep.feature_kind != kFeatureInnerWall) {
+                            continue;
+                        }
+                        for (std::size_t k = 0; k + 1 < ep.points.size(); ++k) {
+                            const Vec3f pa{ep.points[k].x, ep.points[k].y, ep.points[k].z};
+                            const Vec3f pb{ep.points[k + 1].x, ep.points[k + 1].y, ep.points[k + 1].z};
+                            const Vec3f ab = pb - pa;
+                            const float hw = 0.25f * (ep.points[k].width_mm + ep.points[k + 1].width_mm);
+                            emittedWallSegs.push_back(EmittedWallSeg{
+                                pa,
+                                pb,
+                                ab,
+                                lengthSq3(ab),
+                                std::max(0.05f, hw),
+                            });
+                        }
+                    }
+
+                    auto distToNearestEmittedWallEdge = [&](const Vec3f& p, float* outCenterDist = nullptr) -> float {
+                        float bestEdgeDist = kInf;
+                        float bestCenterDist = kInf;
+                        for (const auto& ws : emittedWallSegs) {
+                            const float tProj = (ws.abLenSq > 1.0e-12f)
+                                ? std::clamp(dot3(p - ws.a, ws.ab) / ws.abLenSq, 0.0f, 1.0f)
+                                : 0.5f;
+                            const Vec3f foot = ws.a + (ws.ab * tProj);
+                            const float dc = dist3(p, foot);
+                            const float de = dc - ws.halfWidth;
+                            if (de < bestEdgeDist) {
+                                bestEdgeDist = de;
+                                bestCenterDist = dc;
+                            }
+                        }
+                        if (outCenterDist != nullptr) {
+                            *outCenterDist = bestCenterDist;
+                        }
+                        return bestEdgeDist;
+                    };
+
+                    if (!emittedWallSegs.empty()) {
+                        std::queue<std::uint32_t> deadZoneQ;
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            if (isWaveOverhang[i]) {
+                                deadZoneQ.push(static_cast<std::uint32_t>(i));
+                            }
+                        }
+                        while (!deadZoneQ.empty()) {
+                            const std::uint32_t u = deadZoneQ.front();
+                            deadZoneQ.pop();
+                            for (std::uint32_t nb : adj[u]) {
+                                if (isWaveOverhang[nb] || coveredByBridge[nb]) {
+                                    continue;
+                                }
+                                // If `nb` lies within the perimeter wall band (`dOuter <= totalWallSpan`)
+                                // and is not covered by any emitted wall bead (`edgeDist > 0.06 * w_min`),
+                                // absorb `nb` into `isWaveOverhang` so WaveOverhang Pass 1 reaches the
+                                // first surviving wall.
+                                if (dOuter[nb] <= totalWallSpan[nb] - 0.15f * localInnerWidth[nb]) {
+                                    const float edgeDist = distToNearestEmittedWallEdge(shellMesh.verts[nb].pos);
+                                    if (edgeDist > 0.06f * outerW.min_mm) {
+                                        isWaveOverhang[nb] = true;
+                                        isUnsupported[nb] = true;
+                                        deadZoneQ.push(nb);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Multi-source Dijkstra distance `dFromSupported` starting at 0 on the boundary
                     // of the supported region (`!isWaveOverhang`) and on underlying sparse infill
                     // rib loci (`sparseRibSeedDist <= 0.45 * w_sparse`), growing outward.
+                    // Also compute `dIntoSupported` growing inward into `!isWaveOverhang` so the
+                    // interior anchor contour is placed at exact geodesic offset `0.5 * w_inner`.
                     std::vector<float> dFromSupported(nV, kInf);
+                    std::vector<float> dIntoSupported(nV, kInf);
                     std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> wavePq;
+                    std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> supPq;
 
                     for (std::size_t i = 0; i < nV; ++i) {
                         if (!isWaveOverhang[i]) {
                             dFromSupported[i] = 0.0f;
                             wavePq.push({0.0f, static_cast<std::uint32_t>(i)});
-                        } else if (isOverSparseWave[i] &&
-                                   sparseRibSeedDist[i] <= 0.45f * sparseW.target_mm) {
-                            dFromSupported[i] = sparseRibSeedDist[i];
-                            wavePq.push({sparseRibSeedDist[i], static_cast<std::uint32_t>(i)});
+                        } else {
+                            dIntoSupported[i] = 0.0f;
+                            supPq.push({0.0f, static_cast<std::uint32_t>(i)});
+                            if (isOverSparseWave[i] &&
+                                sparseRibSeedDist[i] <= 0.45f * sparseW.target_mm) {
+                                dFromSupported[i] = sparseRibSeedDist[i];
+                                wavePq.push({sparseRibSeedDist[i], static_cast<std::uint32_t>(i)});
+                            }
                         }
                     }
 
                     // For wave vertices directly adjacent to a supported vertex across a mesh edge,
-                    // initialize exact distance from the midpoint of the supported/unsupported boundary edge.
+                    // initialize distance from the physical outer edge of the adjacent emitted wall
+                    // (when bordering the perimeter band) or the boundary edge midpoint.
                     for (std::size_t i = 0; i < nV; ++i) {
                         if (!isWaveOverhang[i]) {
                             continue;
                         }
                         for (std::uint32_t nb : adj[i]) {
                             if (!isWaveOverhang[nb]) {
-                                const float halfEdge = 0.5f * dist3(shellMesh.verts[i].pos, shellMesh.verts[nb].pos);
-                                if (halfEdge < dFromSupported[i]) {
-                                    dFromSupported[i] = halfEdge;
-                                    wavePq.push({halfEdge, static_cast<std::uint32_t>(i)});
+                                const float edgeLen = dist3(shellMesh.verts[i].pos, shellMesh.verts[nb].pos);
+                                float seedDist = 0.5f * edgeLen;
+                                if (!emittedWallSegs.empty() &&
+                                    dOuter[nb] <= totalWallSpan[nb] + 0.25f * localInnerWidth[nb]) {
+                                    const float wallEdgeDist = distToNearestEmittedWallEdge(shellMesh.verts[i].pos);
+                                    if (wallEdgeDist > 0.0f && wallEdgeDist < edgeLen * 1.5f) {
+                                        seedDist = wallEdgeDist;
+                                    }
+                                }
+                                if (seedDist < dFromSupported[i]) {
+                                    dFromSupported[i] = seedDist;
+                                    wavePq.push({seedDist, static_cast<std::uint32_t>(i)});
+                                }
+                                const float supSeed = std::max(0.01f, edgeLen - seedDist);
+                                if (supSeed < dIntoSupported[nb]) {
+                                    dIntoSupported[nb] = supSeed;
+                                    supPq.push({supSeed, nb});
                                 }
                             }
                         }
@@ -4871,20 +5088,45 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         }
                     }
 
+                    while (!supPq.empty()) {
+                        const auto [dCurr, u] = supPq.top();
+                        supPq.pop();
+                        if (dCurr > dIntoSupported[u] + 1.0e-6f) {
+                            continue;
+                        }
+                        for (std::uint32_t v : adj[u]) {
+                            if (isWaveOverhang[v]) {
+                                continue;
+                            }
+                            const float wEdge = dist3(shellMesh.verts[u].pos, shellMesh.verts[v].pos);
+                            if (dCurr + wEdge < dIntoSupported[v]) {
+                                dIntoSupported[v] = dCurr + wEdge;
+                                supPq.push({dIntoSupported[v], v});
+                            }
+                        }
+                    }
+
                     // If the supported/wave boundary cuts across an interior infill region (where
-                    // `dOuter > totalWallSpan`), emit a supported anchor inner-wall contour along
-                    // the supported side of the interface so pass 1 of the wave overhang always has
-                    // a continuous existing extrusion to overlap against.
+                    // `dOuter > totalWallSpan`) or across an uncovered perimeter transition, emit a
+                    // supported anchor inner-wall contour at geodesic distance `0.5 * w_inner - 0.5 * overlap`
+                    // inside the supported side of the interface so pass 1 of the wave overhang always
+                    // has a continuous existing extrusion to overlap against.
                     {
                         std::vector<float> anchorLevel(nV, 0.0f);
                         std::vector<float> anchorValidity(nV, -1.0f);
                         for (std::size_t i = 0; i < nV; ++i) {
-                            const float signedDist = isWaveOverhang[i]
-                                ? dFromSupported[i]
-                                : -0.5f * innerW.target_mm;
-                            anchorLevel[i] = signedDist + 0.25f * innerW.target_mm;
-                            if (dOuter[i] > totalWallSpan[i] - 0.25f * innerW.target_mm) {
+                            const float targetInset =
+                                std::max(0.15f * localInnerWidth[i], 0.5f * localInnerWidth[i] - 0.5f * waveOverlapMm);
+                            anchorLevel[i] = isWaveOverhang[i]
+                                ? (dFromSupported[i] + targetInset)
+                                : (targetInset - dIntoSupported[i]);
+                            if (dOuter[i] > totalWallSpan[i] - 0.65f * localInnerWidth[i]) {
                                 anchorValidity[i] = 1.0f;
+                            } else if (!isWaveOverhang[i] && dOuter[i] >= 0.75f * localOuterWidth[i]) {
+                                const float edgeDist = distToNearestEmittedWallEdge(shellMesh.verts[i].pos);
+                                if (edgeDist > 0.15f * localInnerWidth[i]) {
+                                    anchorValidity[i] = 1.0f;
+                                }
                             }
                         }
                         const auto anchorSegs = extractIsoContourSegments(
@@ -4951,14 +5193,53 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             : 1.0f;
                         waveRho[i] = rho;
 
-                        const float remToBound = hasInnerShellBoundary
-                            ? std::min(dOuter[i], dInner[i])
+                        // For perimeter/cantilever wave overhangs (`!isOverSparseWave[i]`), the wave
+                        // always grows outward to the outer surface \Gamma_outer (`dOuter = 0`), never
+                        // toward the inner shell boundary `dInner`!
+                        const float remToBound = isOverSparseWave[i]
+                            ? (hasInnerShellBoundary ? std::min(dOuter[i], dInner[i]) : dOuter[i])
                             : dOuter[i];
                         const float totSpan = std::clamp(
                             dFromSupported[i] + remToBound,
                             outerW.min_mm,
                             8.0f * shellThicknessMm);
                         waveTotalSpan[i] = totSpan;
+                        waveDomainValidity[i] = totSpan;
+                    }
+
+                    // Smooth `waveTotalSpan` and `waveRho` across the wave overhang domain before
+                    // computing `nPasses` and `waveStep` so consecutive passes p and p+1 share a
+                    // consistent step size and stay in continuous contact.
+                    for (int pass = 0; pass < 3; ++pass) {
+                        std::vector<float> nextSpan = waveTotalSpan;
+                        std::vector<float> nextRho = waveRho;
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            if (!isWaveOverhang[i] || adj[i].empty()) {
+                                continue;
+                            }
+                            float sumSpan = waveTotalSpan[i];
+                            float sumRho = waveRho[i];
+                            int cnt = 1;
+                            for (std::uint32_t nb : adj[i]) {
+                                if (isWaveOverhang[nb]) {
+                                    sumSpan += waveTotalSpan[nb];
+                                    sumRho += waveRho[nb];
+                                    ++cnt;
+                                }
+                            }
+                            nextSpan[i] = sumSpan / static_cast<float>(cnt);
+                            nextRho[i] = sumRho / static_cast<float>(cnt);
+                        }
+                        waveTotalSpan = std::move(nextSpan);
+                        waveRho = std::move(nextRho);
+                    }
+
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (!isWaveOverhang[i] || dFromSupported[i] >= kInf * 0.5f) {
+                            continue;
+                        }
+                        const float totSpan = waveTotalSpan[i];
+                        const float rho = waveRho[i];
                         waveDomainValidity[i] = totSpan;
 
                         const float nominalStep =
@@ -4978,9 +5259,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             rho * adaptedWidth - waveOverlapMm);
                     }
 
-                    // Smooth `waveWidth` and `waveStep` over 1-ring neighborhoods so variable width
+                    // Smooth `waveWidth` and `waveStep` over 2 neighborhood passes so variable width
                     // transitions along curved wave overhangs are C^1-smooth while maintaining overlap.
-                    {
+                    for (int pass = 0; pass < 2; ++pass) {
                         std::vector<float> wSmooth = waveWidth;
                         std::vector<float> sSmooth = waveStep;
                         for (std::size_t i = 0; i < nV; ++i) {
@@ -5021,9 +5302,11 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             const float centerDist =
                                 (static_cast<float>(p) - 0.5f) * waveStep[i] - 0.5f * waveOverlapMm;
                             const float outerInset = 0.5f * waveRho[i] * waveWidth[i];
-                            waveLevel[i] = std::max(
-                                dFromSupported[i] - centerDist,
-                                outerInset - dOuter[i]);
+                            float lvl = dFromSupported[i] - centerDist;
+                            if (dFromSupported[i] >= centerDist - 0.85f * waveStep[i]) {
+                                lvl = std::max(lvl, outerInset - dOuter[i]);
+                            }
+                            waveLevel[i] = lvl;
                             if (isWaveOverhang[i]) {
                                 const float prevOuterReach = (p == 1)
                                     ? 0.0f
@@ -5464,9 +5747,12 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 }
 
                 // Vertical Half-Layer Brick Interlocking (`VerticalHalfLayer` or `CombinedLateralAndVertical`):
-                // Offsets odd-indexed inner walls (j = 1, 3, ...) by +0.5 * h_layer along the local
-                // nozzle axis \hat{z}_nozzle, with a 0.5 * h starter pass on the first layer and a
-                // 0.5 * h flush closing cap pass on the topmost layer containing inner walls.
+                // Offsets odd-indexed inner walls (j = 1, 3, ..., j <= layerNumInnerWalls) by +0.5 * h_layer
+                // along the local nozzle axis \hat{z}_nozzle, with a 0.5 * h starter pass on the first layer
+                // and a 0.5 * h flush closing cap pass on the topmost layer containing inner walls.
+                // Special case: never shift the wave-overhang anchor contour (`wall_index > layerNumInnerWalls`)
+                // or inner walls that border an unsupported Bridge / WaveOverhang or steep overhang wall, so
+                // overhanging perimeters and wave overhangs retain full co-planar lateral and vertical contact.
                 const bool isLastInnerWallLayer =
                     layerInfo.is_top_layer ||
                     (onePerimeterOnConformalPatches &&
@@ -5478,12 +5764,59 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     layerNumInnerWalls > 0 &&
                     layerInfo.branch_layer_count >= 2 &&
                     !layerOut.paths.empty()) {
+                    std::vector<Vec3f> unsupVertPositions;
+                    std::vector<Vec3f> overhangWallPositions;
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (isUnsupported[i] || isWaveOverhang[i]) {
+                            unsupVertPositions.push_back(shellMesh.verts[i].pos);
+                        } else if (vertIsOverhangWall[i]) {
+                            overhangWallPositions.push_back(shellMesh.verts[i].pos);
+                        }
+                    }
+                    const float unsupGuardRad = shellThicknessMm + 2.0f * innerW.target_mm;
+                    const float unsupGuardRadSq = unsupGuardRad * unsupGuardRad;
+                    const float ovWallGuardRad = shellThicknessMm + 1.0f * innerW.target_mm;
+                    const float ovWallGuardRadSq = ovWallGuardRad * ovWallGuardRad;
+
+                    auto shouldVerticalBrickShiftPath = [&](const ExtrusionPath& path) -> bool {
+                        if (path.feature_kind != kFeatureInnerWall ||
+                            path.wall_index == 0 ||
+                            path.wall_index > layerNumInnerWalls ||
+                            (path.wall_index % 2) != 1 ||
+                            path.points.empty()) {
+                            return false;
+                        }
+                        // Open inner-wall chains were clipped at an unsupported overhang boundary;
+                        // keep them co-planar with the layer so WaveOverhang / Bridge paths stay in contact.
+                        if (!path.is_closed && (anyUnsupported || anyWaveOverhang)) {
+                            return false;
+                        }
+                        if (unsupVertPositions.empty() && overhangWallPositions.empty()) {
+                            return true;
+                        }
+                        std::size_t overhangPtCount = 0;
+                        for (const auto& pt : path.points) {
+                            const Vec3f p0{pt.x, pt.y, pt.z};
+                            for (const auto& up : unsupVertPositions) {
+                                if (lengthSq3(p0 - up) <= unsupGuardRadSq) {
+                                    return false;
+                                }
+                            }
+                            for (const auto& op : overhangWallPositions) {
+                                if (lengthSq3(p0 - op) <= ovWallGuardRadSq) {
+                                    ++overhangPtCount;
+                                    break;
+                                }
+                            }
+                        }
+                        return (overhangPtCount * 5 <= path.points.size());
+                    };
+
                     if (layerInfo.is_first_layer && !isLastInnerWallLayer) {
                         rust::Vec<ExtrusionPath> brickPaths;
                         brickPaths.reserve(layerOut.paths.size() + layerNumInnerWalls);
                         for (const auto& path : layerOut.paths) {
-                            if (path.feature_kind == kFeatureInnerWall &&
-                                (path.wall_index % 2 == 1)) {
+                            if (shouldVerticalBrickShiftPath(path)) {
                                 ExtrusionPath starterPath = path;
                                 for (auto& pt : starterPath.points) {
                                     const float hOrig = pt.height_mm;
@@ -5499,8 +5832,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             }
                         }
                         for (auto& path : layerOut.paths) {
-                            if (path.feature_kind == kFeatureInnerWall &&
-                                (path.wall_index % 2 == 1)) {
+                            if (shouldVerticalBrickShiftPath(path)) {
                                 for (auto& pt : path.points) {
                                     const float hOrig = pt.height_mm;
                                     const Vec3f p0{pt.x, pt.y, pt.z};
@@ -5522,8 +5854,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         layerOut.paths = std::move(brickPaths);
                     } else if (!layerInfo.is_first_layer && !isLastInnerWallLayer) {
                         for (auto& path : layerOut.paths) {
-                            if (path.feature_kind == kFeatureInnerWall &&
-                                (path.wall_index % 2 == 1)) {
+                            if (shouldVerticalBrickShiftPath(path)) {
                                 for (auto& pt : path.points) {
                                     const float hOrig = pt.height_mm;
                                     const Vec3f p0{pt.x, pt.y, pt.z};
@@ -5543,8 +5874,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         }
                     } else if (isLastInnerWallLayer && !layerInfo.is_first_layer) {
                         for (auto& path : layerOut.paths) {
-                            if (path.feature_kind == kFeatureInnerWall &&
-                                (path.wall_index % 2 == 1)) {
+                            if (shouldVerticalBrickShiftPath(path)) {
                                 for (auto& pt : path.points) {
                                     pt.height_mm = std::max(0.02f, 0.5f * pt.height_mm);
                                 }

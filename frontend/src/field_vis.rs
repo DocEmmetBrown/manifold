@@ -9504,6 +9504,178 @@ mod tests {
 
         let _ = ffi::remove_cad_object(part.object_id);
     }
+
+    #[test]
+    fn test_brick_layers_overhang_and_wave_overhang_contact_and_categorisation() {
+        let _guard = crate::bridge::TEST_BACKEND_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Build an L-shaped cantilevered overhang block:
+        // - Lower column (z in [0.0, 1.6] mm): x in [-5.0, +5.0], y in [-5.0, +5.0]
+        // - Upper cantilevered shelf (z in [1.6, 3.2] mm): x in [-5.0, +9.0], y in [-5.0, +5.0]
+        //   (so x in [+5.0, +9.0] at z = 1.6..2.0 mm is a 4.0 mm free-air cantilevered overhang
+        //   requiring multiple inside-out WaveOverhang passes!).
+        let v = [
+            // Base z = 0.0 (0..4)
+            [-5.0f32, -5.0, 0.0],
+            [5.0, -5.0, 0.0],
+            [5.0, 5.0, 0.0],
+            [-5.0, 5.0, 0.0],
+            // Step z = 1.6 (4..10)
+            [-5.0, -5.0, 1.6],
+            [5.0, -5.0, 1.6],
+            [5.0, 5.0, 1.6],
+            [-5.0, 5.0, 1.6],
+            [9.0, -5.0, 1.6],
+            [9.0, 5.0, 1.6],
+            // Top z = 3.2 (10..14)
+            [-5.0, -5.0, 3.2],
+            [9.0, -5.0, 3.2],
+            [9.0, 5.0, 3.2],
+            [-5.0, 5.0, 3.2],
+        ];
+        let tris: &[[u32; 3]] = &[
+            // Bottom z = 0
+            [0, 2, 1],
+            [0, 3, 2],
+            // Top z = 3.2
+            [10, 11, 12],
+            [10, 12, 13],
+            // Left x = -5 (full height 0..3.2 via 0,3,7,4 and 4,7,13,10)
+            [0, 7, 3],
+            [0, 4, 7],
+            [4, 13, 7],
+            [4, 10, 13],
+            // Lower right x = +5 (z = 0..1.6)
+            [1, 2, 6],
+            [1, 6, 5],
+            // Cantilevered overhang underside z = 1.6 (x = +5..+9, facing -Z!)
+            [5, 6, 9],
+            [5, 9, 8],
+            // Upper right x = +9 (z = 1.6..3.2)
+            [8, 9, 12],
+            [8, 12, 11],
+            // Front y = -5
+            [0, 1, 5],
+            [0, 5, 4],
+            [4, 5, 11],
+            [4, 11, 10],
+            [5, 8, 11],
+            // Back y = +5
+            [3, 6, 2],
+            [3, 7, 6],
+            [7, 12, 6],
+            [7, 13, 12],
+            [6, 12, 9],
+        ];
+        let mut positions = Vec::with_capacity(v.len() * 3);
+        for p in &v {
+            positions.extend_from_slice(p);
+        }
+        let mut indices = Vec::with_capacity(tris.len() * 3);
+        for tri in tris {
+            indices.extend_from_slice(tri);
+        }
+
+        let part = ffi::register_triangle_mesh("CantileverOverhangBlock", &positions, &indices);
+        assert!(part.object_id > 0);
+
+        let mut cfg = SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+        cfg.eikonal.voxel_size_mm = 0.25;
+        cfg.eikonal.enable_multi_resolution_grid = false;
+        cfg.slicing.layer_height.target_mm = 0.35;
+        cfg.slicing.layer_height.min_mm = 0.20;
+        cfg.slicing.layer_height.max_mm = 0.45;
+        cfg.slicing.layer_height.first_layer_mm = 0.35;
+        cfg.slicing.shell_thickness_mm = 1.60;
+        cfg.slicing.inner_wall_count = 2;
+        cfg.slicing.enable_support_generation = false;
+        cfg.slicing.enable_auto_conformal_skin = false;
+
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.25, 4.0));
+        let layers_res = ffi::select_slicing_isosurfaces(part.object_id, 0.0);
+        assert!(layers_res.valid);
+
+        for mode in crate::config::BrickLayerMode::ALL {
+            cfg.slicing.brick_layer_mode = mode;
+            crate::ui::sync_config_to_backend(&cfg);
+            let tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+            assert!(tp.valid, "Toolpaths should be valid for mode {:?}", mode);
+            assert!(
+                tp.wave_overhang_count > 0,
+                "Expected WaveOverhang extrusions on cantilever shelf for mode {:?}",
+                mode
+            );
+
+            for layer in &tp.layers {
+                let wave_paths: Vec<_> = layer
+                    .paths
+                    .iter()
+                    .filter(|p| p.feature_kind == 6 && !p.points.is_empty())
+                    .collect();
+                if wave_paths.is_empty() {
+                    continue;
+                }
+                let non_wave_paths: Vec<_> = layer
+                    .paths
+                    .iter()
+                    .filter(|p| (p.feature_kind == 0 || p.feature_kind == 1) && !p.points.is_empty())
+                    .collect();
+                assert!(
+                    !non_wave_paths.is_empty(),
+                    "WaveOverhang layer {} must also have supported walls in mode {:?}",
+                    layer.layer_index,
+                    mode
+                );
+
+                // Every WaveOverhang pass `p` must be in lateral & vertical contact with at least one
+                // earlier extrusion on the same layer (a supported wall for p = 1, or pass p - 1 for p > 1)
+                for wp in &wave_paths {
+                    let mut min_center_dist = f32::MAX;
+                    let mut min_z_diff = f32::MAX;
+                    for other in &layer.paths {
+                        let is_valid_neighbor = (other.feature_kind == 0 || other.feature_kind == 1)
+                            || (other.feature_kind == 6 && other.wall_index < wp.wall_index);
+                        if !is_valid_neighbor {
+                            continue;
+                        }
+                        for p_w in &wp.points {
+                            let pw = Vec3::new(p_w.x, p_w.y, p_w.z);
+                            for p_o in &other.points {
+                                let po = Vec3::new(p_o.x, p_o.y, p_o.z);
+                                let d = pw.distance(po);
+                                if d < min_center_dist {
+                                    min_center_dist = d;
+                                    min_z_diff = (pw.z - po.z).abs();
+                                }
+                            }
+                        }
+                    }
+                    assert!(
+                        min_center_dist <= 0.85,
+                        "WaveOverhang pass {} on layer {} is out of contact (min_dist = {:.3} mm) in mode {:?}",
+                        wp.wall_index,
+                        layer.layer_index,
+                        min_center_dist,
+                        mode
+                    );
+                    assert!(
+                        min_z_diff <= 0.15,
+                        "WaveOverhang pass {} on layer {} has vertical brick Z-mismatch ({:.3} mm) with adjacent extrusion in mode {:?}",
+                        wp.wall_index,
+                        layer.layer_index,
+                        min_z_diff,
+                        mode
+                    );
+                }
+            }
+        }
+
+        let _ = ffi::remove_cad_object(part.object_id);
+    }
 }
 
 

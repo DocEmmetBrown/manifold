@@ -1018,54 +1018,49 @@ fn order_chain_band_single_slot(
     }
 
     // Sort supported walls according to `WallPrintOrder`, and when Vertical Half-Layer Brick
-    // Interlocking is present, order monotonically by elevation tier:
-    // Tier 0 (First-Layer 0.5*h Starter Pass) -> Tier 1 (Even Walls 0, 2, 4...) -> Tier 2 (Raised +0.5*h Odd Walls)
+    // Interlocking is present on an odd wall chain, order monotonically by local elevation tier
+    // relative to the nearest adjacent even wall point:
+    // - Tier 0: First-layer 0.5*h starter pass (\Delta z_noz < -0.25*h, r_h < 0.72)
+    // - Tier 1: Unshifted even walls (0, 2, 4...) AND unshifted overhang/anchor odd walls
+    // - Tier 2: Raised +0.5*h odd brick walls (\Delta z_noz > +0.30*h) or top-layer 0.5*h cap passes
     let max_wall_idx = walls.iter().map(|w| w.wall_index).max().unwrap_or(0);
-    let mut even_h_sum = 0.0f32;
-    let mut even_proj_sum = 0.0f32;
-    let mut even_pt_cnt = 0usize;
-    for w in &walls {
-        if w.wall_index % 2 == 0 {
-            for pt in &w.pts {
-                even_h_sum += pt.height_mm;
-                even_proj_sum += pt.pos_bed.dot(pt.nozzle_bed);
-                even_pt_cnt += 1;
+    let mut even_wall_pts: Vec<(Vec3, f32)> = Vec::new();
+    for ew in &walls {
+        if ew.wall_index % 2 == 0 {
+            for ept in &ew.pts {
+                even_wall_pts.push((ept.pos_bed, ept.height_mm));
             }
         }
     }
-    let even_mean_h = if even_pt_cnt > 0 {
-        even_h_sum / (even_pt_cnt as f32)
-    } else {
-        0.20
-    };
-    let even_mean_proj = if even_pt_cnt > 0 {
-        even_proj_sum / (even_pt_cnt as f32)
-    } else {
-        0.0
-    };
-    let chain_mean_h_and_proj = |w: &WorkingChain| -> (f32, f32) {
-        if w.pts.is_empty() {
-            return (even_mean_h, even_mean_proj);
+    let wall_tier = |w: &WorkingChain| -> u32 {
+        if w.wall_index % 2 == 0 || w.pts.is_empty() || even_wall_pts.is_empty() {
+            return 1u32;
         }
-        let mut hs = 0.0f32;
-        let mut ps = 0.0f32;
-        for pt in &w.pts {
-            hs += pt.height_mm;
-            ps += pt.pos_bed.dot(pt.nozzle_bed);
-        }
-        let inv = 1.0 / (w.pts.len() as f32);
-        (hs * inv, ps * inv)
-    };
-    let has_vertical_brick_shift = even_pt_cnt > 0
-        && walls.iter().any(|w| {
-            if w.wall_index % 2 == 1 {
-                let (mh, mp) = chain_mean_h_and_proj(w);
-                (mh - even_mean_h).abs() > 0.20 * even_mean_h
-                    || (mp - even_mean_proj).abs() > 0.20 * even_mean_h
-            } else {
-                false
+        let sample_pt = &w.pts[w.pts.len() / 2];
+        let mut best_dist_sq = f32::MAX;
+        let mut nearest_even: Option<(Vec3, f32)> = None;
+        for &(epos, eh) in &even_wall_pts {
+            let dsq = (epos - sample_pt.pos_bed).length_squared();
+            if dsq < best_dist_sq {
+                best_dist_sq = dsq;
+                nearest_even = Some((epos, eh));
             }
-        });
+        }
+        let Some((epos, eh)) = nearest_even else {
+            return 1u32;
+        };
+        let h_ref = eh.max(0.02);
+        let r_h = sample_pt.height_mm / h_ref;
+        let noz = sample_pt.nozzle_bed.try_normalize().unwrap_or(Vec3::Z);
+        let delta_z_noz = (sample_pt.pos_bed - epos).dot(noz);
+        if r_h < 0.72 && delta_z_noz < -0.22 * h_ref {
+            0u32 // First-layer half-height starter pass (-0.5 * h_0)
+        } else if delta_z_noz > 0.28 * h_ref || r_h < 0.72 {
+            2u32 // Raised +0.5 * h_k brick pass (or top-layer 0.5 * h closing cap pass)
+        } else {
+            1u32 // Unshifted overhang inner wall or wave-overhang anchor contour
+        }
+    };
 
     let wall_rank = |w: &WorkingChain| -> u32 {
         let base_rank = match wall_order {
@@ -1081,19 +1076,7 @@ fn order_chain_band_single_slot(
                 }
             }
         };
-        if !has_vertical_brick_shift {
-            return base_rank;
-        }
-        let tier = if w.wall_index % 2 == 0 {
-            1u32
-        } else {
-            let (mh, mp) = chain_mean_h_and_proj(w);
-            if mh < 0.72 * even_mean_h && mp < even_mean_proj - 0.15 * even_mean_h {
-                0u32 // First-layer half-height starter pass (-0.5 * h_0)
-            } else {
-                2u32 // Raised +0.5 * h_k brick pass (or top-layer closing cap pass)
-            }
-        };
+        let tier = wall_tier(w);
         tier * 1024 + base_rank
     };
     walls.sort_by_key(|w| wall_rank(w));
