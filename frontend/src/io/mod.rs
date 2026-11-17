@@ -5,7 +5,7 @@ pub mod threemf;
 use std::path::{Path, PathBuf};
 use bevy::prelude::*;
 use crate::bridge::ffi::{self, DecomposedPartInfo, RenderVertex};
-use crate::config::{SlicerConfig, ThreeMfFilamentSlot};
+use crate::config::{ObjectFilamentMode, SlicerConfig, ThreeMfFilamentSlot};
 use crate::hull::{
     build_surface_patches, SimplifiedConvexHull, SurfacePatch, MAX_SIMPLIFIED_HULL_FACES,
 };
@@ -52,6 +52,11 @@ pub struct LoadedObjectData {
     pub triangle_colors_rgba: Vec<u32>,
     /// Per-vertex `[R, G, B, A]` sRGBA8 colours for full-colour / textured 3MF viewport rendering, or empty.
     pub vertex_colors_rgba: Vec<[u8; 4]>,
+    /// Per-object filament / colour mixing mode override (`ProjectDefault` by default).
+    pub filament_mode: ObjectFilamentMode,
+    /// Optional per-object target sRGBA colour (`[R, G, B, A]` in `0.0..=1.0`) for unpainted objects
+    /// when using per-object CMYKW optical colour mixing or custom filament tinting.
+    pub custom_color_srgba: Option<[f32; 4]>,
 }
 
 /// Summary of an asynchronous multi-file import operation.
@@ -221,6 +226,8 @@ pub fn build_loaded_object_from_part(
         vertex_filament_slots: Vec::new(),
         triangle_colors_rgba: Vec::new(),
         vertex_colors_rgba: Vec::new(),
+        filament_mode: ObjectFilamentMode::default(),
+        custom_color_srgba: None,
     })
 }
 

@@ -2220,7 +2220,224 @@ impl MoonrakerNetworkConfig {
     }
 }
 
-/// A colour / filament slot imported from a multi-colour `.3mf` project and its mapping to a machine tool.
+/// A single real-filament component of a Virtual Filament (`ThreeMfFilamentSlot`),
+/// pairing a physical machine tool index (`tool_index`) with a positive integer weight (`ratio`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VirtualFilamentComponent {
+    /// Index into `SlicerConfig::tools` (`0..tools.len()`).
+    pub tool_index: usize,
+    /// Positive integer dither weight ($r_k \ge 1$, e.g. `2` in a `2 : 1` mix).
+    pub ratio: u32,
+}
+
+impl Default for VirtualFilamentComponent {
+    fn default() -> Self {
+        Self {
+            tool_index: 0,
+            ratio: 1,
+        }
+    }
+}
+
+/// Spatial dithering strategy used to interleave real filaments in an integer ratio
+/// ($r_0 : r_1 : \dots : r_{k-1}$) for a Virtual Filament.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VirtualFilamentDitherMode {
+    /// Interleave real filaments across both perimeter wall depth (`wall_index`) and
+    /// layer index (`layer_index`) using a balanced Bresenham ratio schedule.
+    /// Zero mid-perimeter tool switches; blends both radially through the shell and vertically.
+    #[default]
+    ByWallAndLayer,
+    /// Interleave real filaments strictly layer-by-layer (`layer_index`) using a balanced
+    /// Bresenham ratio schedule. Minimum possible toolchanges (at most 1 tool per virtual
+    /// filament per layer).
+    ByLayer,
+    /// Subdivide extrusions into short segments (`min_short_extrusion_mm`) and step through
+    /// the integer ratio along each extrusion path (with brick-staggered phase across layers).
+    AlongPathSegments,
+}
+
+impl VirtualFilamentDitherMode {
+    pub const ALL: [Self; 3] = [
+        Self::ByWallAndLayer,
+        Self::ByLayer,
+        Self::AlongPathSegments,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ByWallAndLayer => "By Wall & Layer (Radial + Vertical)",
+            Self::ByLayer => "By Layer Only (Min Toolchanges)",
+            Self::AlongPathSegments => "Along-Path Short Segments",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::ByWallAndLayer => "Wall + Layer",
+            Self::ByLayer => "Layer Only",
+            Self::AlongPathSegments => "Along Path",
+        }
+    }
+}
+
+/// Per-object filament assignment and optical colour-mixing mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ObjectFilamentMode {
+    /// Follow the project's default active tool, imported 3MF/OBJ slot assignments,
+    /// and global `config.slicing.color_mixing` setting.
+    #[default]
+    ProjectDefault,
+    /// Print this entire object with a single physical machine tool (`0..config.tools.len()`),
+    /// bypassing optical colour mixing for this object.
+    SingleTool(usize),
+    /// Print this object using a specific slot in `config.filament_slots` (`0..filament_slots.len()`),
+    /// such as a Virtual Filament (integer-ratio dither mix) or 3MF filament slot.
+    FilamentSlot(u8),
+    /// Force Kubelka-Munk Front-Lit Reflectance optical colour mixing (CMYKW / N-Tool) on this object.
+    OpticalFrontLit,
+    /// Force Kubelka-Munk Back-Lit Transmittance optical colour mixing (Lithophane CMYKW) on this object.
+    OpticalBackLitLithophane,
+    /// Keep imported 3MF/OBJ multi-slot assignments mapped directly to their configured tools/virtual mixes,
+    /// explicitly disabling Kubelka-Munk optical colour mixing on this object even if enabled globally.
+    DirectSlotsNoOptical,
+}
+
+impl ObjectFilamentMode {
+    /// Compact label suitable for the Build Plate object list row.
+    pub fn short_label(self, config: &SlicerConfig) -> String {
+        match self {
+            Self::ProjectDefault => {
+                if config.slicing.color_mixing.enabled && config.tools.len() >= 2 {
+                    match config.slicing.color_mixing.lighting_mode {
+                        crate::color_optics::OpticalLightingMode::FrontLitReflectance => {
+                            "Auto (CMYKW)".to_string()
+                        }
+                        crate::color_optics::OpticalLightingMode::BackLitTransmittance => {
+                            "Auto (Litho)".to_string()
+                        }
+                        crate::color_optics::OpticalLightingMode::MixedFrontAndBack => {
+                            "Auto (Mixed)".to_string()
+                        }
+                    }
+                } else if let Some(s0) = config.filament_slots.first() {
+                    if s0.is_virtual_mix() {
+                        format!("Auto ({})", s0.format_ratio_summary(&config.tools))
+                    } else if let Some(t) = config.active_tool() {
+                        format!("Auto (T{})", t.id)
+                    } else {
+                        "Default".to_string()
+                    }
+                } else if let Some(t) = config.active_tool() {
+                    format!("Auto (T{})", t.id)
+                } else {
+                    "Default".to_string()
+                }
+            }
+            Self::SingleTool(t_idx) => {
+                let tid = config
+                    .tools
+                    .get(t_idx)
+                    .map(|t| t.id)
+                    .unwrap_or(t_idx as u32);
+                format!("Tool T{tid}")
+            }
+            Self::FilamentSlot(slot) => {
+                if let Some(s) = config
+                    .filament_slots
+                    .iter()
+                    .find(|s| s.slot_index == slot as u32)
+                    .or_else(|| config.filament_slots.get(slot as usize))
+                {
+                    if s.is_virtual_mix() {
+                        format!("Slot #{} ({})", slot as usize + 1, s.format_ratio_summary(&config.tools))
+                    } else {
+                        format!("Slot #{}", slot as usize + 1)
+                    }
+                } else {
+                    format!("Slot #{}", slot as usize + 1)
+                }
+            }
+            Self::OpticalFrontLit => "CMYKW Front-Lit".to_string(),
+            Self::OpticalBackLitLithophane => "CMYKW Lithophane".to_string(),
+            Self::DirectSlotsNoOptical => "Direct Slots (No Mix)".to_string(),
+        }
+    }
+
+    /// Detailed label suitable for the Selected Object inspector combo box.
+    pub fn full_label(self, config: &SlicerConfig) -> String {
+        match self {
+            Self::ProjectDefault => {
+                if config.slicing.color_mixing.enabled && config.tools.len() >= 2 {
+                    format!(
+                        "Project Default (Optical {})",
+                        config.slicing.color_mixing.lighting_mode.label()
+                    )
+                } else if let Some(t) = config.active_tool() {
+                    format!("Project Default (Active Tool T{} / 3MF Slots)", t.id)
+                } else {
+                    "Project Default".to_string()
+                }
+            }
+            Self::SingleTool(t_idx) => {
+                if let Some(t) = config.tools.get(t_idx) {
+                    format!(
+                        "Tool T{} — {} ({} {})",
+                        t.id, t.name, t.filament_type, t.filament_color_hex
+                    )
+                } else {
+                    format!("Tool T{t_idx}")
+                }
+            }
+            Self::FilamentSlot(slot) => {
+                if let Some(s) = config
+                    .filament_slots
+                    .iter()
+                    .find(|s| s.slot_index == slot as u32)
+                    .or_else(|| config.filament_slots.get(slot as usize))
+                {
+                    if s.is_virtual_mix() {
+                        format!(
+                            "Slot #{} — {} [Mix {}]",
+                            slot as usize + 1,
+                            s.name,
+                            s.format_ratio_summary(&config.tools)
+                        )
+                    } else {
+                        let tid = config
+                            .tools
+                            .get(s.tool_index)
+                            .map(|t| t.id)
+                            .unwrap_or(s.tool_index as u32);
+                        format!(
+                            "Slot #{} — {} (→ T{}, {})",
+                            slot as usize + 1,
+                            s.name,
+                            tid,
+                            s.color_hex
+                        )
+                    }
+                } else {
+                    format!("Filament Slot #{}", slot as usize + 1)
+                }
+            }
+            Self::OpticalFrontLit => {
+                "Optical Colour Mixing — CMYKW Front-Lit (Reflectance)".to_string()
+            }
+            Self::OpticalBackLitLithophane => {
+                "Optical Colour Mixing — CMYKW Back-Lit (Lithophane)".to_string()
+            }
+            Self::DirectSlotsNoOptical => {
+                "Direct 3MF / Virtual Slots (Bypass Optical Mixing)".to_string()
+            }
+        }
+    }
+}
+
+/// A colour / filament slot imported from a multi-colour `.3mf` project (or defined manually)
+/// and its mapping to either a single machine tool or a Virtual Filament composed of two or more
+/// real tools dithered together in an integer ratio.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThreeMfFilamentSlot {
@@ -2234,8 +2451,13 @@ pub struct ThreeMfFilamentSlot {
     pub color_hex: String,
     /// Display color in sRGB `[r, g, b, a]` (`0.0..=1.0`).
     pub color_srgba: [f32; 4],
-    /// Assigned machine tool index in `SlicerConfig::tools` (`0..tools.len()`).
+    /// Assigned machine tool index in `SlicerConfig::tools` (`0..tools.len()`) when not a virtual mix.
     pub tool_index: usize,
+    /// When containing 2 or more components, defines this slot as a Virtual Filament composed of
+    /// multiple real tools (`tool_index`) dithered together in the integer ratio `c_0.ratio : c_1.ratio : ...`.
+    pub dither_components: Vec<VirtualFilamentComponent>,
+    /// Dithering mode used when `dither_components.len() >= 2`.
+    pub dither_mode: VirtualFilamentDitherMode,
 }
 
 impl Default for ThreeMfFilamentSlot {
@@ -2256,7 +2478,82 @@ impl ThreeMfFilamentSlot {
             color_hex: hex.to_string(),
             color_srgba: srgba,
             tool_index,
+            dither_components: Vec::new(),
+            dither_mode: VirtualFilamentDitherMode::default(),
         }
+    }
+
+    /// Returns true if this slot is configured as a Virtual Filament mixing 2 or more real tools.
+    pub fn is_virtual_mix(&self) -> bool {
+        self.dither_components.len() >= 2 && self.total_ratio_parts() >= 2
+    }
+
+    /// Returns the sum of integer ratio weights across all `dither_components`.
+    pub fn total_ratio_parts(&self) -> u32 {
+        self.dither_components
+            .iter()
+            .map(|c| c.ratio.max(1))
+            .sum()
+    }
+
+    /// Returns the primary (highest-ratio) real tool index for this slot.
+    pub fn primary_tool_index(&self, num_tools: usize) -> usize {
+        let max_idx = num_tools.saturating_sub(1);
+        if self.is_virtual_mix() {
+            self.dither_components
+                .iter()
+                .max_by_key(|c| c.ratio.max(1))
+                .map(|c| c.tool_index.min(max_idx))
+                .unwrap_or_else(|| self.tool_index.min(max_idx))
+        } else {
+            self.tool_index.min(max_idx)
+        }
+    }
+
+    /// Computes the optically blended sRGBA colour of this Virtual Filament from its constituent
+    /// real tools and integer ratios (or returns `self.color_srgba` when mapped to a single tool).
+    pub fn compute_blended_srgba(&self, tools: &[ToolConfig]) -> [f32; 4] {
+        if !self.is_virtual_mix() || tools.is_empty() {
+            return self.color_srgba;
+        }
+        crate::color_optics::blend_virtual_filament_srgba(&self.dither_components, tools)
+    }
+
+    /// Updates `self.color_srgba` and `self.color_hex` to match the blended colour of `self.dither_components`.
+    pub fn sync_color_from_dither_components(&mut self, tools: &[ToolConfig]) {
+        if self.is_virtual_mix() && !tools.is_empty() {
+            let rgba = self.compute_blended_srgba(tools);
+            self.color_srgba = rgba;
+            self.color_hex = Self::format_hex_color(rgba);
+        }
+    }
+
+    /// Formats a concise human-readable summary of the integer ratio (e.g. `"2:1 (T0:T1)"`).
+    pub fn format_ratio_summary(&self, tools: &[ToolConfig]) -> String {
+        if !self.is_virtual_mix() {
+            let t_id = tools
+                .get(self.tool_index)
+                .map(|t| t.id)
+                .unwrap_or(self.tool_index as u32);
+            return format!("T{t_id}");
+        }
+        let ratios: Vec<String> = self
+            .dither_components
+            .iter()
+            .map(|c| c.ratio.max(1).to_string())
+            .collect();
+        let t_names: Vec<String> = self
+            .dither_components
+            .iter()
+            .map(|c| {
+                let tid = tools
+                    .get(c.tool_index)
+                    .map(|t| t.id)
+                    .unwrap_or(c.tool_index as u32);
+                format!("T{tid}")
+            })
+            .collect();
+        format!("{} ({})", ratios.join(":"), t_names.join(":"))
     }
 
     /// Parses any standard colour string (`#RGB`, `#RRGGBB`, `#RRGGBBAA`, `rgb(...)`, `rgba(...)`,
@@ -2340,6 +2637,12 @@ impl SlicerConfig {
         }
     }
 
+    /// Returns true if any slot in `self.filament_slots` is configured as a Virtual Filament
+    /// with 2 or more real tools dithered together in an integer ratio.
+    pub fn has_virtual_filament_slots(&self) -> bool {
+        self.tools.len() >= 2 && self.filament_slots.iter().any(|s| s.is_virtual_mix())
+    }
+
     /// Returns the resolved tool index into `self.tools` for a 0-based 3MF `filament_slot`
     /// or direct optical tool assignment (`0x80 | tool_idx`).
     pub fn tool_index_for_filament_slot(&self, slot: u8) -> usize {
@@ -2356,7 +2659,7 @@ impl SlicerConfig {
             .find(|s| s.slot_index == slot as u32)
             .or_else(|| self.filament_slots.get(slot as usize))
         {
-            entry.tool_index.min(max_idx)
+            entry.primary_tool_index(self.tools.len())
         } else {
             self.active_tool_index.min(max_idx)
         }
@@ -2397,7 +2700,11 @@ impl SlicerConfig {
             .find(|s| s.slot_index == slot as u32)
             .or_else(|| self.filament_slots.get(slot as usize))
         {
-            entry.color_srgba
+            if entry.is_virtual_mix() {
+                entry.compute_blended_srgba(&self.tools)
+            } else {
+                entry.color_srgba
+            }
         } else if self.filament_slots.is_empty() {
             self.active_tool()
                 .map(|t| t.filament_color_srgba)

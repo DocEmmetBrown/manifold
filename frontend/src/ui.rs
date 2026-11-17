@@ -12,9 +12,9 @@ use crate::calibration::{
 };
 use crate::config::{
     lookup_parameter_doc, BedShape, BrickLayerMode, ClearancePointXZ, ClearanceProfileMode,
-    FiveAxisKinematicsMode, GcodeDialect, OrderFieldMode, PointNormalHint, SlicerConfig,
-    SolidInfillPattern, SparseInfillPattern, SupportStyle, SurfaceHintMode, ToolConfig,
-    WallPrintOrder,
+    FiveAxisKinematicsMode, GcodeDialect, ObjectFilamentMode, OrderFieldMode, PointNormalHint,
+    SlicerConfig, SolidInfillPattern, SparseInfillPattern, SupportStyle, SurfaceHintMode,
+    ToolConfig, WallPrintOrder,
 };
 use crate::field_vis::{
     high_contrast_parameter_ramp, sample_slice_colormap_rgba, FieldColormap,
@@ -1698,6 +1698,8 @@ pub fn ui_workspace_system(
                         transform: tf,
                         vertices: obj.vertices.clone(),
                         indices: obj.indices.clone(),
+                        filament_mode: obj.filament_mode,
+                        custom_color_srgba: obj.custom_color_srgba,
                     });
                 }
                 let plate_names_snapshot = plate.plate_names();
@@ -2426,6 +2428,28 @@ pub fn ui_workspace_system(
                                     select_id = Some(obj.object_id);
                                 }
 
+                                if render_object_filament_mode_combo(
+                                    ui,
+                                    obj.object_id,
+                                    &mut obj.filament_mode,
+                                    obj.custom_color_srgba,
+                                    &config,
+                                    true,
+                                ) {
+                                    if let Some(mesh) = meshes.get_mut(&obj.mesh_handle) {
+                                        mesh.insert_attribute(
+                                            Mesh::ATTRIBUTE_COLOR,
+                                            crate::field_vis::default_cad_vertex_colors_for_object(
+                                                obj, &config,
+                                            ),
+                                        );
+                                    }
+                                    vis_state.dirty_color_mixing = true;
+                                    vis_state.dirty_surface_colors = true;
+                                    vis_state.dirty_planned_gcode = true;
+                                    vis_state.dirty_toolpaths_mesh = true;
+                                }
+
                                 if render_icon_button(ui, UiIcon::CloneObject, "Clone", true, true)
                                     .on_hover_text(
                                         "Add a duplicate of this object onto this build plate",
@@ -2493,7 +2517,10 @@ pub fn ui_workspace_system(
                         .objects
                         .iter()
                         .any(|o| !o.triangle_filament_slots.is_empty());
-                    if !config.filament_slots.is_empty() || plate_has_multicolor_obj {
+                    if !config.filament_slots.is_empty()
+                        || plate_has_multicolor_obj
+                        || config.tools.len() >= 2
+                    {
                         ui.add_space(6.0);
                         render_3mf_filament_slot_mapping_section(
                             ui,
@@ -2532,6 +2559,15 @@ pub fn ui_workspace_system(
                                 vis_state.dirty_planned_gcode = true;
                                 vis_state.dirty_toolpaths_mesh = true;
                             }
+
+                            // Per-Object Filament / Colour Mode & Optical CMYKW Selector
+                            render_selected_object_filament_and_color_controls(
+                                ui,
+                                &mut plate.objects[obj_idx],
+                                &mut config,
+                                &mut vis_state,
+                                &mut meshes,
+                            );
 
                             // Move object between build plates
                             let mut move_to_plate: Option<usize> = None;
@@ -5476,10 +5512,21 @@ fn render_3mf_filament_slot_mapping_section_config_only(
     id_salt: &str,
 ) {
     let slot_count = config.filament_slots.len();
+    let virtual_count = config
+        .filament_slots
+        .iter()
+        .filter(|s| s.is_virtual_mix())
+        .count();
     let header_title = if slot_count > 0 {
-        format!("3MF Colour / Filament → Tool Mapping ({slot_count} Slots)")
+        if virtual_count > 0 {
+            format!(
+                "3MF Colour / Virtual Filament Mapping ({slot_count} Slots, {virtual_count} Virtual)"
+            )
+        } else {
+            format!("3MF Colour / Filament → Tool Mapping ({slot_count} Slots)")
+        }
     } else {
-        "3MF Colour / Filament → Tool Mapping".to_string()
+        "3MF Colour / Virtual Filament Mapping".to_string()
     };
 
     egui::CollapsingHeader::new(egui::RichText::new(header_title).strong())
@@ -5487,7 +5534,7 @@ fn render_3mf_filament_slot_mapping_section_config_only(
         .default_open(slot_count > 0)
         .show(ui, |ui| {
             ui.small(
-                "Map each colour/filament slot from a multi-colour 3MF (e.g. PrusaSlicer / Bambu / OrcaSlicer MMU painting or multi-part extruders) to a machine extrusion tool (T0, T1, ...).",
+                "Map each colour/filament slot to a single machine tool (T0, T1, ...) or define a Virtual Filament composed of 2+ real tools dithered together in an integer ratio.",
             );
 
             ui.horizontal_wrapped(|ui| {
@@ -5509,8 +5556,68 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                             color_hex: hex.to_string(),
                             color_srgba: srgba,
                             tool_index: tool_idx,
+                            ..Default::default()
                         });
                     vis_state.dirty_surface_colors = true;
+                    vis_state.dirty_color_mixing = true;
+                    vis_state.dirty_toolpaths_mesh = true;
+                    *dirty_gcode = true;
+                }
+
+                if ui
+                    .small_button("+ Add Virtual Filament (Ratio Mix)")
+                    .on_hover_text(
+                        "Add a Virtual Filament composed of two or more real tools dithered together in a custom integer ratio (e.g. 2:1 T0:T1)",
+                    )
+                    .clicked()
+                {
+                    if config.tools.is_empty() {
+                        config.tools.push(ToolConfig::default());
+                    }
+                    if config.tools.len() < 2 {
+                        let base_nozzle = config.tools[0].nozzle_diameter_mm;
+                        let base_temp = config.tools[0].temperature_celsius;
+                        let new_id = config.tools[0].id + 1;
+                        let mut t1 = ToolConfig::standard_tool(
+                            new_id,
+                            format!("T{new_id} - {base_nozzle:.1}mm Extruder"),
+                            base_nozzle,
+                            base_temp,
+                        );
+                        t1.set_color_from_srgba(crate::config::DEFAULT_FILAMENT_SLOT_PALETTE[1].1);
+                        config.tools.push(t1);
+                        *dirty_backend = true;
+                    }
+                    let next_idx = config.filament_slots.len().min(254) as u32;
+                    let comps = vec![
+                        crate::config::VirtualFilamentComponent {
+                            tool_index: 0,
+                            ratio: 1,
+                        },
+                        crate::config::VirtualFilamentComponent {
+                            tool_index: 1.min(config.tools.len() - 1),
+                            ratio: 1,
+                        },
+                    ];
+                    let mut vslot = crate::config::ThreeMfFilamentSlot {
+                        slot_index: next_idx,
+                        name: format!("Virtual Mix #{}", next_idx as usize + 1),
+                        filament_type: config
+                            .tools
+                            .first()
+                            .map(|t| t.filament_type.clone())
+                            .unwrap_or_else(|| "PLA".to_string()),
+                        color_hex: "#888888".to_string(),
+                        color_srgba: [0.53, 0.53, 0.53, 1.0],
+                        tool_index: 0,
+                        dither_components: comps,
+                        dither_mode: crate::config::VirtualFilamentDitherMode::ByWallAndLayer,
+                    };
+                    vslot.sync_color_from_dither_components(&config.tools);
+                    config.filament_slots.push(vslot);
+                    vis_state.toolpath_color_mode = ToolpathColorMode::ByToolOrFilament;
+                    vis_state.dirty_surface_colors = true;
+                    vis_state.dirty_color_mixing = true;
                     vis_state.dirty_toolpaths_mesh = true;
                     *dirty_gcode = true;
                 }
@@ -5713,6 +5820,7 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                 })
                 .collect();
 
+            let tools_snapshot = config.tools.clone();
             let mut remove_slot_idx: Option<usize> = None;
             let mut apply_slot_type_to_tool: Option<(usize, String)> = None;
             let total_slots = config.filament_slots.len();
@@ -5721,6 +5829,14 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                 if slot.tool_index >= tool_labels.len() && !tool_labels.is_empty() {
                     slot.tool_index = tool_labels.len() - 1;
                 }
+                for comp in &mut slot.dither_components {
+                    if comp.tool_index >= tool_labels.len() && !tool_labels.is_empty() {
+                        comp.tool_index = tool_labels.len() - 1;
+                    }
+                    comp.ratio = comp.ratio.clamp(1, 64);
+                }
+
+                let is_virtual = slot.is_virtual_mix();
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(format!("#{}", s_idx + 1))
@@ -5738,7 +5854,7 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                     if ui
                         .color_edit_button_srgba(&mut c32)
                         .on_hover_text(format!(
-                            "Slot #{} colour ({}) — click to customize",
+                            "Slot #{} target colour ({}) — click to customize",
                             s_idx + 1,
                             slot.color_hex
                         ))
@@ -5759,7 +5875,7 @@ fn render_3mf_filament_slot_mapping_section_config_only(
 
                     ui.add(
                         egui::TextEdit::singleline(&mut slot.name)
-                            .desired_width(92.0)
+                            .desired_width(88.0)
                             .hint_text("Slot Name"),
                     )
                     .on_hover_text(format!(
@@ -5774,7 +5890,7 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                         } else {
                             slot.filament_type.as_str()
                         })
-                        .width(62.0)
+                        .width(58.0)
                         .show_ui(ui, |ui| {
                             for mat in ["PLA", "PETG", "ABS", "ASA", "TPU", "PVA", "PA-CF"] {
                                 let is_cur = slot.filament_type.eq_ignore_ascii_case(mat);
@@ -5802,24 +5918,94 @@ fn render_3mf_filament_slot_mapping_section_config_only(
 
                     ui.label("→");
 
-                    let current_tool_text = tool_labels
-                        .get(slot.tool_index)
-                        .map(|(_, l)| l.clone())
-                        .unwrap_or_else(|| format!("T{}", slot.tool_index));
-                    egui::ComboBox::from_id_source((id_salt, "slot_tool_map", s_idx))
-                        .selected_text(current_tool_text)
-                        .width(135.0)
-                        .show_ui(ui, |ui| {
-                            for (t_idx, t_lbl) in &tool_labels {
-                                if ui
-                                    .selectable_value(&mut slot.tool_index, *t_idx, t_lbl)
-                                    .changed()
-                                {
-                                    *dirty_gcode = true;
-                                    vis_state.dirty_toolpaths_mesh = true;
+                    if !is_virtual {
+                        let current_tool_text = tool_labels
+                            .get(slot.tool_index)
+                            .map(|(_, l)| l.clone())
+                            .unwrap_or_else(|| format!("T{}", slot.tool_index));
+                        egui::ComboBox::from_id_source((id_salt, "slot_tool_map", s_idx))
+                            .selected_text(current_tool_text)
+                            .width(120.0)
+                            .show_ui(ui, |ui| {
+                                for (t_idx, t_lbl) in &tool_labels {
+                                    if ui
+                                        .selectable_value(&mut slot.tool_index, *t_idx, t_lbl)
+                                        .changed()
+                                    {
+                                        *dirty_gcode = true;
+                                        vis_state.dirty_toolpaths_mesh = true;
+                                    }
                                 }
-                            }
-                        });
+                            });
+
+                        if tools_snapshot.len() >= 2
+                            && ui
+                                .small_button("⇄ Mix Ratio")
+                                .on_hover_text(
+                                    "Convert this slot into a Virtual Filament composed of 2+ real tools dithered together in an integer ratio",
+                                )
+                                .clicked()
+                        {
+                            slot.dither_components =
+                                crate::color_optics::find_best_integer_ratio_for_target_srgba(
+                                    slot.color_srgba,
+                                    &tools_snapshot,
+                                    8,
+                                );
+                            slot.sync_color_from_dither_components(&tools_snapshot);
+                            vis_state.toolpath_color_mode = ToolpathColorMode::ByToolOrFilament;
+                            vis_state.dirty_surface_colors = true;
+                            vis_state.dirty_color_mixing = true;
+                            vis_state.dirty_toolpaths_mesh = true;
+                            *dirty_gcode = true;
+                        }
+                    } else {
+                        let blended = slot.compute_blended_srgba(&tools_snapshot);
+                        let b_c32 = egui::Color32::from_rgba_unmultiplied(
+                            (blended[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                            (blended[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                            (blended[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                            255,
+                        );
+                        let summary = slot.format_ratio_summary(&tools_snapshot);
+                        ui.label(
+                            egui::RichText::new(format!("Mix {summary}"))
+                                .strong()
+                                .color(b_c32),
+                        )
+                        .on_hover_text(
+                            "Virtual Filament integer ratio across real tools (colour text shows optically blended ratio result)",
+                        );
+
+                        egui::ComboBox::from_id_source((id_salt, "slot_dither_mode", s_idx))
+                            .selected_text(slot.dither_mode.short_label())
+                            .width(92.0)
+                            .show_ui(ui, |ui| {
+                                for dm in crate::config::VirtualFilamentDitherMode::ALL {
+                                    if ui
+                                        .selectable_value(&mut slot.dither_mode, dm, dm.label())
+                                        .changed()
+                                    {
+                                        vis_state.dirty_color_mixing = true;
+                                        vis_state.dirty_toolpaths_mesh = true;
+                                        *dirty_gcode = true;
+                                    }
+                                }
+                            });
+
+                        if ui
+                            .small_button("1:1")
+                            .on_hover_text("Revert this Virtual Filament back to a single 1:1 tool mapping")
+                            .clicked()
+                        {
+                            slot.tool_index = slot.primary_tool_index(tools_snapshot.len());
+                            slot.dither_components.clear();
+                            vis_state.dirty_surface_colors = true;
+                            vis_state.dirty_color_mixing = true;
+                            vis_state.dirty_toolpaths_mesh = true;
+                            *dirty_gcode = true;
+                        }
+                    }
 
                     if total_slots > 1
                         && ui
@@ -5830,6 +6016,123 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                         remove_slot_idx = Some(s_idx);
                     }
                 });
+
+                // Render indented integer-ratio component controls when `slot` is a Virtual Filament
+                if slot.is_virtual_mix() {
+                    let mut ratio_changed = false;
+                    let mut remove_comp_idx: Option<usize> = None;
+                    let comp_count = slot.dither_components.len();
+                    let total_parts = slot.total_ratio_parts().max(1) as f32;
+
+                    ui.indent((id_salt, "virtual_mix_indent", s_idx), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for (c_idx, comp) in slot.dither_components.iter_mut().enumerate() {
+                                if c_idx > 0 {
+                                    ui.label(egui::RichText::new(":").strong());
+                                }
+                                let pct = ((comp.ratio.max(1) as f32) / total_parts * 100.0).round();
+                                ratio_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut comp.ratio)
+                                            .speed(0.15)
+                                            .range(1..=64)
+                                            .suffix("×"),
+                                    )
+                                    .on_hover_text(format!(
+                                        "Integer ratio weight for component #{} ({:.0}% of virtual filament)",
+                                        c_idx + 1,
+                                        pct
+                                    ))
+                                    .changed();
+
+                                let short_tool = tools_snapshot
+                                    .get(comp.tool_index)
+                                    .map(|t| format!("T{} ({})", t.id, t.filament_color_hex))
+                                    .unwrap_or_else(|| format!("T{}", comp.tool_index));
+                                egui::ComboBox::from_id_source((
+                                    id_salt,
+                                    "virtual_comp_tool",
+                                    s_idx,
+                                    c_idx,
+                                ))
+                                .selected_text(short_tool)
+                                .width(102.0)
+                                .show_ui(ui, |ui| {
+                                    for (t_idx, t_lbl) in &tool_labels {
+                                        if ui
+                                            .selectable_value(&mut comp.tool_index, *t_idx, t_lbl)
+                                            .changed()
+                                        {
+                                            ratio_changed = true;
+                                        }
+                                    }
+                                });
+
+                                if comp_count > 2
+                                    && ui
+                                        .small_button("−")
+                                        .on_hover_text("Remove this component from the Virtual Filament")
+                                        .clicked()
+                                {
+                                    remove_comp_idx = Some(c_idx);
+                                }
+                            }
+
+                            if slot.dither_components.len() < tools_snapshot.len().max(2)
+                                && ui
+                                    .small_button("+ Tool")
+                                    .on_hover_text("Add another real filament tool to this Virtual Filament mix")
+                                    .clicked()
+                            {
+                                let next_t = (0..tools_snapshot.len())
+                                    .find(|&ti| {
+                                        !slot
+                                            .dither_components
+                                            .iter()
+                                            .any(|c| c.tool_index == ti)
+                                    })
+                                    .unwrap_or(0);
+                                slot.dither_components.push(
+                                    crate::config::VirtualFilamentComponent {
+                                        tool_index: next_t,
+                                        ratio: 1,
+                                    },
+                                );
+                                ratio_changed = true;
+                            }
+
+                            if ui
+                                .small_button("Auto-Fit")
+                                .on_hover_text(
+                                    "Automatically compute the optimal integer ratio of loaded real tools to match this slot's target colour",
+                                )
+                                .clicked()
+                            {
+                                slot.dither_components =
+                                    crate::color_optics::find_best_integer_ratio_for_target_srgba(
+                                        slot.color_srgba,
+                                        &tools_snapshot,
+                                        8,
+                                    );
+                                ratio_changed = true;
+                            }
+                        });
+                    });
+
+                    if let Some(rc_idx) = remove_comp_idx {
+                        if slot.dither_components.len() > 2 {
+                            slot.dither_components.remove(rc_idx);
+                            ratio_changed = true;
+                        }
+                    }
+                    if ratio_changed {
+                        slot.sync_color_from_dither_components(&tools_snapshot);
+                        vis_state.dirty_surface_colors = true;
+                        vis_state.dirty_color_mixing = true;
+                        vis_state.dirty_toolpaths_mesh = true;
+                        *dirty_gcode = true;
+                    }
+                }
             }
 
             if let Some((t_idx, mat_type)) = apply_slot_type_to_tool {
@@ -10058,4 +10361,299 @@ fn render_calibration_utilities_window(
             }
         });
     calib_state.show_window = open;
+}
+
+/// Renders a compact or full-width per-object `ObjectFilamentMode` `ComboBox` with a live colour swatch.
+/// Returns `true` if `filament_mode` was modified.
+fn render_object_filament_mode_combo(
+    ui: &mut egui::Ui,
+    object_id: u64,
+    filament_mode: &mut ObjectFilamentMode,
+    custom_color_srgba: Option<[f32; 4]>,
+    config: &SlicerConfig,
+    compact: bool,
+) -> bool {
+    let mut changed = false;
+
+    let swatch_rgba = match *filament_mode {
+        ObjectFilamentMode::SingleTool(t) => config
+            .tools
+            .get(t)
+            .or_else(|| config.tools.first())
+            .map(|tool| tool.filament_color_srgba)
+            .unwrap_or([0.24, 0.62, 0.92, 1.0]),
+        ObjectFilamentMode::FilamentSlot(s) => config.color_srgba_for_filament_slot(s),
+        ObjectFilamentMode::OpticalFrontLit | ObjectFilamentMode::OpticalBackLitLithophane => {
+            custom_color_srgba.unwrap_or([0.18, 0.82, 0.96, 1.0])
+        }
+        _ => custom_color_srgba.unwrap_or_else(|| {
+            config
+                .active_tool()
+                .map(|t| t.filament_color_srgba)
+                .unwrap_or([0.24, 0.62, 0.92, 1.0])
+        }),
+    };
+    let swatch_col32 = egui::Color32::from_rgb(
+        (swatch_rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (swatch_rgba[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (swatch_rgba[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+    );
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 3.0, swatch_col32);
+    ui.painter().rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)),
+    );
+
+    let selected_text = if compact {
+        filament_mode.short_label(config)
+    } else {
+        filament_mode.full_label(config)
+    };
+    let combo_id = if compact {
+        format!("obj_filament_mode_compact_{object_id}")
+    } else {
+        format!("obj_filament_mode_full_{object_id}")
+    };
+
+    egui::ComboBox::from_id_source(combo_id)
+        .selected_text(selected_text)
+        .width(if compact { 112.0 } else { 255.0 })
+        .show_ui(ui, |ui| {
+            let def_mode = ObjectFilamentMode::ProjectDefault;
+            if ui
+                .selectable_label(*filament_mode == def_mode, def_mode.full_label(config))
+                .on_hover_text(
+                    "Follow the project's default active tool, imported 3MF/OBJ slots, and global colour mixing setting.",
+                )
+                .clicked()
+            {
+                *filament_mode = def_mode;
+                changed = true;
+            }
+
+            ui.separator();
+            ui.small(egui::RichText::new("Real Machine Tools (T0..Tn):").strong());
+            for (t_idx, tool) in config.tools.iter().enumerate() {
+                let mode = ObjectFilamentMode::SingleTool(t_idx);
+                let is_sel = *filament_mode == mode;
+                let tc = egui::Color32::from_rgb(
+                    (tool.filament_color_srgba[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (tool.filament_color_srgba[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (tool.filament_color_srgba[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                );
+                let lbl = format!(
+                    "■ T{} — {} ({}, {})",
+                    tool.id, tool.name, tool.filament_type, tool.filament_color_hex
+                );
+                if ui
+                    .selectable_label(is_sel, egui::RichText::new(lbl).color(tc))
+                    .on_hover_text(
+                        "Print this entire object with this specific machine tool, bypassing optical colour mixing.",
+                    )
+                    .clicked()
+                {
+                    *filament_mode = mode;
+                    changed = true;
+                }
+            }
+
+            if !config.filament_slots.is_empty() {
+                ui.separator();
+                ui.small(
+                    egui::RichText::new("Filament Slots & Virtual Ratio Mixes:").strong(),
+                );
+                for (s_idx, slot) in config.filament_slots.iter().enumerate() {
+                    if s_idx > 239 {
+                        break;
+                    }
+                    let mode = ObjectFilamentMode::FilamentSlot(s_idx as u8);
+                    let is_sel = *filament_mode == mode;
+                    let sc = egui::Color32::from_rgb(
+                        (slot.color_srgba[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (slot.color_srgba[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (slot.color_srgba[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    );
+                    let lbl = format!("■ {}", mode.full_label(config));
+                    if ui
+                        .selectable_label(is_sel, egui::RichText::new(lbl).color(sc))
+                        .on_hover_text(
+                            "Print this object using this filament slot (including any Virtual Filament integer-ratio dither mix).",
+                        )
+                        .clicked()
+                    {
+                        *filament_mode = mode;
+                        changed = true;
+                    }
+                }
+            }
+
+            ui.separator();
+            ui.small(
+                egui::RichText::new("Per-Object Optical Colour Mixing (CMYKW / N-Tool):").strong(),
+            );
+            for opt_mode in [
+                ObjectFilamentMode::OpticalFrontLit,
+                ObjectFilamentMode::OpticalBackLitLithophane,
+                ObjectFilamentMode::DirectSlotsNoOptical,
+            ] {
+                let is_sel = *filament_mode == opt_mode;
+                if ui
+                    .selectable_label(is_sel, opt_mode.full_label(config))
+                    .clicked()
+                {
+                    *filament_mode = opt_mode;
+                    changed = true;
+                }
+            }
+        });
+
+    changed
+}
+
+/// Renders the per-object `Filament / Colour Mode` selector, optional target colour picker,
+/// and quick CMYKW / Virtual Ratio actions inside the `Selected: {obj_name}` inspector.
+fn render_selected_object_filament_and_color_controls(
+    ui: &mut egui::Ui,
+    obj: &mut crate::scene::SceneObject,
+    config: &mut SlicerConfig,
+    vis_state: &mut FieldVisualizationState,
+    meshes: &mut Assets<Mesh>,
+) {
+    let mut mode_or_color_changed = false;
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Filament / Mode:");
+        if render_object_filament_mode_combo(
+            ui,
+            obj.object_id,
+            &mut obj.filament_mode,
+            obj.custom_color_srgba,
+            config,
+            false,
+        ) {
+            mode_or_color_changed = true;
+        }
+    });
+
+    let is_optical_override = matches!(
+        obj.filament_mode,
+        ObjectFilamentMode::OpticalFrontLit | ObjectFilamentMode::OpticalBackLitLithophane
+    );
+    if is_optical_override && config.tools.len() < 2 {
+        ui.horizontal_wrapped(|ui| {
+            ui.small(
+                egui::RichText::new("Optical CMYKW mixing requires >= 2 tools.")
+                    .color(egui::Color32::from_rgb(245, 190, 90)),
+            );
+            if ui
+                .small_button("Load 5-Tool PLA CMYKW Palette")
+                .on_hover_text(
+                    "Auto-configure T0..T4 with Cyan, Magenta, Yellow, Black, and White PLA filaments.",
+                )
+                .clicked()
+            {
+                config.apply_optical_palette_to_tools(
+                    &crate::color_optics::bambu_pla_cmykw_palette(),
+                );
+                sync_config_to_backend(config);
+                mode_or_color_changed = true;
+            }
+        });
+    }
+
+    let is_unpainted =
+        obj.triangle_filament_slots.is_empty() && obj.triangle_colors_rgba.is_empty();
+    let show_target_color_row = is_unpainted
+        || is_optical_override
+        || obj.custom_color_srgba.is_some();
+
+    if show_target_color_row {
+        ui.horizontal_wrapped(|ui| {
+            let mut has_custom = obj.custom_color_srgba.is_some();
+            if ui
+                .checkbox(&mut has_custom, "Object Target Colour:")
+                .on_hover_text(
+                    "Assign a target sRGB colour to this object for per-object CMYKW optical mixing, Virtual Ratio auto-fitting, or 3D viewport tinting.",
+                )
+                .changed()
+            {
+                if has_custom {
+                    let default_col = config
+                        .active_tool()
+                        .map(|t| t.filament_color_srgba)
+                        .unwrap_or([0.92, 0.36, 0.18, 1.0]);
+                    obj.custom_color_srgba = Some(default_col);
+                } else {
+                    obj.custom_color_srgba = None;
+                }
+                mode_or_color_changed = true;
+            }
+
+            if let Some(ref mut col_srgba) = obj.custom_color_srgba {
+                let mut rgb = [col_srgba[0], col_srgba[1], col_srgba[2]];
+                if ui
+                    .color_edit_button_rgb(&mut rgb)
+                    .on_hover_text("Pick target sRGB colour for this object")
+                    .changed()
+                {
+                    col_srgba[0] = rgb[0];
+                    col_srgba[1] = rgb[1];
+                    col_srgba[2] = rgb[2];
+                    col_srgba[3] = 1.0;
+                    mode_or_color_changed = true;
+                }
+                let hex = crate::config::ThreeMfFilamentSlot::format_hex_color(*col_srgba);
+                ui.monospace(&hex);
+
+                if config.tools.len() >= 2
+                    && ui
+                        .small_button("⇄ Auto-Fit Virtual Ratio")
+                        .on_hover_text(
+                            "Create a new Virtual Filament slot dithered in the best integer ratio of 2–3 real tools to match this colour, and assign this object to it.",
+                        )
+                        .clicked()
+                {
+                    let target_col = *col_srgba;
+                    let comps = crate::color_optics::find_best_integer_ratio_for_target_srgba(
+                        target_col,
+                        &config.tools,
+                        10,
+                    );
+                    let next_idx = config.filament_slots.len().min(239);
+                    let mut new_slot = crate::config::ThreeMfFilamentSlot::default_for_slot(
+                        next_idx,
+                        0,
+                    );
+                    new_slot.dither_components = comps;
+                    new_slot.sync_color_from_dither_components(&config.tools);
+                    let ratio_str = new_slot.format_ratio_summary(&config.tools);
+                    new_slot.name = format!(
+                        "Virtual #{} ({} -> {})",
+                        next_idx + 1,
+                        ratio_str,
+                        new_slot.color_hex
+                    );
+                    config.filament_slots.push(new_slot);
+                    obj.filament_mode = ObjectFilamentMode::FilamentSlot(next_idx as u8);
+                    vis_state.toolpath_color_mode = ToolpathColorMode::ByToolOrFilament;
+                    mode_or_color_changed = true;
+                }
+            }
+        });
+    }
+
+    if mode_or_color_changed {
+        if let Some(mesh) = meshes.get_mut(&obj.mesh_handle) {
+            mesh.insert_attribute(
+                Mesh::ATTRIBUTE_COLOR,
+                crate::field_vis::default_cad_vertex_colors_for_object(obj, config),
+            );
+        }
+        vis_state.dirty_color_mixing = true;
+        vis_state.dirty_surface_colors = true;
+        vis_state.dirty_planned_gcode = true;
+        vis_state.dirty_toolpaths_mesh = true;
+    }
 }

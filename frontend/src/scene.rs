@@ -11,8 +11,8 @@ use wgpu::util::DeviceExt;
 use crate::arrange::{auto_arrange_spiral, ArrangeItem};
 use crate::bridge::ffi::{self, RenderVertex};
 use crate::config::{
-    BedShape, ClearanceProfileMode, PointNormalHint, SlicerConfig, SurfaceFaceHint,
-    SurfaceHintMode,
+    BedShape, ClearanceProfileMode, ObjectFilamentMode, PointNormalHint, SlicerConfig,
+    SurfaceFaceHint, SurfaceHintMode,
 };
 use crate::field_vis::SliceAxis;
 use crate::hull::{
@@ -114,6 +114,8 @@ pub struct SceneObject {
     pub vertex_filament_slots: Vec<u8>,
     pub triangle_colors_rgba: Vec<u32>,
     pub vertex_colors_rgba: Vec<[u8; 4]>,
+    pub filament_mode: ObjectFilamentMode,
+    pub custom_color_srgba: Option<[f32; 4]>,
     pub vertex_buffer: Option<wgpu::Buffer>,
     pub index_buffer: Option<wgpu::Buffer>,
     pub visible: bool,
@@ -334,6 +336,20 @@ impl SceneObject {
     /// Returns the sanitized Klipper `EXCLUDE_OBJECT_DEFINE NAME=...` identifier for this object.
     pub fn exclude_object_name(&self) -> String {
         crate::gcode::sanitize_exclude_object_name(&self.name, self.object_id)
+    }
+
+    /// Returns an explicit single-colour sRGBA override for this object when `custom_color_srgba`
+    /// is set or when `filament_mode` is `SingleTool(t)` or `FilamentSlot(s)`.
+    pub fn resolved_cad_tint_srgba(&self, config: &SlicerConfig) -> Option<[f32; 4]> {
+        match self.filament_mode {
+            ObjectFilamentMode::SingleTool(t) => config
+                .tools
+                .get(t)
+                .or_else(|| config.tools.first())
+                .map(|tool| tool.filament_color_srgba),
+            ObjectFilamentMode::FilamentSlot(s) => Some(config.color_srgba_for_filament_slot(s)),
+            _ => self.custom_color_srgba,
+        }
     }
 
     /// Computes this object's closed 2D `exclude_object` convex-hull footprint polygon
@@ -875,6 +891,8 @@ pub fn spawn_loaded_objects(
             vertex_filament_slots: data.vertex_filament_slots,
             triangle_colors_rgba: data.triangle_colors_rgba,
             vertex_colors_rgba: data.vertex_colors_rgba,
+            filament_mode: data.filament_mode,
+            custom_color_srgba: data.custom_color_srgba,
             vertex_buffer,
             index_buffer,
             visible: true,
@@ -1014,6 +1032,8 @@ pub fn clone_object_on_plate(
     let src_vert_filament_slots = plate.objects[src_idx].vertex_filament_slots.clone();
     let src_tri_colors_rgba = plate.objects[src_idx].triangle_colors_rgba.clone();
     let src_vert_colors_rgba = plate.objects[src_idx].vertex_colors_rgba.clone();
+    let src_filament_mode = plate.objects[src_idx].filament_mode;
+    let src_custom_color_srgba = plate.objects[src_idx].custom_color_srgba;
 
     let src_surface_hints: Vec<SurfaceFaceHint> = config
         .eikonal
@@ -1127,6 +1147,8 @@ pub fn clone_object_on_plate(
             vertex_filament_slots: src_vert_filament_slots.clone(),
             triangle_colors_rgba: src_tri_colors_rgba.clone(),
             vertex_colors_rgba: src_vert_colors_rgba.clone(),
+            filament_mode: src_filament_mode,
+            custom_color_srgba: src_custom_color_srgba,
         });
     }
 
@@ -1227,10 +1249,11 @@ pub fn run_auto_arrange_on_plate(
 /// while preserving translucency (with backface culling) when any visualization is active.
 pub fn update_selection_materials_system(
     plate: Res<BuildPlateState>,
+    config: Res<SlicerConfig>,
     vis_state: Res<crate::field_vis::FieldVisualizationState>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    if !plate.is_changed() && !vis_state.is_changed() {
+    if !plate.is_changed() && !vis_state.is_changed() && !config.is_changed() {
         return;
     }
 
@@ -1238,6 +1261,7 @@ pub fn update_selection_materials_system(
         let is_selected = plate.selected_object_id == Some(obj.object_id);
         let hq_pbr = vis_state.toolpath_quality_mode
             == crate::field_vis::ToolpathQualityMode::HighQualityPbr;
+        let explicit_tint = obj.resolved_cad_tint_srgba(&config);
 
         let any_vis_active = (is_selected
             && (vis_state.show_isosurface
@@ -1328,6 +1352,19 @@ pub fn update_selection_materials_system(
                     None,
                     true,
                 )
+            } else if let Some([tr, tg, tb, _]) = explicit_tint {
+                (
+                    Color::srgba(tr.clamp(0.0, 1.0), tg.clamp(0.0, 1.0), tb.clamp(0.0, 1.0), 1.0),
+                    0.06,
+                    0.38,
+                    0.46,
+                    0.18,
+                    0.0,
+                    AlphaMode::Opaque,
+                    0.0,
+                    None,
+                    true,
+                )
             } else {
                 (
                     Color::srgba(0.32, 0.76, 0.98, 1.0),
@@ -1363,6 +1400,24 @@ pub fn update_selection_materials_system(
                 0.42,
                 if hq_pbr { 0.24 } else { 0.15 },
                 if hq_pbr { 0.14 } else { 0.0 },
+                AlphaMode::Opaque,
+                0.0,
+                None,
+                true,
+            )
+        } else if let Some([tr, tg, tb, _]) = explicit_tint {
+            (
+                Color::srgba(
+                    (tr * 0.85).clamp(0.0, 1.0),
+                    (tg * 0.85).clamp(0.0, 1.0),
+                    (tb * 0.85).clamp(0.0, 1.0),
+                    1.0,
+                ),
+                0.06,
+                0.42,
+                0.42,
+                0.14,
+                0.0,
                 AlphaMode::Opaque,
                 0.0,
                 None,

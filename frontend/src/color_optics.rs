@@ -1524,7 +1524,7 @@ where
     for layer in &raw_toolpaths.layers {
         let mut prep_paths = Vec::with_capacity(layer.paths.len());
         for path in &layer.paths {
-            if path.points.len() < 2 {
+            if path.points.len() < 2 || decode_direct_tool_slot(path.filament_slot).is_some() {
                 prep_paths.push(PreparedPath::Passthrough(path.clone()));
                 continue;
             }
@@ -2678,6 +2678,7 @@ pub fn quantize_texture_triangles_to_filament_slots(
             color_hex: hex,
             color_srgba: srgba,
             tool_index: idx,
+            ..Default::default()
         });
     }
 
@@ -2685,6 +2686,508 @@ pub fn quantize_texture_triangles_to_filament_slots(
         triangle_colors_rgba,
         &slot_colors_srgba,
     ))
+}
+
+// ============================================================================
+// Virtual Filaments: Integer-Ratio Dithering & Optical Blending
+// ============================================================================
+
+#[inline]
+pub fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a.max(1)
+}
+
+/// Consolidates duplicate `tool_index` entries and divides all integer ratio weights by their
+/// greatest common divisor ($\gcd$), clamping `tool_index` to `0..num_tools`.
+pub fn normalize_virtual_filament_components(
+    components: &[crate::config::VirtualFilamentComponent],
+    num_tools: usize,
+) -> Vec<crate::config::VirtualFilamentComponent> {
+    if components.is_empty() || num_tools == 0 {
+        return Vec::new();
+    }
+    let max_tool = num_tools - 1;
+    let mut merged: Vec<crate::config::VirtualFilamentComponent> = Vec::with_capacity(components.len());
+    for c in components {
+        let ti = c.tool_index.min(max_tool);
+        let r = c.ratio.clamp(1, 256);
+        if let Some(existing) = merged.iter_mut().find(|m| m.tool_index == ti) {
+            existing.ratio = existing.ratio.saturating_add(r).min(256);
+        } else {
+            merged.push(crate::config::VirtualFilamentComponent {
+                tool_index: ti,
+                ratio: r,
+            });
+        }
+    }
+    if merged.len() < 2 {
+        return merged;
+    }
+    let mut g = merged[0].ratio;
+    for m in &merged[1..] {
+        g = gcd_u32(g, m.ratio);
+    }
+    let g = g.max(1);
+    for m in &mut merged {
+        m.ratio = (m.ratio / g).max(1);
+    }
+    merged
+}
+
+/// Builds a maximally interleaved Bresenham tool-index sequence of length $R = \sum (r_m / \gcd)$
+/// where each component tool `c_m.tool_index` appears exact integer count $r_m / \gcd$ times.
+pub fn build_bresenham_ratio_schedule(
+    components: &[crate::config::VirtualFilamentComponent],
+    num_tools: usize,
+) -> Vec<usize> {
+    let norm = normalize_virtual_filament_components(components, num_tools);
+    if norm.is_empty() {
+        return vec![0];
+    }
+    if norm.len() == 1 {
+        return vec![norm[0].tool_index];
+    }
+    let total_steps: usize = norm.iter().map(|c| c.ratio as usize).sum();
+    let total_steps = total_steps.clamp(2, 256);
+    let mut counts: Vec<u32> = vec![0; norm.len()];
+    let mut schedule = Vec::with_capacity(total_steps);
+
+    for step in 0..total_steps {
+        let mut best_k = 0usize;
+        let mut best_deficit = f64::NEG_INFINITY;
+        for (k, comp) in norm.iter().enumerate() {
+            if counts[k] >= comp.ratio {
+                continue;
+            }
+            // Target cumulative count at (step + 0.5) is (step + 0.5) * r_k / R
+            let target = ((step as f64) + 0.5) * (comp.ratio as f64) / (total_steps as f64);
+            let deficit = target - (counts[k] as f64);
+            if deficit > best_deficit + 1.0e-9 {
+                best_deficit = deficit;
+                best_k = k;
+            }
+        }
+        counts[best_k] += 1;
+        schedule.push(norm[best_k].tool_index);
+    }
+    schedule
+}
+
+/// Builds a run-grouped integer-ratio schedule `[T_0 (×r_0), T_1 (×r_1), ...]` of length
+/// $R = \sum (r_m / \gcd)$ for along-path short-segment dithering (`AlongPathSegments`),
+/// minimizing toolchanges per cycle while preserving the exact integer length ratio.
+pub fn build_grouped_ratio_schedule(
+    components: &[crate::config::VirtualFilamentComponent],
+    num_tools: usize,
+) -> Vec<usize> {
+    let norm = normalize_virtual_filament_components(components, num_tools);
+    if norm.is_empty() {
+        return vec![0];
+    }
+    let mut schedule = Vec::new();
+    for comp in &norm {
+        for _ in 0..comp.ratio {
+            schedule.push(comp.tool_index);
+        }
+    }
+    if schedule.is_empty() {
+        schedule.push(0);
+    }
+    schedule
+}
+
+/// Computes the optically blended sRGBA colour `[r, g, b, 1.0]` of a Virtual Filament from its
+/// constituent real tools and integer ratios, combining Kubelka-Munk stacked interlayer transmittance
+/// and side-by-side linear-light ratio averaging.
+pub fn blend_virtual_filament_srgba(
+    components: &[crate::config::VirtualFilamentComponent],
+    tools: &[crate::config::ToolConfig],
+) -> [f32; 4] {
+    if tools.is_empty() {
+        return [0.85, 0.85, 0.85, 1.0];
+    }
+    let norm = normalize_virtual_filament_components(components, tools.len());
+    if norm.is_empty() {
+        return tools[0].filament_color_srgba;
+    }
+    if norm.len() == 1 {
+        return tools[norm[0].tool_index].filament_color_srgba;
+    }
+
+    let total_r: f64 = norm.iter().map(|c| c.ratio as f64).sum();
+    let mut lin_avg = [0.0_f64; 3];
+    for comp in &norm {
+        let w = (comp.ratio as f64) / total_r;
+        let tc = tools[comp.tool_index].filament_color_srgba;
+        let lin = srgb_to_linear_rgb([tc[0], tc[1], tc[2]]);
+        lin_avg[0] += w * lin[0];
+        lin_avg[1] += w * lin[1];
+        lin_avg[2] += w * lin[2];
+    }
+
+    // Also evaluate Kubelka-Munk stacked slab reflectance over the Bresenham schedule (up to 6 slabs)
+    // to capture subtractive dye filtering across translucent layers.
+    let schedule = build_bresenham_ratio_schedule(&norm, tools.len());
+    let models: Vec<FilamentOpticalModel> = tools
+        .iter()
+        .map(|t| {
+            let c = t.filament_color_srgba;
+            FilamentOpticalModel::from_srgb_and_td(
+                [c[0], c[1], c[2]],
+                t.effective_transmission_distance_mm(),
+            )
+        })
+        .collect();
+    let n_slabs = schedule.len().clamp(2, 6);
+    let lighting = LithophaneLighting::default_frontlit_d65();
+    let mut km_avg = [0.0_f64; 3];
+    for phase in 0..schedule.len() {
+        let mut comp_slab = OpticalSlab::transparent();
+        for s in 0..n_slabs {
+            let ti = schedule[(phase + s) % schedule.len()];
+            comp_slab = comp_slab.stack_over(&models[ti].slab_response(0.20));
+        }
+        let back_ti = schedule[(phase + n_slabs - 1) % schedule.len()];
+        comp_slab = comp_slab.stack_over(&models[back_ti].opaque_backing_slab());
+        let rgb = comp_slab.evaluate_lighting(&lighting);
+        km_avg[0] += rgb[0] / (schedule.len() as f64);
+        km_avg[1] += rgb[1] / (schedule.len() as f64);
+        km_avg[2] += rgb[2] / (schedule.len() as f64);
+    }
+
+    let blended_lin = [
+        0.55 * km_avg[0] + 0.45 * lin_avg[0],
+        0.55 * km_avg[1] + 0.45 * lin_avg[1],
+        0.55 * km_avg[2] + 0.45 * lin_avg[2],
+    ];
+    let srgb = linear_rgb_to_srgb(blended_lin);
+    [
+        srgb[0].clamp(0.0, 1.0),
+        srgb[1].clamp(0.0, 1.0),
+        srgb[2].clamp(0.0, 1.0),
+        1.0,
+    ]
+}
+
+/// Searches 2-tool and 3-tool integer ratios ($\sum r_k \le \text{max\_total\_parts}$, $\gcd = 1$)
+/// across `tools` to find the Virtual Filament composition that best approximates `target_srgba`
+/// in perceptual Oklab space.
+pub fn find_best_integer_ratio_for_target_srgba(
+    target_srgba: [f32; 4],
+    tools: &[crate::config::ToolConfig],
+    max_total_parts: u32,
+) -> Vec<crate::config::VirtualFilamentComponent> {
+    if tools.len() < 2 {
+        return vec![crate::config::VirtualFilamentComponent {
+            tool_index: 0,
+            ratio: 1,
+        }];
+    }
+    let max_parts = max_total_parts.clamp(2, 12);
+    let target_lab = srgb_to_oklab([target_srgba[0], target_srgba[1], target_srgba[2]]);
+    let mut best_components = vec![
+        crate::config::VirtualFilamentComponent {
+            tool_index: 0,
+            ratio: 1,
+        },
+        crate::config::VirtualFilamentComponent {
+            tool_index: 1,
+            ratio: 1,
+        },
+    ];
+    let mut best_cost = f64::INFINITY;
+
+    // 1. Evaluate all 2-tool integer ratios (r_a : r_b) with gcd(r_a, r_b) == 1 and r_a + r_b <= max_parts
+    for a in 0..tools.len() {
+        for b in (a + 1)..tools.len() {
+            for ra in 1..max_parts {
+                for rb in 1..=(max_parts - ra) {
+                    if gcd_u32(ra, rb) != 1 {
+                        continue;
+                    }
+                    let cand = [
+                        crate::config::VirtualFilamentComponent {
+                            tool_index: a,
+                            ratio: ra,
+                        },
+                        crate::config::VirtualFilamentComponent {
+                            tool_index: b,
+                            ratio: rb,
+                        },
+                    ];
+                    let srgba = blend_virtual_filament_srgba(&cand, tools);
+                    let lab = srgb_to_oklab([srgba[0], srgba[1], srgba[2]]);
+                    // Slight preference for smaller total parts when perceptual error is tied
+                    let cost = oklab_delta_e(lab, target_lab) + 0.0012 * ((ra + rb) as f64);
+                    if cost < best_cost {
+                        best_cost = cost;
+                        best_components = cand.to_vec();
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Evaluate 3-tool integer ratios (r_a : r_b : r_c) up to sum <= 6 when >= 3 tools exist
+    if tools.len() >= 3 {
+        let max_3 = max_parts.min(6);
+        for a in 0..tools.len() {
+            for b in (a + 1)..tools.len() {
+                for c in (b + 1)..tools.len() {
+                    for ra in 1..max_3 {
+                        for rb in 1..(max_3 - ra) {
+                            for rc in 1..=(max_3 - ra - rb) {
+                                if gcd_u32(gcd_u32(ra, rb), rc) != 1 {
+                                    continue;
+                                }
+                                let cand = [
+                                    crate::config::VirtualFilamentComponent {
+                                        tool_index: a,
+                                        ratio: ra,
+                                    },
+                                    crate::config::VirtualFilamentComponent {
+                                        tool_index: b,
+                                        ratio: rb,
+                                    },
+                                    crate::config::VirtualFilamentComponent {
+                                        tool_index: c,
+                                        ratio: rc,
+                                    },
+                                ];
+                                let srgba = blend_virtual_filament_srgba(&cand, tools);
+                                let lab = srgb_to_oklab([srgba[0], srgba[1], srgba[2]]);
+                                let cost = oklab_delta_e(lab, target_lab)
+                                    + 0.0025 * ((ra + rb + rc) as f64);
+                                if cost < best_cost {
+                                    best_cost = cost;
+                                    best_components = cand.to_vec();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort components in descending ratio order so primary component comes first
+    best_components.sort_by(|x, y| y.ratio.cmp(&x.ratio).then(x.tool_index.cmp(&y.tool_index)));
+    best_components
+}
+
+/// Dithers toolpaths assigned to any Virtual Filament (`ThreeMfFilamentSlot::is_virtual_mix()`)
+/// into direct real-tool assignments (`encode_direct_tool_slot(tool_idx)`) according to each
+/// virtual filament's integer ratio and `VirtualFilamentDitherMode`.
+pub fn apply_virtual_filament_dithering_to_toolpaths(
+    raw_toolpaths: &ObjectToolpathsResult,
+    filament_slots: &[crate::config::ThreeMfFilamentSlot],
+    num_tools: usize,
+    unit_segment_mm: f32,
+    support_tool_index: Option<usize>,
+) -> ObjectToolpathsResult {
+    if !raw_toolpaths.valid
+        || num_tools < 2
+        || !filament_slots.iter().any(|s| s.is_virtual_mix())
+    {
+        return raw_toolpaths.clone();
+    }
+
+    let find_virtual_slot = |slot_u8: u8| -> Option<&crate::config::ThreeMfFilamentSlot> {
+        if decode_direct_tool_slot(slot_u8).is_some() {
+            return None;
+        }
+        let s = filament_slots
+            .iter()
+            .find(|s| s.slot_index == slot_u8 as u32)
+            .or_else(|| filament_slots.get(slot_u8 as usize))?;
+        if s.is_virtual_mix() {
+            Some(s)
+        } else {
+            None
+        }
+    };
+
+    let unit_len = unit_segment_mm.clamp(1.0, 50.0);
+    let mut out = ObjectToolpathsResult {
+        valid: true,
+        total_path_count: 0,
+        outer_wall_count: 0,
+        inner_wall_count: 0,
+        solid_infill_count: 0,
+        sparse_infill_count: 0,
+        bridge_count: 0,
+        wave_overhang_count: 0,
+        support_count: 0,
+        support_interface_count: 0,
+        layers: Vec::with_capacity(raw_toolpaths.layers.len()),
+    };
+
+    for layer in &raw_toolpaths.layers {
+        let mut out_paths: Vec<ExtrusionPath> = Vec::with_capacity(layer.paths.len());
+        let mut solid_infill_seq = 0usize;
+
+        for path in &layer.paths {
+            if path.points.len() < 2 {
+                increment_feature_counter(&mut out, path.feature_kind);
+                out_paths.push(path.clone());
+                continue;
+            }
+            if path.feature_kind == 7 || path.feature_kind == 8 {
+                let mut p = path.clone();
+                if let Some(sup_t) = support_tool_index {
+                    p.filament_slot = encode_direct_tool_slot(sup_t);
+                }
+                increment_feature_counter(&mut out, p.feature_kind);
+                out_paths.push(p);
+                continue;
+            }
+
+            let Some(vslot) = find_virtual_slot(path.filament_slot) else {
+                increment_feature_counter(&mut out, path.feature_kind);
+                out_paths.push(path.clone());
+                continue;
+            };
+
+            // SparseInfill (`feature_kind == 4`) stays on the virtual filament's primary real tool
+            // so the printer never wastes toolchanges inside the hidden interior core.
+            if path.feature_kind == 4 {
+                let mut p = path.clone();
+                p.filament_slot = encode_direct_tool_slot(vslot.primary_tool_index(num_tools));
+                increment_feature_counter(&mut out, p.feature_kind);
+                out_paths.push(p);
+                continue;
+            }
+
+            match vslot.dither_mode {
+                crate::config::VirtualFilamentDitherMode::ByLayer => {
+                    let schedule =
+                        build_bresenham_ratio_schedule(&vslot.dither_components, num_tools);
+                    let tool_idx = schedule[(layer.layer_index as usize) % schedule.len()];
+                    let mut p = path.clone();
+                    p.filament_slot = encode_direct_tool_slot(tool_idx);
+                    increment_feature_counter(&mut out, p.feature_kind);
+                    out_paths.push(p);
+                }
+                crate::config::VirtualFilamentDitherMode::ByWallAndLayer => {
+                    let schedule =
+                        build_bresenham_ratio_schedule(&vslot.dither_components, num_tools);
+                    let depth_offset = match path.feature_kind {
+                        0 => 0usize,
+                        1 | 5 | 6 => path.wall_index as usize,
+                        2 | 3 => {
+                            let idx = 2 + solid_infill_seq;
+                            solid_infill_seq = solid_infill_seq.wrapping_add(1);
+                            idx
+                        }
+                        _ => path.wall_index as usize,
+                    };
+                    let step_idx =
+                        ((layer.layer_index as usize) + depth_offset) % schedule.len();
+                    let tool_idx = schedule[step_idx];
+                    let mut p = path.clone();
+                    p.filament_slot = encode_direct_tool_slot(tool_idx);
+                    increment_feature_counter(&mut out, p.feature_kind);
+                    out_paths.push(p);
+                }
+                crate::config::VirtualFilamentDitherMode::AlongPathSegments => {
+                    let schedule =
+                        build_grouped_ratio_schedule(&vslot.dither_components, num_tools);
+                    let phase_offset =
+                        ((layer.layer_index as usize) + (path.wall_index as usize)) % schedule.len();
+
+                    let num_raw_edges = if path.is_closed {
+                        let d_close = dist3(path.points.last().unwrap(), &path.points[0]);
+                        if d_close > 1.0e-3 {
+                            path.points.len()
+                        } else {
+                            path.points.len() - 1
+                        }
+                    } else {
+                        path.points.len() - 1
+                    };
+
+                    let mut sub_segs: Vec<PreparedSubSeg> = Vec::new();
+                    let mut seg_tool_choices: Vec<usize> = Vec::new();
+                    let mut accum_len = 0.0f32;
+
+                    for edge_i in 0..num_raw_edges {
+                        let a = &path.points[edge_i];
+                        let b = &path.points[(edge_i + 1) % path.points.len()];
+                        let edge_len = dist3(a, b);
+                        if edge_len <= 1.0e-5 {
+                            continue;
+                        }
+                        let n_div = if edge_len > 1.25 * unit_len {
+                            ((edge_len / unit_len).round() as usize).clamp(1, 512)
+                        } else {
+                            1
+                        };
+                        let seg_len = edge_len / (n_div as f32);
+                        for k in 0..n_div {
+                            let t0 = (k as f32) / (n_div as f32);
+                            let t1 = ((k + 1) as f32) / (n_div as f32);
+                            let p0 = if k == 0 {
+                                *a
+                            } else {
+                                interpolate_point(a, b, t0)
+                            };
+                            let p1 = if k + 1 == n_div {
+                                *b
+                            } else {
+                                interpolate_point(a, b, t1)
+                            };
+                            let mid_dist = accum_len + 0.5 * seg_len;
+                            accum_len += seg_len;
+                            let unit_idx = (mid_dist / unit_len).floor().max(0.0) as usize;
+                            let tool_idx = schedule[(phase_offset + unit_idx) % schedule.len()];
+                            sub_segs.push(PreparedSubSeg {
+                                p0,
+                                p1,
+                                len_mm: seg_len,
+                                sample_idx: 0,
+                            });
+                            seg_tool_choices.push(tool_idx);
+                        }
+                    }
+
+                    if sub_segs.is_empty() {
+                        let mut p = path.clone();
+                        p.filament_slot = encode_direct_tool_slot(schedule[phase_offset]);
+                        increment_feature_counter(&mut out, p.feature_kind);
+                        out_paths.push(p);
+                    } else {
+                        let identity_tools: Vec<usize> = (0..num_tools).collect();
+                        let emitted = emit_segmented_extrusion_paths(
+                            path,
+                            &sub_segs,
+                            &seg_tool_choices,
+                            &identity_tools,
+                            unit_len * 0.45,
+                        );
+                        for sub_path in emitted {
+                            increment_feature_counter(&mut out, sub_path.feature_kind);
+                            out_paths.push(sub_path);
+                        }
+                    }
+                }
+            }
+        }
+
+        out.total_path_count += out_paths.len() as u32;
+        out.layers.push(crate::bridge::ffi::LayerToolpaths {
+            layer_index: layer.layer_index,
+            branch_id: layer.branch_id,
+            isovalue: layer.isovalue,
+            paths: out_paths,
+        });
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -2999,5 +3502,272 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn virtual_filament_integer_ratio_dithering_and_blending() {
+        use crate::config::{
+            SlicerConfig, ThreeMfFilamentSlot, VirtualFilamentComponent, VirtualFilamentDitherMode,
+        };
+
+        // 1. GCD reduction (4:2 -> 2:1) and balanced Bresenham schedule for 3:2 -> [0, 1, 0, 1, 0]
+        let sched_4_2 = build_bresenham_ratio_schedule(
+            &[
+                VirtualFilamentComponent {
+                    tool_index: 0,
+                    ratio: 4,
+                },
+                VirtualFilamentComponent {
+                    tool_index: 1,
+                    ratio: 2,
+                },
+            ],
+            3,
+        );
+        assert_eq!(sched_4_2.len(), 3, "4:2 ratio must reduce via GCD to length 3");
+        assert_eq!(sched_4_2.iter().filter(|&&t| t == 0).count(), 2);
+        assert_eq!(sched_4_2.iter().filter(|&&t| t == 1).count(), 1);
+
+        let sched_3_2 = build_bresenham_ratio_schedule(
+            &[
+                VirtualFilamentComponent {
+                    tool_index: 0,
+                    ratio: 3,
+                },
+                VirtualFilamentComponent {
+                    tool_index: 1,
+                    ratio: 2,
+                },
+            ],
+            2,
+        );
+        assert_eq!(sched_3_2, vec![0, 1, 0, 1, 0]);
+
+        // 2. Optical blending & Auto-Fit integer ratio on CMYKW tools
+        let mut cfg = SlicerConfig::default();
+        cfg.apply_optical_palette_to_tools(&bambu_pla_cmykw_palette());
+        let green_1_1 = blend_virtual_filament_srgba(
+            &[
+                VirtualFilamentComponent {
+                    tool_index: 0, // Cyan
+                    ratio: 1,
+                },
+                VirtualFilamentComponent {
+                    tool_index: 2, // Yellow
+                    ratio: 1,
+                },
+            ],
+            &cfg.tools,
+        );
+        assert!(
+            green_1_1[1] > green_1_1[0] + 0.12 && green_1_1[1] > green_1_1[2] + 0.05,
+            "1:1 Cyan:Yellow Virtual Filament should blend to Green, got {green_1_1:?}"
+        );
+
+        let fitted = find_best_integer_ratio_for_target_srgba(green_1_1, &cfg.tools, 8);
+        assert!(
+            fitted.len() >= 2
+                && fitted.iter().any(|c| c.tool_index == 0)
+                && fitted.iter().any(|c| c.tool_index == 2),
+            "Auto-Fit on Green target should select Cyan (T0) and Yellow (T2), got {fitted:?}"
+        );
+
+        // 3. Verify `ByLayer`, `ByWallAndLayer`, and `AlongPathSegments` dithering in 2:1 integer ratio
+        let mut vslot = ThreeMfFilamentSlot::default_for_slot(0, 0);
+        vslot.dither_components = vec![
+            VirtualFilamentComponent {
+                tool_index: 0,
+                ratio: 2,
+            },
+            VirtualFilamentComponent {
+                tool_index: 1,
+                ratio: 1,
+            },
+        ];
+
+        let make_layer = |layer_index: u32| crate::bridge::ffi::LayerToolpaths {
+            layer_index,
+            branch_id: 0,
+            isovalue: (layer_index + 1) as f32 * 0.2,
+            paths: vec![
+                ExtrusionPath {
+                    feature_kind: 0,
+                    filament_slot: 0,
+                    wall_index: 0,
+                    is_closed: false,
+                    total_length_mm: 30.0,
+                    mean_width_mm: 0.4,
+                    points: vec![
+                        ToolpathPoint {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.2,
+                            nx: 0.0,
+                            ny: 0.0,
+                            nz: 1.0,
+                            width_mm: 0.4,
+                            height_mm: 0.2,
+                            ..Default::default()
+                        },
+                        ToolpathPoint {
+                            x: 30.0,
+                            y: 0.0,
+                            z: 0.2,
+                            nx: 0.0,
+                            ny: 0.0,
+                            nz: 1.0,
+                            width_mm: 0.4,
+                            height_mm: 0.2,
+                            ..Default::default()
+                        },
+                    ],
+                },
+                ExtrusionPath {
+                    feature_kind: 4, // SparseInfill (must remain on primary tool T0)
+                    filament_slot: 0,
+                    wall_index: 0,
+                    is_closed: false,
+                    total_length_mm: 10.0,
+                    mean_width_mm: 0.4,
+                    points: vec![
+                        ToolpathPoint {
+                            x: 0.0,
+                            y: 5.0,
+                            z: 0.2,
+                            nx: 0.0,
+                            ny: 0.0,
+                            nz: 1.0,
+                            width_mm: 0.4,
+                            height_mm: 0.2,
+                            ..Default::default()
+                        },
+                        ToolpathPoint {
+                            x: 10.0,
+                            y: 5.0,
+                            z: 0.2,
+                            nx: 0.0,
+                            ny: 0.0,
+                            nz: 1.0,
+                            width_mm: 0.4,
+                            height_mm: 0.2,
+                            ..Default::default()
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let raw_3_layers = ObjectToolpathsResult {
+            valid: true,
+            total_path_count: 6,
+            outer_wall_count: 3,
+            sparse_infill_count: 3,
+            layers: vec![make_layer(0), make_layer(1), make_layer(2)],
+            ..Default::default()
+        };
+
+        // 3a. ByLayer mode: across 3 layers, outer wall uses T0 on 2 layers and T1 on 1 layer,
+        // while SparseInfill uses T0 on all 3 layers!
+        vslot.dither_mode = VirtualFilamentDitherMode::ByLayer;
+        let dithered_layer = apply_virtual_filament_dithering_to_toolpaths(
+            &raw_3_layers,
+            &[vslot.clone()],
+            cfg.tools.len(),
+            5.0,
+            None,
+        );
+        let mut wall_t0 = 0usize;
+        let mut wall_t1 = 0usize;
+        for l in &dithered_layer.layers {
+            for p in &l.paths {
+                let t = decode_direct_tool_slot(p.filament_slot).expect("direct tool");
+                if p.feature_kind == 0 {
+                    if t == 0 {
+                        wall_t0 += 1;
+                    } else if t == 1 {
+                        wall_t1 += 1;
+                    }
+                } else if p.feature_kind == 4 {
+                    assert_eq!(t, 0, "SparseInfill must stay on primary tool T0");
+                }
+            }
+        }
+        assert_eq!((wall_t0, wall_t1), (2, 1), "Expected 2:1 layer ratio for T0:T1");
+
+        // 3b. AlongPathSegments mode: 30mm outer wall with 5mm unit segment length in 2:1 ratio
+        // extrudes 20mm of T0 and 10mm of T1!
+        vslot.dither_mode = VirtualFilamentDitherMode::AlongPathSegments;
+        let dithered_path = apply_virtual_filament_dithering_to_toolpaths(
+            &raw_3_layers,
+            std::slice::from_ref(&vslot),
+            cfg.tools.len(),
+            5.0,
+            None,
+        );
+        let mut len_t0 = 0.0f32;
+        let mut len_t1 = 0.0f32;
+        for p in &dithered_path.layers[0].paths {
+            if p.feature_kind == 0 {
+                let t = decode_direct_tool_slot(p.filament_slot).expect("direct tool");
+                if t == 0 {
+                    len_t0 += p.total_length_mm;
+                } else if t == 1 {
+                    len_t1 += p.total_length_mm;
+                }
+            }
+        }
+        assert!(
+            (len_t0 - 20.0).abs() < 0.05 && (len_t1 - 10.0).abs() < 0.05,
+            "Expected 20mm T0 and 10mm T1 (2:1 ratio) on 30mm wall, got T0={len_t0}, T1={len_t1}"
+        );
+
+        // 4. Per-Object `ObjectFilamentMode` overrides (`SingleTool` and `FilamentSlot`)
+        let mut slot0 = ThreeMfFilamentSlot::default_for_slot(0, 0);
+        slot0.tool_index = 0;
+        let mut slot1 = vslot.clone();
+        slot1.slot_index = 1;
+        cfg.filament_slots = vec![slot0, slot1];
+        cfg.slicing.color_mixing.min_short_extrusion_mm = 5.0;
+
+        let single_t3 = crate::field_vis::build_mixed_toolpaths_for_object_with_mode(
+            0,
+            &raw_3_layers,
+            &cfg,
+            crate::config::ObjectFilamentMode::SingleTool(3),
+            None,
+        );
+        for l in &single_t3.layers {
+            for p in &l.paths {
+                assert_eq!(
+                    decode_direct_tool_slot(p.filament_slot),
+                    Some(3),
+                    "SingleTool(3) must assign all non-support paths to T3"
+                );
+            }
+        }
+
+        let virtual_slot1 = crate::field_vis::build_mixed_toolpaths_for_object_with_mode(
+            0,
+            &raw_3_layers,
+            &cfg,
+            crate::config::ObjectFilamentMode::FilamentSlot(1),
+            None,
+        );
+        let mut v_len_t0 = 0.0f32;
+        let mut v_len_t1 = 0.0f32;
+        for p in &virtual_slot1.layers[0].paths {
+            if p.feature_kind == 0 {
+                let t = decode_direct_tool_slot(p.filament_slot).expect("direct tool");
+                if t == 0 {
+                    v_len_t0 += p.total_length_mm;
+                } else if t == 1 {
+                    v_len_t1 += p.total_length_mm;
+                }
+            }
+        }
+        assert!(
+            (v_len_t0 - 20.0).abs() < 0.05 && (v_len_t1 - 10.0).abs() < 0.05,
+            "FilamentSlot(1) must dither unpainted object paths using Virtual Slot #2's 2:1 ratio"
+        );
     }
 }

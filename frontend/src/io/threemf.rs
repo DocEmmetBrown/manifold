@@ -12,7 +12,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::bridge::ffi::{self, RenderVertex};
 use crate::color_optics;
-use crate::config::{SlicerConfig, ThreeMfFilamentSlot};
+use crate::config::{ObjectFilamentMode, SlicerConfig, ThreeMfFilamentSlot};
 use crate::io::{
     build_loaded_object_from_part, load_step_file_parts, obj, stl, LoadedBatchReport,
     LoadedObjectData, LoadedPlateInfo,
@@ -48,6 +48,10 @@ struct SavedObjectEntry {
     plate_index: usize,
     #[serde(default = "default_true_bool")]
     printable: bool,
+    #[serde(default)]
+    filament_mode: ObjectFilamentMode,
+    #[serde(default)]
+    custom_color_srgba: Option<[f32; 4]>,
 }
 
 /// Snapshot of an active build-plate object passed to the 3MF exporter.
@@ -60,6 +64,8 @@ pub struct ExportableObject {
     pub transform: Transform,
     pub vertices: Vec<RenderVertex>,
     pub indices: Vec<u32>,
+    pub filament_mode: ObjectFilamentMode,
+    pub custom_color_srgba: Option<[f32; 4]>,
 }
 
 /// Parsed `<plate>` block from `Metadata/model_settings.config` (OrcaSlicer / Bambu Studio / PrusaSlicer).
@@ -524,6 +530,8 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                             obj.name = saved_obj.name.clone();
                             obj.plate_index = saved_obj.plate_index;
                             obj.printable = saved_obj.printable;
+                            obj.filament_mode = saved_obj.filament_mode;
+                            obj.custom_color_srgba = saved_obj.custom_color_srgba;
                             obj.initial_translation = Vec3::from_array(saved_obj.translation);
                             obj.initial_rotation =
                                 Quat::from_array(saved_obj.rotation_xyzw).normalize();
@@ -533,6 +541,8 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                                 last.name = saved_obj.name.clone();
                                 last.plate_index = saved_obj.plate_index;
                                 last.printable = saved_obj.printable;
+                                last.filament_mode = saved_obj.filament_mode;
+                                last.custom_color_srgba = saved_obj.custom_color_srgba;
                                 last.initial_translation = Vec3::from_array(saved_obj.translation);
                                 last.initial_rotation =
                                     Quat::from_array(saved_obj.rotation_xyzw).normalize();
@@ -793,8 +803,19 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                         .and_then(|ms| ms.object_printable.get(&item.object_id).copied())
                 })
                 .unwrap_or(true);
+            let saved_filament_mode = scene_manifest
+                .as_ref()
+                .and_then(|m| m.objects.get(idx))
+                .map(|o| o.filament_mode)
+                .unwrap_or_default();
+            let saved_custom_color = scene_manifest
+                .as_ref()
+                .and_then(|m| m.objects.get(idx))
+                .and_then(|o| o.custom_color_srgba);
             for loaded in &mut report.objects[prev_obj_len..] {
                 loaded.printable = item_printable;
+                loaded.filament_mode = saved_filament_mode;
+                loaded.custom_color_srgba = saved_custom_color;
             }
         }
     }
@@ -1775,6 +1796,8 @@ pub fn save_project_to_3mf(
             rotation_xyzw: obj.transform.rotation.to_array(),
             plate_index: obj.plate_index,
             printable: obj.printable,
+            filament_mode: obj.filament_mode,
+            custom_color_srgba: obj.custom_color_srgba,
         });
     }
 
@@ -2932,6 +2955,8 @@ mod tests {
                     RenderVertex { x: 0.0, y: 0.0, z: 10.0, nx: 0.0, ny: 0.0, nz: 1.0 },
                 ],
                 indices: vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
+                filament_mode: ObjectFilamentMode::default(),
+                custom_color_srgba: None,
             },
             ExportableObject {
                 object_id: 2,
@@ -2947,6 +2972,8 @@ mod tests {
                     RenderVertex { x: 0.0, y: 0.0, z: 10.0, nx: 0.0, ny: 0.0, nz: 1.0 },
                 ],
                 indices: vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
+                filament_mode: ObjectFilamentMode::OpticalFrontLit,
+                custom_color_srgba: Some([0.2, 0.7, 0.9, 1.0]),
             },
         ];
         let cfg = SlicerConfig::default();
@@ -2969,9 +2996,13 @@ mod tests {
         assert_eq!(report.objects[0].name, "TetraA");
         assert_eq!(report.objects[0].plate_index, 0);
         assert!(report.objects[0].printable);
+        assert_eq!(report.objects[0].filament_mode, ObjectFilamentMode::ProjectDefault);
+        assert_eq!(report.objects[0].custom_color_srgba, None);
         assert_eq!(report.objects[1].name, "TetraB");
         assert_eq!(report.objects[1].plate_index, 1);
         assert!(!report.objects[1].printable);
+        assert_eq!(report.objects[1].filament_mode, ObjectFilamentMode::OpticalFrontLit);
+        assert_eq!(report.objects[1].custom_color_srgba, Some([0.2, 0.7, 0.9, 1.0]));
         for obj in &report.objects {
             let _ = ffi::remove_cad_object(obj.object_id);
         }

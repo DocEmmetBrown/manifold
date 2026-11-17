@@ -473,6 +473,7 @@ fn find_or_insert_obj_filament_slot(
         color_hex: hex,
         color_srgba: rgba8_to_srgba([rgba8[0], rgba8[1], rgba8[2], 255]),
         tool_index: next_idx,
+        ..Default::default()
     });
     next_idx as u8
 }

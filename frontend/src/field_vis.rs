@@ -8,7 +8,7 @@ use crate::bridge::ffi::{
     self, ExtrusionPath, FieldSlice2D, FieldStats, LayerHeightSpec, LineWidthSpec,
     ObjectToolpathsResult, SelectedIsosurfacesResult, ShellPathSpec, SupportSpec,
 };
-use crate::config::{NozzleFrame, SlicerConfig};
+use crate::config::{NozzleFrame, ObjectFilamentMode, SlicerConfig};
 use crate::scene::{BuildPlateState, CadObjectEntity};
 
 /// Cross-section cutting plane orientation in the object's coordinate frame.
@@ -845,27 +845,159 @@ impl FieldVisualizationState {
     }
 }
 
-/// Applies Kubelka-Munk optical filament mixing (`config.slicing.color_mixing`) to `raw_toolpaths`
-/// for `object_id` when enabled and at least 2 extrusion tools are configured, or returns a clone
-/// of `raw_toolpaths`.
+/// Applies Virtual Filament integer-ratio dithering (`config.has_virtual_filament_slots()`) and/or
+/// Kubelka-Munk optical filament mixing (`config.slicing.color_mixing`) to `raw_toolpaths`
+/// for `object_id` when at least 2 extrusion tools are configured, or returns a clone of `raw_toolpaths`.
 pub fn build_mixed_toolpaths_for_object(
     object_id: u64,
     raw_toolpaths: &ObjectToolpathsResult,
     config: &SlicerConfig,
 ) -> ObjectToolpathsResult {
-    if !raw_toolpaths.valid || !config.slicing.color_mixing.enabled || config.tools.len() < 2 {
+    build_mixed_toolpaths_for_object_with_mode(
+        object_id,
+        raw_toolpaths,
+        config,
+        ObjectFilamentMode::ProjectDefault,
+        None,
+    )
+}
+
+/// Applies per-object filament assignment (`ObjectFilamentMode`), Virtual Filament integer-ratio
+/// dithering, and/or Kubelka–Munk optical colour mixing (CMYKW Front-Lit Reflectance or Back-Lit
+/// Lithophane) to `raw_toolpaths` for `object_id`.
+pub fn build_mixed_toolpaths_for_object_with_mode(
+    object_id: u64,
+    raw_toolpaths: &ObjectToolpathsResult,
+    config: &SlicerConfig,
+    filament_mode: ObjectFilamentMode,
+    custom_color_srgba: Option<[f32; 4]>,
+) -> ObjectToolpathsResult {
+    if !raw_toolpaths.valid {
         return raw_toolpaths.clone();
     }
-    let tool_optics = config.tool_optical_inputs();
-    let slot_colors = config.imported_slot_colors_srgba();
     let support_tool = if config.slicing.enable_support_generation {
         Some(config.support_tool_index_resolved())
     } else {
         None
     };
+
+    match filament_mode {
+        ObjectFilamentMode::SingleTool(tool_idx) => {
+            let clamped_tool = tool_idx.min(config.tools.len().saturating_sub(1));
+            let direct_slot = crate::color_optics::encode_direct_tool_slot(clamped_tool);
+            let mut out = raw_toolpaths.clone();
+            for layer in &mut out.layers {
+                for path in &mut layer.paths {
+                    if path.feature_kind != 7 && path.feature_kind != 8 {
+                        path.filament_slot = direct_slot;
+                    }
+                }
+            }
+            return out;
+        }
+        ObjectFilamentMode::FilamentSlot(slot_idx) => {
+            let mut assigned = raw_toolpaths.clone();
+            for layer in &mut assigned.layers {
+                for path in &mut layer.paths {
+                    if path.feature_kind != 7 && path.feature_kind != 8 {
+                        path.filament_slot = slot_idx;
+                    }
+                }
+            }
+            let is_virtual = config
+                .filament_slots
+                .get(slot_idx as usize)
+                .map_or(false, |s| s.is_virtual_mix());
+            if is_virtual && config.tools.len() >= 2 {
+                return crate::color_optics::apply_virtual_filament_dithering_to_toolpaths(
+                    &assigned,
+                    &config.filament_slots,
+                    config.tools.len(),
+                    config.slicing.color_mixing.min_short_extrusion_mm,
+                    support_tool,
+                );
+            }
+            return assigned;
+        }
+        ObjectFilamentMode::DirectSlotsNoOptical => {
+            if config.has_virtual_filament_slots() && config.tools.len() >= 2 {
+                return crate::color_optics::apply_virtual_filament_dithering_to_toolpaths(
+                    raw_toolpaths,
+                    &config.filament_slots,
+                    config.tools.len(),
+                    config.slicing.color_mixing.min_short_extrusion_mm,
+                    support_tool,
+                );
+            }
+            return raw_toolpaths.clone();
+        }
+        ObjectFilamentMode::ProjectDefault
+        | ObjectFilamentMode::OpticalFrontLit
+        | ObjectFilamentMode::OpticalBackLitLithophane => {}
+    }
+
+    if config.tools.len() < 2 {
+        return raw_toolpaths.clone();
+    }
+
+    let want_optical = match filament_mode {
+        ObjectFilamentMode::OpticalFrontLit | ObjectFilamentMode::OpticalBackLitLithophane => true,
+        _ => config.slicing.color_mixing.enabled,
+    };
+    let has_virtual = config.has_virtual_filament_slots();
+    if !has_virtual && !want_optical {
+        return raw_toolpaths.clone();
+    }
+
+    let after_virtual = if has_virtual {
+        crate::color_optics::apply_virtual_filament_dithering_to_toolpaths(
+            raw_toolpaths,
+            &config.filament_slots,
+            config.tools.len(),
+            config.slicing.color_mixing.min_short_extrusion_mm,
+            support_tool,
+        )
+    } else {
+        raw_toolpaths.clone()
+    };
+
+    if !want_optical {
+        return after_virtual;
+    }
+
+    let mut mix_cfg = config.slicing.color_mixing.clone();
+    mix_cfg.enabled = true;
+    match filament_mode {
+        ObjectFilamentMode::OpticalFrontLit => {
+            mix_cfg.lighting_mode = crate::color_optics::OpticalLightingMode::FrontLitReflectance;
+        }
+        ObjectFilamentMode::OpticalBackLitLithophane => {
+            mix_cfg.lighting_mode = crate::color_optics::OpticalLightingMode::BackLitTransmittance;
+        }
+        _ => {}
+    }
+
+    let tool_optics = config.tool_optical_inputs();
+    let mut slot_colors = config.imported_slot_colors_srgba();
+    if let Some(custom_rgba) = custom_color_srgba {
+        if slot_colors.is_empty() {
+            slot_colors.push(custom_rgba);
+        } else {
+            for sc in &mut slot_colors {
+                *sc = custom_rgba;
+            }
+        }
+    } else if slot_colors.is_empty() {
+        let fallback_rgba = config
+            .active_tool()
+            .map(|t| t.filament_color_srgba)
+            .unwrap_or([0.24, 0.62, 0.92, 1.0]);
+        slot_colors.push(fallback_rgba);
+    }
+
     crate::color_optics::apply_optical_color_mixing_to_toolpaths(
-        raw_toolpaths,
-        &config.slicing.color_mixing,
+        &after_virtual,
+        &mix_cfg,
         &tool_optics,
         &slot_colors,
         config.slicing.layer_height.target_mm,
@@ -948,12 +1080,7 @@ pub fn sync_field_visualization_system(
                 if let Some(mesh) = meshes.get_mut(&prev_obj.mesh_handle) {
                     mesh.insert_attribute(
                         Mesh::ATTRIBUTE_COLOR,
-                        default_cad_vertex_colors(
-                            prev_obj.vertices.len(),
-                            &prev_obj.vertex_filament_slots,
-                            &prev_obj.vertex_colors_rgba,
-                            &config,
-                        ),
+                        default_cad_vertex_colors_for_object(prev_obj, &config),
                     );
                 }
             }
@@ -1083,14 +1210,10 @@ pub fn sync_field_visualization_system(
             );
         if vis_state.surface_color_mode == ObjectSurfaceColorMode::DefaultCad
             && (!scene_obj.vertex_filament_slots.is_empty()
-                || !scene_obj.vertex_colors_rgba.is_empty())
+                || !scene_obj.vertex_colors_rgba.is_empty()
+                || scene_obj.resolved_cad_tint_srgba(&config).is_some())
         {
-            colors = default_cad_vertex_colors(
-                scene_obj.vertices.len(),
-                &scene_obj.vertex_filament_slots,
-                &scene_obj.vertex_colors_rgba,
-                &config,
-            );
+            colors = default_cad_vertex_colors_for_object(scene_obj, &config);
         }
         vis_state.surface_color_min_deg = min_deg;
         vis_state.surface_color_max_deg = max_deg;
@@ -1486,7 +1609,7 @@ pub fn sync_field_visualization_system(
         }
     }
 
-    // 2c-ii. Apply Kubelka-Munk optical filament mixing across layers & short extrusions when dirty
+    // 2c-ii. Apply per-object filament assignment, Virtual Filament ratio dithering, and Kubelka-Munk optical mixing
     if (!vis_state.plate_unmixed_toolpaths.is_empty() || vis_state.cached_unmixed_toolpaths.is_some())
         && (vis_state.dirty_color_mixing || vis_state.cached_toolpaths.is_none())
         && !vis_state.ui_pointer_down
@@ -1495,7 +1618,19 @@ pub fn sync_field_visualization_system(
         let unmixed_ids: Vec<u64> = vis_state.plate_unmixed_toolpaths.keys().copied().collect();
         for oid in unmixed_ids {
             if let Some(raw_tp) = vis_state.plate_unmixed_toolpaths.get(&oid) {
-                let mixed = build_mixed_toolpaths_for_object(oid, raw_tp, &config);
+                let (o_mode, o_custom_col) = plate
+                    .objects
+                    .iter()
+                    .find(|o| o.object_id == oid)
+                    .map(|o| (o.filament_mode, o.custom_color_srgba))
+                    .unwrap_or((ObjectFilamentMode::ProjectDefault, None));
+                let mixed = build_mixed_toolpaths_for_object_with_mode(
+                    oid,
+                    raw_tp,
+                    &config,
+                    o_mode,
+                    o_custom_col,
+                );
                 if oid == obj_id {
                     vis_state.cached_toolpaths = Some(mixed.clone());
                 }
@@ -1504,7 +1639,13 @@ pub fn sync_field_visualization_system(
         }
         if !vis_state.plate_mixed_toolpaths.contains_key(&obj_id) {
             if let Some(ref raw_tp) = vis_state.cached_unmixed_toolpaths {
-                let mixed = build_mixed_toolpaths_for_object(obj_id, raw_tp, &config);
+                let mixed = build_mixed_toolpaths_for_object_with_mode(
+                    obj_id,
+                    raw_tp,
+                    &config,
+                    scene_obj.filament_mode,
+                    scene_obj.custom_color_srgba,
+                );
                 vis_state.cached_toolpaths = Some(mixed.clone());
                 vis_state.plate_mixed_toolpaths.insert(obj_id, mixed);
             }
@@ -1522,6 +1663,12 @@ pub fn sync_field_visualization_system(
             if o.plate_index == plate.active_plate_index {
                 o.object_id.hash(&mut sig_hasher);
                 o.printable.hash(&mut sig_hasher);
+                o.filament_mode.hash(&mut sig_hasher);
+                if let Some(cc) = o.custom_color_srgba {
+                    for c in cc {
+                        c.to_bits().hash(&mut sig_hasher);
+                    }
+                }
                 let tf = object_transforms
                     .get(o.entity)
                     .copied()
@@ -3316,6 +3463,54 @@ pub const BRANCH_PALETTE: [[f32; 3]; 8] = [
     [0.58, 0.48, 0.96],
     [0.24, 0.90, 0.92],
 ];
+
+/// Returns per-vertex Linear RGBA colors for a `SceneObject` in `DefaultCad` surface color mode,
+/// honoring per-object `SingleTool`, `FilamentSlot`, or `custom_color_srgba` overrides when present.
+pub fn default_cad_vertex_colors_for_object(
+    obj: &crate::scene::SceneObject,
+    config: &SlicerConfig,
+) -> Vec<[f32; 4]> {
+    match obj.filament_mode {
+        ObjectFilamentMode::SingleTool(t) => {
+            if let Some(tool) = config.tools.get(t).or_else(|| config.tools.first()) {
+                let lin = if obj.vertex_filament_slots.is_empty() && obj.vertex_colors_rgba.is_empty()
+                {
+                    // Base material already applies `resolved_cad_tint_srgba`, so keep vertex attribute white
+                    [1.0, 1.0, 1.0, 1.0]
+                } else {
+                    srgba_to_linear_rgba(tool.filament_color_srgba)
+                };
+                return vec![lin; obj.vertices.len()];
+            }
+        }
+        ObjectFilamentMode::FilamentSlot(s) => {
+            let lin = if obj.vertex_filament_slots.is_empty() && obj.vertex_colors_rgba.is_empty() {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                srgba_to_linear_rgba(config.color_srgba_for_filament_slot(s))
+            };
+            return vec![lin; obj.vertices.len()];
+        }
+        _ => {
+            if let Some(c) = obj.custom_color_srgba {
+                if obj.vertex_colors_rgba.is_empty() {
+                    let lin = if obj.vertex_filament_slots.is_empty() {
+                        [1.0, 1.0, 1.0, 1.0]
+                    } else {
+                        srgba_to_linear_rgba(c)
+                    };
+                    return vec![lin; obj.vertices.len()];
+                }
+            }
+        }
+    }
+    default_cad_vertex_colors(
+        obj.vertices.len(),
+        &obj.vertex_filament_slots,
+        &obj.vertex_colors_rgba,
+        config,
+    )
+}
 
 /// Returns per-vertex Linear RGBA colors for a CAD object in `DefaultCad` surface color mode:
 /// uses discrete 3MF/OBJ filament slot colours when multiple slots (or explicit slot mappings) are

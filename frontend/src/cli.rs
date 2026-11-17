@@ -1484,6 +1484,8 @@ pub fn execute_headless_slice(opts: &SliceCommandOptions) -> Result<HeadlessSlic
                 transform: *tf,
                 vertices: obj.vertices.clone(),
                 indices: obj.indices.clone(),
+                filament_mode: obj.filament_mode,
+                custom_color_srgba: obj.custom_color_srgba,
             })
             .collect();
         save_project_to_3mf(save_3mf, &plate_names, &export_list, &config)?;
@@ -1690,18 +1692,13 @@ fn slice_single_loaded_object(
             obj.name
         ));
     }
-    let toolpaths = if config.slicing.color_mixing.enabled && config.tools.len() >= 2 {
-        if !quiet {
-            eprintln!(
-                "  -> Solving Kubelka-Munk optical filament approximation across {} tools ({})...",
-                config.tools.len(),
-                config.slicing.color_mixing.lighting_mode.label()
-            );
-        }
-        crate::field_vis::build_mixed_toolpaths_for_object(obj.object_id, &raw_toolpaths, config)
-    } else {
-        raw_toolpaths
-    };
+    let toolpaths = crate::field_vis::build_mixed_toolpaths_for_object_with_mode(
+        obj.object_id,
+        &raw_toolpaths,
+        config,
+        obj.filament_mode,
+        obj.custom_color_srgba,
+    );
 
     if !quiet {
         eprintln!(
