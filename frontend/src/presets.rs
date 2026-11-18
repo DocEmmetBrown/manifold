@@ -1229,6 +1229,7 @@ pub struct PresetLibrary {
 
     pub left_tab: LeftPanelTab,
     pub config_subtab: PresetCategory,
+    pub show_left_panel: bool,
     pub show_view_panel: bool,
     pub save_as_open_for: Option<PresetCategory>,
     pub save_as_name_buf: String,
@@ -1247,6 +1248,7 @@ impl Default for PresetLibrary {
             selected_process: "0.20mm Standard Non-Planar".to_string(),
             left_tab: LeftPanelTab::ProjectSetup,
             config_subtab: PresetCategory::Process,
+            show_left_panel: true,
             show_view_panel: true,
             save_as_open_for: None,
             save_as_name_buf: String::new(),

@@ -321,7 +321,7 @@ fn render_interactive_toolpath_line_types_legend(
             let c_sup = counts.map(|c| c.7);
             let c_sup_intf = counts.map(|c| c.8);
 
-            let col_w = ((ui.available_width() - 8.0) * 0.5).max(115.0);
+            let col_w = ((ui.available_width() - 12.0) * 0.5).max(82.0);
             egui::Grid::new("combined_line_type_legend_grid")
                 .num_columns(2)
                 .min_col_width(col_w)
@@ -1223,31 +1223,56 @@ fn render_folder_tab_bar(
     height: f32,
     active_accent: egui::Color32,
 ) -> Option<usize> {
+    render_folder_tab_bar_with_collapse(
+        ui,
+        id_salt,
+        tabs,
+        active_index,
+        height,
+        active_accent,
+        false,
+    )
+    .0
+}
+
+fn render_folder_tab_bar_with_collapse(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    tabs: &[(&str, bool)],
+    active_index: usize,
+    height: f32,
+    active_accent: egui::Color32,
+    show_collapse_btn: bool,
+) -> (Option<usize>, bool) {
     if tabs.is_empty() {
-        return None;
+        return (None, false);
     }
 
     let count = tabs.len();
     let gap = 3.0_f32;
     let total_width = ui.available_width().max(120.0);
+    let collapse_reserve = if show_collapse_btn { 26.0_f32 } else { 0.0_f32 };
+    let tabs_area_width = (total_width - collapse_reserve).max(80.0);
     let total_gaps = gap * (count.saturating_sub(1) as f32);
-    let tab_width = ((total_width - total_gaps) / (count as f32)).max(28.0);
+    let tab_width = ((tabs_area_width - total_gaps) / (count as f32)).max(28.0);
 
     let (bar_rect, _) =
         ui.allocate_exact_size(egui::vec2(total_width, height), egui::Sense::hover());
 
     let mut clicked_tab = None;
+    let mut collapse_clicked = false;
     let baseline_y = bar_rect.max.y - 1.0;
     let baseline_stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(86, 96, 116));
+    let tabs_max_x = bar_rect.min.x + tabs_area_width;
 
     // Pre-collect interaction responses before borrowing the painter
     let mut tab_rects_and_states = Vec::with_capacity(count);
     for idx in 0..count {
         let min_x = bar_rect.min.x + (idx as f32) * (tab_width + gap);
         let max_x = if idx + 1 == count {
-            bar_rect.max.x
+            tabs_max_x
         } else {
-            (min_x + tab_width).min(bar_rect.max.x)
+            (min_x + tab_width).min(tabs_max_x)
         };
         let tab_rect = egui::Rect::from_min_max(
             egui::pos2(min_x, bar_rect.min.y),
@@ -1264,6 +1289,26 @@ fn render_folder_tab_bar(
         tab_rects_and_states.push((tab_rect, resp.hovered()));
     }
 
+    let collapse_btn_state = if show_collapse_btn {
+        let btn_rect = egui::Rect::from_min_max(
+            egui::pos2(tabs_max_x + 3.0, bar_rect.min.y + 2.0),
+            egui::pos2(bar_rect.max.x, baseline_y - 2.0),
+        );
+        let btn_id = ui.id().with(id_salt).with("collapse_btn");
+        let resp = ui
+            .interact(btn_rect, btn_id, egui::Sense::click())
+            .on_hover_text("Collapse left Setup & Configuration panel");
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            collapse_clicked = true;
+        }
+        Some((btn_rect, resp.hovered()))
+    } else {
+        None
+    };
+
     let painter = ui.painter();
 
     // Draw continuous bottom baseline across the entire tab strip first
@@ -1274,6 +1319,35 @@ fn render_folder_tab_bar(
         ],
         baseline_stroke,
     );
+
+    if let Some((btn_rect, btn_hovered)) = collapse_btn_state {
+        let btn_fill = if btn_hovered {
+            egui::Color32::from_rgb(48, 58, 76)
+        } else {
+            egui::Color32::from_rgb(28, 33, 42)
+        };
+        painter.rect_filled(btn_rect, egui::Rounding::same(4.0), btn_fill);
+        painter.rect_stroke(
+            btn_rect,
+            egui::Rounding::same(4.0),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(76, 86, 106)),
+        );
+        let arrow_col = if btn_hovered {
+            egui::Color32::WHITE
+        } else {
+            egui::Color32::from_rgb(190, 200, 218)
+        };
+        let galley = painter.layout_no_wrap(
+            "◀".to_string(),
+            egui::FontId::proportional(11.5),
+            arrow_col,
+        );
+        let pos = egui::pos2(
+            btn_rect.center().x - galley.size().x * 0.5,
+            btn_rect.center().y - galley.size().y * 0.5,
+        );
+        painter.galley(pos, galley, arrow_col);
+    }
 
     for (idx, (&(label, is_modified), &(tab_rect, hovered))) in
         tabs.iter().zip(tab_rects_and_states.iter()).enumerate()
@@ -1350,11 +1424,12 @@ fn render_folder_tab_bar(
         painter.line_segment([p_tr_high, p_tr_low], top_stroke);
         painter.line_segment([p_tr_low, p_br], side_stroke);
 
-        // Label + optional modified amber dot
+        // Label + optional modified amber dot (clipped to tab bounds for narrow panels)
+        let compact_tab = tab_width < 135.0;
         let font_id = if is_active {
-            egui::FontId::proportional(13.5)
+            egui::FontId::proportional(if compact_tab { 12.2 } else { 13.5 })
         } else {
-            egui::FontId::proportional(12.8)
+            egui::FontId::proportional(if compact_tab { 11.6 } else { 12.8 })
         };
         let text_color = if is_active {
             egui::Color32::WHITE
@@ -1363,25 +1438,26 @@ fn render_folder_tab_bar(
         } else {
             egui::Color32::from_rgb(172, 180, 198)
         };
-        let galley = painter.layout_no_wrap(label.to_string(), font_id, text_color);
+        let tab_painter = painter.with_clip_rect(tab_rect.shrink2(egui::vec2(2.0, 0.0)));
+        let galley = tab_painter.layout_no_wrap(label.to_string(), font_id, text_color);
         let dot_space = if is_modified { 10.0 } else { 0.0 };
         let content_w = galley.size().x + dot_space;
         let text_pos = egui::pos2(
-            (tab_rect.center().x - content_w * 0.5).max(tab_rect.min.x + 5.0),
+            (tab_rect.center().x - content_w * 0.5).max(tab_rect.min.x + 4.0),
             tab_rect.center().y - galley.size().y * 0.5 + 1.0,
         );
-        painter.galley(text_pos, galley.clone(), text_color);
+        tab_painter.galley(text_pos, galley.clone(), text_color);
 
         if is_modified {
             let dot_center = egui::pos2(
                 (text_pos.x + galley.size().x + 6.0).min(tab_rect.max.x - 5.0),
                 tab_rect.center().y + 1.0,
             );
-            painter.circle_filled(dot_center, 3.2, egui::Color32::from_rgb(255, 192, 56));
+            tab_painter.circle_filled(dot_center, 3.2, egui::Color32::from_rgb(255, 192, 56));
         }
     }
 
-    clicked_tab
+    (clicked_tab, collapse_clicked)
 }
 
 /// Renders a clearly delineated bordered pill/tab button for inline mode & selector strips
@@ -1442,10 +1518,11 @@ fn render_preset_selector_bar(
                 } else {
                     selected_name.clone()
                 };
+                let combo_w = (ui.available_width() - 95.0).clamp(105.0, 210.0);
                 let mut pick_name: Option<String> = None;
                 egui::ComboBox::from_id_source(("preset_selector_combo", category.label()))
                     .selected_text(combo_label)
-                    .width(210.0)
+                    .width(combo_w)
                     .show_ui(ui, |ui| {
                         for (name, builtin) in &names {
                             let tag = if *builtin { "[Factory]" } else { "[User]" };
@@ -1637,9 +1714,19 @@ pub fn ui_workspace_system(
     // ========================================================================
     // 1. Top Toolbar: Project I/O, Viewport Editing Tools & Workflow Pipeline
     // ========================================================================
-    egui::TopBottomPanel::top("top_editing_toolbar").show(ctx, |ui| {
-        // Row 1: File I/O, Viewport Editing Mode, Scene Actions, and Right Panel Toggle
+    let screen_width = ctx.screen_rect().width().max(640.0);
+    let top_bar_resp = egui::TopBottomPanel::top("top_editing_toolbar").show(ctx, |ui| {
+        // Row 1: Left Panel Toggle, File I/O, Viewport Editing Mode, Scene Actions, and Right Panel Toggle
         ui.horizontal_wrapped(|ui| {
+            ui.toggle_value(
+                &mut preset_lib.show_left_panel,
+                egui::RichText::new("◧ Setup & Config").strong(),
+            )
+            .on_hover_text(
+                "Show/hide the left Project Setup & Configuration side panel",
+            );
+            ui.separator();
+
             if render_icon_button(
                 ui,
                 UiIcon::ImportFile,
@@ -1955,7 +2042,10 @@ pub fn ui_workspace_system(
             );
             ui.toggle_value(
                 &mut preset_lib.show_view_panel,
-                egui::RichText::new("View & Inspection Panel").strong(),
+                egui::RichText::new("◨ View & Inspect").strong(),
+            )
+            .on_hover_text(
+                "Show/hide the right View & Inspection side panel",
             );
         });
 
@@ -2152,96 +2242,129 @@ pub fn ui_workspace_system(
     // ========================================================================
     // 2. Left Panel: Project Setup vs. Configuration & Saved Presets
     // ========================================================================
-    egui::SidePanel::left("slicer_control_panel")
-        .default_width(390.0)
-        .resizable(true)
-        .show(ctx, |ui| {
-            // Top-level Left Panel Mode Switcher (Folder-style tab bar)
-            let any_preset_dirty = PresetCategory::ALL
-                .iter()
-                .any(|&cat| preset_lib.is_category_modified(cat, &config));
-            let setup_label = format!("Project Setup ({})", plate.objects.len());
-            let top_tabs = [
-                (setup_label.as_str(), false),
-                ("Configuration & Presets", any_preset_dirty),
-            ];
-            let active_top_idx = match preset_lib.left_tab {
-                LeftPanelTab::ProjectSetup => 0,
-                LeftPanelTab::Configuration => 1,
-            };
-            if let Some(clicked_idx) = render_folder_tab_bar(
-                ui,
-                "left_panel_primary_tabs",
-                &top_tabs,
-                active_top_idx,
-                30.0,
-                egui::Color32::from_rgb(76, 166, 255),
-            ) {
-                preset_lib.left_tab = if clicked_idx == 0 {
-                    LeftPanelTab::ProjectSetup
-                } else {
-                    LeftPanelTab::Configuration
-                };
-            }
-            ui.add_space(4.0);
+    let left_default_w = (screen_width * 0.22).clamp(245.0, 300.0);
+    let left_max_w = (screen_width * 0.46).max(340.0);
+    if preset_lib.show_left_panel {
+        egui::SidePanel::left("slicer_left_panel")
+            .default_width(left_default_w)
+            .width_range(200.0..=left_max_w)
+            .resizable(true)
+            .show(ctx, |outer_ui| {
+                // Lock the SidePanel's outer `min_rect` width to its exact allocated `max_rect` width
+                // so wide child widgets can never push the panel edge past the resize handle or trigger
+                // auto-expansion when loading a .3mf file.
+                let panel_rect = outer_ui.max_rect();
+                let mut child_ui = outer_ui.child_ui(panel_rect, *outer_ui.layout(), None);
+                child_ui.set_clip_rect(panel_rect);
+                let ui = &mut child_ui;
+                let panel_w = panel_rect.width();
+                ui.spacing_mut().slider_width = (panel_w * 0.34).clamp(62.0, 135.0);
+                ui.spacing_mut().combo_width = (panel_w * 0.42).clamp(85.0, 175.0);
 
-            // When in Configuration & Presets mode, keep the 4 category sub-tabs and preset
-            // selector bar pinned above the scroll area so they stay visible while scrolling.
-            if preset_lib.left_tab == LeftPanelTab::Configuration {
-                let sub_tabs = [
-                    (
-                        PresetCategory::Printer.label(),
-                        preset_lib.is_category_modified(PresetCategory::Printer, &config),
-                    ),
-                    (
-                        PresetCategory::Tool.label(),
-                        preset_lib.is_category_modified(PresetCategory::Tool, &config),
-                    ),
-                    (
-                        PresetCategory::Filament.label(),
-                        preset_lib.is_category_modified(PresetCategory::Filament, &config),
-                    ),
-                    (
-                        PresetCategory::Process.label(),
-                        preset_lib.is_category_modified(PresetCategory::Process, &config),
-                    ),
-                ];
-                let active_sub_idx = PresetCategory::ALL
+                // Top-level Left Panel Mode Switcher (Folder-style tab bar + integrated collapse button)
+                let any_preset_dirty = PresetCategory::ALL
                     .iter()
-                    .position(|&c| c == preset_lib.config_subtab)
-                    .unwrap_or(0);
-                if let Some(clicked_sub) = render_folder_tab_bar(
+                    .any(|&cat| preset_lib.is_category_modified(cat, &config));
+                let is_narrow_left = ui.available_width() < 310.0;
+                let setup_label = if is_narrow_left {
+                    format!("Setup ({})", plate.objects.len())
+                } else {
+                    format!("Project Setup ({})", plate.objects.len())
+                };
+                let cfg_label = if is_narrow_left {
+                    "Config & Presets"
+                } else {
+                    "Configuration & Presets"
+                };
+                let top_tabs = [
+                    (setup_label.as_str(), false),
+                    (cfg_label, any_preset_dirty),
+                ];
+                let active_top_idx = match preset_lib.left_tab {
+                    LeftPanelTab::ProjectSetup => 0,
+                    LeftPanelTab::Configuration => 1,
+                };
+                let (clicked_top, collapse_left) = render_folder_tab_bar_with_collapse(
                     ui,
-                    "left_panel_config_subtabs",
-                    &sub_tabs,
-                    active_sub_idx,
-                    28.0,
-                    egui::Color32::from_rgb(240, 168, 56),
-                ) {
-                    preset_lib.config_subtab = PresetCategory::ALL[clicked_sub];
+                    "left_panel_primary_tabs",
+                    &top_tabs,
+                    active_top_idx,
+                    30.0,
+                    egui::Color32::from_rgb(76, 166, 255),
+                    true,
+                );
+                if let Some(clicked_idx) = clicked_top {
+                    preset_lib.left_tab = if clicked_idx == 0 {
+                        LeftPanelTab::ProjectSetup
+                    } else {
+                        LeftPanelTab::Configuration
+                    };
+                }
+                if collapse_left {
+                    preset_lib.show_left_panel = false;
                 }
                 ui.add_space(4.0);
 
-                let active_category = preset_lib.config_subtab;
-                if render_preset_selector_bar(
-                    ui,
-                    active_category,
-                    &mut preset_lib,
-                    &mut config,
-                    &mut plate.status_message,
-                ) {
-                    if !is_computing {
-                        sync_config_to_backend(&config);
+                // When in Configuration & Presets mode, keep the 4 category sub-tabs and preset
+                // selector bar pinned above the scroll area so they stay visible while scrolling.
+                if preset_lib.left_tab == LeftPanelTab::Configuration {
+                    let sub_tabs = [
+                        (
+                            PresetCategory::Printer.label(),
+                            preset_lib.is_category_modified(PresetCategory::Printer, &config),
+                        ),
+                        (
+                            PresetCategory::Tool.label(),
+                            preset_lib.is_category_modified(PresetCategory::Tool, &config),
+                        ),
+                        (
+                            PresetCategory::Filament.label(),
+                            preset_lib.is_category_modified(PresetCategory::Filament, &config),
+                        ),
+                        (
+                            PresetCategory::Process.label(),
+                            preset_lib.is_category_modified(PresetCategory::Process, &config),
+                        ),
+                    ];
+                    let active_sub_idx = PresetCategory::ALL
+                        .iter()
+                        .position(|&c| c == preset_lib.config_subtab)
+                        .unwrap_or(0);
+                    if let Some(clicked_sub) = render_folder_tab_bar(
+                        ui,
+                        "left_panel_config_subtabs",
+                        &sub_tabs,
+                        active_sub_idx,
+                        28.0,
+                        egui::Color32::from_rgb(240, 168, 56),
+                    ) {
+                        preset_lib.config_subtab = PresetCategory::ALL[clicked_sub];
                     }
-                    vis_state.dirty_selected_layers = true;
-                    vis_state.dirty_toolpaths = true;
-                    vis_state.dirty_planned_gcode = true;
-                }
-                ui.add_space(6.0);
-            }
+                    ui.add_space(4.0);
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if preset_lib.left_tab == LeftPanelTab::ProjectSetup {
+                    let active_category = preset_lib.config_subtab;
+                    if render_preset_selector_bar(
+                        ui,
+                        active_category,
+                        &mut preset_lib,
+                        &mut config,
+                        &mut plate.status_message,
+                    ) {
+                        if !is_computing {
+                            sync_config_to_backend(&config);
+                        }
+                        vis_state.dirty_selected_layers = true;
+                        vis_state.dirty_toolpaths = true;
+                        vis_state.dirty_planned_gcode = true;
+                    }
+                    ui.add_space(6.0);
+                }
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.available_width());
+                        if preset_lib.left_tab == LeftPanelTab::ProjectSetup {
                     // ================================================================
                     // TAB 1: PROJECT SETUP (Build Plates, Objects, Placement, Hints)
                     // ================================================================
@@ -2315,11 +2438,12 @@ pub fn ui_workspace_system(
 
                             let active_idx = plate.active_plate_index;
                             if let Some(active_plate_info) = plate.plates.get_mut(active_idx) {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.small("Plate Name:");
+                                    let edit_w = (ui.available_width() - 12.0).clamp(90.0, 180.0);
                                     ui.add(
                                         egui::TextEdit::singleline(&mut active_plate_info.name)
-                                            .desired_width(180.0),
+                                            .desired_width(edit_w),
                                     );
                                 });
                             }
@@ -2330,7 +2454,7 @@ pub fn ui_workspace_system(
                     let active_plate_name = plate.active_plate_name().to_string();
                     let active_obj_count = plate.active_plate_object_count();
 
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.heading(format!(
                             "Objects on {active_plate_name} ({active_obj_count})"
                         ));
@@ -2390,7 +2514,7 @@ pub fn ui_workspace_system(
                                 continue;
                             }
                             let is_selected = current_selected_id == Some(obj.object_id);
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if ui
                                     .checkbox(&mut obj.visible, "")
                                     .on_hover_text("Show/hide object in the 3D viewport")
@@ -2572,7 +2696,7 @@ pub fn ui_workspace_system(
                             // Move object between build plates
                             let mut move_to_plate: Option<usize> = None;
                             let mut move_to_new_plate = false;
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Assigned Plate:");
                                 let cur_p_name = plate
                                     .plates
@@ -2581,7 +2705,7 @@ pub fn ui_workspace_system(
                                     .unwrap_or_else(|| format!("Plate {}", obj_plate_idx + 1));
                                 egui::ComboBox::from_id_source("selected_object_plate_combo")
                                     .selected_text(cur_p_name)
-                                    .width(140.0)
+                                    .width(120.0)
                                     .show_ui(ui, |ui| {
                                         for (p_idx, p_info) in plate.plates.iter().enumerate() {
                                             let is_cur = p_idx == obj_plate_idx;
@@ -2633,7 +2757,7 @@ pub fn ui_workspace_system(
                                 plate.clone_copies_count = 1;
                             }
                             let mut pending_clone_copies: Option<usize> = None;
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Clone Object:");
                                 if render_icon_button(ui, UiIcon::CloneObject, "+1 Clone", false, true)
                                     .on_hover_text(
@@ -2786,7 +2910,7 @@ pub fn ui_workspace_system(
                                 });
 
                                 let lock_axes = plate.objects[obj_idx].lock_scale_axes;
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Scale (%):");
                                     ui.label("X");
                                     if ui
@@ -2856,7 +2980,7 @@ pub fn ui_workspace_system(
                                     }
                                 });
 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Size (mm):");
                                     ui.label("X");
                                     if ui
@@ -2953,7 +3077,7 @@ pub fn ui_workspace_system(
                                         );
                                     }
                                 }
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Bed X (mm):");
                                     if ui
                                         .add(egui::DragValue::new(&mut bed_x).speed(0.5))
@@ -2986,7 +3110,7 @@ pub fn ui_workspace_system(
                                     }
                                 });
 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Quick Rotate:");
                                     if render_icon_button(
                                         ui,
@@ -3205,7 +3329,7 @@ pub fn ui_workspace_system(
                                             }
                                             let is_sel = plate.selected_surface_hint_patch
                                                 == Some(sh.patch_id);
-                                            let row_resp = ui.horizontal(|ui| {
+                                            let row_resp = ui.horizontal_wrapped(|ui| {
                                                 let kind_str = if obj_has_brep {
                                                     "STEP Face"
                                                 } else {
@@ -3417,7 +3541,7 @@ pub fn ui_workspace_system(
                                             }
                                             let is_sel = plate.selected_point_hint_id == Some(ph.id);
                                             let group_resp = ui.group(|ui| {
-                                                ui.horizontal(|ui| {
+                                                ui.horizontal_wrapped(|ui| {
                                                     if ui
                                                         .selectable_label(
                                                             is_sel,
@@ -3463,7 +3587,7 @@ pub fn ui_workspace_system(
                                                     }
                                                 });
 
-                                                ui.horizontal(|ui| {
+                                                ui.horizontal_wrapped(|ui| {
                                                     ui.small("Local Pos:");
                                                     ui.add(
                                                         egui::DragValue::new(
@@ -3496,7 +3620,7 @@ pub fn ui_workspace_system(
                                                 let mut azim_deg =
                                                     dir.y.atan2(dir.x).to_degrees();
                                                 let mut dir_changed = false;
-                                                ui.horizontal(|ui| {
+                                                ui.horizontal_wrapped(|ui| {
                                                     ui.small("Normal Dir:");
                                                     dir_changed |= ui
                                                         .add(
@@ -3660,26 +3784,37 @@ pub fn ui_workspace_system(
                             );
                         }
                     }
-                }
+                    }
+                });
+                outer_ui.allocate_rect(panel_rect, egui::Sense::hover());
             });
-        });
+    }
 
     // ========================================================================
     // 3. Right Panel: View & Inspection (Never Marks Presets Dirty)
     // ========================================================================
+    let right_default_w = (screen_width * 0.20).clamp(230.0, 280.0);
+    let right_max_w = (screen_width * 0.42).max(320.0);
     if preset_lib.show_view_panel {
-        egui::SidePanel::right("view_and_inspection_panel")
-            .default_width(340.0)
-            .min_width(285.0)
-            .max_width(400.0)
+        egui::SidePanel::right("slicer_right_panel")
+            .default_width(right_default_w)
+            .width_range(200.0..=right_max_w)
             .resizable(true)
-            .show(ctx, |ui| {
+            .show(ctx, |outer_ui| {
+                let panel_rect = outer_ui.max_rect();
+                let mut child_ui = outer_ui.child_ui(panel_rect, *outer_ui.layout(), None);
+                child_ui.set_clip_rect(panel_rect);
+                let ui = &mut child_ui;
+                let panel_w = panel_rect.width();
+                ui.spacing_mut().slider_width = (panel_w * 0.34).clamp(62.0, 135.0);
+                ui.spacing_mut().combo_width = (panel_w * 0.42).clamp(85.0, 175.0);
+
                 ui.horizontal(|ui| {
                     ui.heading("View & Inspection");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .small_button("✕")
-                            .on_hover_text("Hide View & Inspection panel")
+                            .small_button("▶")
+                            .on_hover_text("Collapse right View & Inspection panel")
                             .clicked()
                         {
                             preset_lib.show_view_panel = false;
@@ -3694,18 +3829,61 @@ pub fn ui_workspace_system(
                 );
                 ui.separator();
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.set_max_width(ui.available_width());
-                    render_view_and_inspection_panel(
-                        ui,
-                        &mut config,
-                        &mut vis_state,
-                        &mut plate,
-                        selected_obj_info.as_ref(),
-                        is_computing,
-                        has_eikonal,
-                    );
-                });
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.available_width());
+                        render_view_and_inspection_panel(
+                            ui,
+                            &mut config,
+                            &mut vis_state,
+                            &mut plate,
+                            selected_obj_info.as_ref(),
+                            is_computing,
+                            has_eikonal,
+                        );
+                    });
+                outer_ui.allocate_rect(panel_rect, egui::Sense::hover());
+            });
+    }
+
+    // Floating viewport-edge expand tabs when Left or Right side panels are collapsed
+    let top_bar_bottom_y = top_bar_resp.response.rect.max.y + 8.0;
+    if !preset_lib.show_left_panel {
+        egui::Area::new(egui::Id::new("collapsed_left_panel_expand_tab"))
+            .fixed_pos(egui::pos2(8.0, top_bar_bottom_y))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+                    .show(ui, |ui| {
+                        let lbl = format!("▶ Setup ({}) / Config", plate.objects.len());
+                        if ui
+                            .button(egui::RichText::new(lbl).strong())
+                            .on_hover_text("Expand left Project Setup & Configuration side panel")
+                            .clicked()
+                        {
+                            preset_lib.show_left_panel = true;
+                        }
+                    });
+            });
+    }
+    if !preset_lib.show_view_panel {
+        egui::Area::new(egui::Id::new("collapsed_right_panel_expand_tab"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, top_bar_bottom_y))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+                    .show(ui, |ui| {
+                        if ui
+                            .button(egui::RichText::new("◀ View & Inspect").strong())
+                            .on_hover_text("Expand right View & Inspection side panel")
+                            .clicked()
+                        {
+                            preset_lib.show_view_panel = true;
+                        }
+                    });
             });
     }
 
@@ -3720,7 +3898,7 @@ pub fn ui_workspace_system(
     {
         egui::Window::new("Viewport Color Legend")
             .id(egui::Id::new("viewport_parameter_color_legend_hud"))
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-14.0, 14.0))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-14.0, 44.0))
             .resizable(false)
             .collapsible(true)
             .default_width(310.0)
@@ -3905,7 +4083,7 @@ fn render_printer_config_tab(
         .id_source("printer_bed_geometry_section")
         .default_open(true)
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 dirty_gcode |= ui
                     .selectable_value(
                         &mut config.bed.shape,
@@ -3923,7 +4101,7 @@ fn render_printer_config_tab(
                 param_help_button(ui, "bed.geometry");
             });
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Quick Sizes:");
                 if ui.small_button("256³ (Bambu/Voron)").clicked() {
                     config.bed.width_x = 256.0;
@@ -4001,7 +4179,7 @@ fn render_printer_config_tab(
         ));
 
         ui.separator();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Kinematics:");
             for mode in FiveAxisKinematicsMode::ALL {
                 dirty_gcode |= ui
@@ -4017,7 +4195,7 @@ fn render_printer_config_tab(
         });
 
         if config.machine.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("B Tilt Range (°):");
                 dirty_gcode |= ui
                     .add(
@@ -4039,7 +4217,7 @@ fn render_printer_config_tab(
                     .changed();
                 param_help_button(ui, "machine.five_axis_bc_limits");
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 dirty_gcode |= ui
                     .checkbox(
                         &mut config.machine.c_continuous,
@@ -4729,16 +4907,17 @@ fn render_tool_config_tab(
             });
 
             // Per-tool Filament Preset & Material Type assignment
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Tool Filament Preset:");
                 let cur_preset_lbl = if tool.filament_preset_name.trim().is_empty() {
                     format!("Custom ({})", tool.filament_type)
                 } else {
                     tool.filament_preset_name.clone()
                 };
+                let combo_w = (ui.available_width() - 12.0).clamp(110.0, 205.0);
                 egui::ComboBox::from_id_source(("tool_filament_preset_combo", tool.id))
                     .selected_text(cur_preset_lbl)
-                    .width(205.0)
+                    .width(combo_w)
                     .show_ui(ui, |ui| {
                         for (p_name, builtin) in &filament_preset_list {
                             let tag = if *builtin { "[Factory]" } else { "[User]" };
@@ -4953,7 +5132,7 @@ fn render_tool_config_tab(
     .default_open(true)
     .show(ui, |ui| {
         let gc = &mut config.gcode;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             dirty_gcode |= ui
                 .add(
                     egui::DragValue::new(&mut gc.retract_length_mm)
@@ -4975,7 +5154,7 @@ fn render_tool_config_tab(
                 .changed();
             param_help_button(ui, "gcode.retract_speed_mms");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             dirty_gcode |= ui
                 .add(
                     egui::DragValue::new(&mut gc.min_travel_for_retract_mm)
@@ -4997,7 +5176,7 @@ fn render_tool_config_tab(
                 .changed();
             param_help_button(ui, "gcode.z_hop_mm");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             dirty_gcode |= ui
                 .add(
                     egui::DragValue::new(&mut gc.wipe_length_mm)
@@ -5019,7 +5198,7 @@ fn render_tool_config_tab(
                 .changed();
             param_help_button(ui, "gcode.pre_retract_taper_mm");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             dirty_gcode |= ui
                 .add(
                     egui::DragValue::new(&mut gc.tool_change_time_s)
@@ -5034,7 +5213,7 @@ fn render_tool_config_tab(
                 .changed();
             param_help_button(ui, "gcode.tool_change_time_s");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             dirty_gcode |= ui
                 .checkbox(&mut gc.tool_change_hop_before, "Hop Before Toolchange")
                 .on_hover_text(
@@ -5712,7 +5891,7 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                     .changed();
                 param_help_button(ui, "gcode.tool_change_time_s");
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 *dirty_gcode |= ui
                     .checkbox(
                         &mut config.gcode.tool_change_hop_before,
@@ -5837,7 +6016,7 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                 }
 
                 let is_virtual = slot.is_virtual_mix();
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(
                         egui::RichText::new(format!("#{}", s_idx + 1))
                             .strong()
@@ -5875,7 +6054,7 @@ fn render_3mf_filament_slot_mapping_section_config_only(
 
                     ui.add(
                         egui::TextEdit::singleline(&mut slot.name)
-                            .desired_width(88.0)
+                            .desired_width(72.0)
                             .hint_text("Slot Name"),
                     )
                     .on_hover_text(format!(
@@ -5890,7 +6069,7 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                         } else {
                             slot.filament_type.as_str()
                         })
-                        .width(58.0)
+                        .width(54.0)
                         .show_ui(ui, |ui| {
                             for mat in ["PLA", "PETG", "ABS", "ASA", "TPU", "PVA", "PA-CF"] {
                                 let is_cur = slot.filament_type.eq_ignore_ascii_case(mat);
@@ -5925,7 +6104,7 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                             .unwrap_or_else(|| format!("T{}", slot.tool_index));
                         egui::ComboBox::from_id_source((id_salt, "slot_tool_map", s_idx))
                             .selected_text(current_tool_text)
-                            .width(120.0)
+                            .width(96.0)
                             .show_ui(ui, |ui| {
                                 for (t_idx, t_lbl) in &tool_labels {
                                     if ui
@@ -6274,7 +6453,7 @@ fn render_filament_config_tab(
             param_help_button(ui, "gcode.filament_type");
         });
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             gc_changed |= ui
                 .add(
                     egui::DragValue::new(&mut config.gcode.filament_diameter_mm)
@@ -6531,7 +6710,7 @@ fn render_filament_config_tab(
                 .changed();
             param_help_button(ui, "gcode.pa_low_high_s");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("PA Ref Flows (mm³/s):");
             gc_changed |= ui
                 .add(
@@ -6620,7 +6799,7 @@ fn render_filament_config_tab(
                 param_help_button(ui, "gcode.corner_flow_comp");
             });
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             gc_changed |= ui
                 .checkbox(
                     &mut gc.enable_transient_pressure_comp,
@@ -6640,7 +6819,7 @@ fn render_filament_config_tab(
             param_help_button(ui, "gcode.transient_pressure_comp");
         });
         if gc.enable_transient_pressure_comp {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 gc_changed |= ui
                     .add(
                         egui::DragValue::new(&mut gc.transient_pressure_exponent)
@@ -6670,7 +6849,7 @@ fn render_filament_config_tab(
                 param_help_button(ui, "gcode.transient_pressure_comp");
             });
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             gc_changed |= ui
                 .add(
                     egui::DragValue::new(&mut gc.ooze_relaxation_extra_prime_mm)
@@ -6737,7 +6916,7 @@ fn render_process_config_tab(
                 .changed();
             param_help_button(ui, "slicing.layer_height.target_mm");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             lh_changed |= ui
                 .add(
                     egui::DragValue::new(&mut config.slicing.layer_height.min_mm)
@@ -6759,7 +6938,7 @@ fn render_process_config_tab(
                 .changed();
             param_help_button(ui, "slicing.layer_height.max_mm");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             lh_changed |= ui
                 .add(
                     egui::DragValue::new(&mut config.slicing.layer_height.first_layer_mm)
@@ -6902,7 +7081,7 @@ fn render_process_config_tab(
             );
         }
         ui.add_space(2.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .checkbox(
                     &mut config.eikonal.auto_voxel_size,
@@ -6941,7 +7120,7 @@ fn render_process_config_tab(
 
         let non_planar_active =
             config.eikonal.order_field_mode == OrderFieldMode::ConstrainedNonPlanar;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add(
                     egui::Slider::new(&mut config.eikonal.voxel_size_mm, 0.08..=2.0)
@@ -6964,7 +7143,7 @@ fn render_process_config_tab(
             });
         });
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             eik_changed |= ui
                 .add(
                     egui::DragValue::new(&mut config.eikonal.narrow_band_width_voxels)
@@ -6988,7 +7167,7 @@ fn render_process_config_tab(
 
         ui.separator();
         ui.add_enabled_ui(non_planar_active, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 eik_changed |= ui
                     .checkbox(
                         &mut config.eikonal.enable_overhang_orientation_bias,
@@ -6998,7 +7177,7 @@ fn render_process_config_tab(
                 param_help_button(ui, "eikonal.enable_overhang_orientation_bias");
             });
             if config.eikonal.enable_overhang_orientation_bias {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     eik_changed |= ui
                         .add(
                             egui::Slider::new(&mut config.eikonal.overhang_bias_weight, 0.0..=1.0)
@@ -7017,7 +7196,7 @@ fn render_process_config_tab(
                         .changed();
                     param_help_button(ui, "eikonal.overhang_bias_transition_deg");
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.small("Orthogonal Band:");
                     eik_changed |= ui
                         .add(
@@ -7047,7 +7226,7 @@ fn render_process_config_tab(
 
         ui.separator();
         ui.small("Default Soft Hint Placement Parameters:");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::DragValue::new(&mut config.eikonal.default_surface_hint_depth_mm)
                     .speed(0.5)
@@ -7102,7 +7281,7 @@ fn render_process_config_tab(
             param_help_button(ui, "slicing.shell_thickness_mm");
         });
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             tp_cfg_changed |= ui
                 .add(
                     egui::DragValue::new(&mut config.slicing.inner_wall_count)
@@ -7219,7 +7398,7 @@ fn render_process_config_tab(
             ("Solid Infill:", &mut config.slicing.solid_infill_width),
             ("Sparse Infill:", &mut config.slicing.sparse_infill_width),
         ] {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(label);
                 tp_cfg_changed |= ui
                     .add(
@@ -7384,7 +7563,7 @@ fn render_process_config_tab(
         });
 
         ui.separator();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             tp_cfg_changed |= ui
                 .checkbox(
                     &mut config.slicing.enable_support_generation,
@@ -7402,7 +7581,7 @@ fn render_process_config_tab(
             support_field_cfg_changed |= seed_changed;
             param_help_button(ui, "slicing.seed_order_field_from_supports");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let only_unreach_changed = ui
                 .checkbox(
                     &mut config.slicing.support_only_unreachable_and_bridges,
@@ -7428,7 +7607,7 @@ fn render_process_config_tab(
         });
 
         if config.slicing.enable_support_generation {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("Support Tool:").strong());
                 let selected_support_label = match config.slicing.support_tool_index {
                     None => {
@@ -7444,9 +7623,10 @@ fn render_process_config_tab(
                         .map(|t| format!("{} ({:.2}mm, {:.0}°C)", t.name, t.nozzle_diameter_mm, t.temperature_celsius))
                         .unwrap_or_else(|| format!("Tool #{idx}")),
                 };
+                let combo_w = (ui.available_width() - 55.0).clamp(105.0, 210.0);
                 egui::ComboBox::from_id_source("support_tool_selector_combo")
                     .selected_text(selected_support_label)
-                    .width(210.0)
+                    .width(combo_w)
                     .show_ui(ui, |ui| {
                         if ui
                             .selectable_value(
@@ -7497,7 +7677,7 @@ fn render_process_config_tab(
 
             if let Some(sup_idx) = config.slicing.support_tool_index {
                 if let Some(sup_tool) = config.tools.get_mut(sup_idx) {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.small(egui::RichText::new(format!("T{} Support Material:", sup_tool.id)).strong());
                         if ui
                             .add(
@@ -7550,7 +7730,7 @@ fn render_process_config_tab(
                 param_help_button(ui, "slicing.support_style");
             });
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 tp_cfg_changed |= ui
                     .checkbox(
                         &mut config.slicing.support_on_bed_only,
@@ -7564,7 +7744,7 @@ fn render_process_config_tab(
             });
 
             if config.slicing.support_style == SupportStyle::NonPlanarTree {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     tp_cfg_changed |= ui
                         .add(
                             egui::DragValue::new(&mut config.slicing.tree_branch_angle_deg)
@@ -7590,7 +7770,7 @@ fn render_process_config_tab(
                         .changed();
                     param_help_button(ui, "slicing.tree_support_params");
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     tp_cfg_changed |= ui
                         .add(
                             egui::DragValue::new(&mut config.slicing.tree_tip_diameter_mm)
@@ -7612,7 +7792,7 @@ fn render_process_config_tab(
                 });
             }
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 tp_cfg_changed |= ui
                     .add(
                         egui::DragValue::new(&mut config.slicing.support_z_gap_mm)
@@ -7633,7 +7813,7 @@ fn render_process_config_tab(
                     .changed();
                 param_help_button(ui, "slicing.support_gaps_mm");
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 tp_cfg_changed |= ui
                     .add(
                         egui::DragValue::new(&mut config.slicing.support_interface_layers)
@@ -7658,7 +7838,7 @@ fn render_process_config_tab(
                     .changed();
                 param_help_button(ui, "slicing.support_interface_layers");
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 tp_cfg_changed |= ui
                     .add(
                         egui::DragValue::new(&mut config.slicing.support_base_spacing_mm)
@@ -7799,11 +7979,12 @@ fn render_process_config_tab(
             );
         }
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Illumination:");
+            let combo_w = (ui.available_width() - 28.0).clamp(105.0, 215.0);
             egui::ComboBox::from_id_source("color_mixing_lighting_mode_combo")
                 .selected_text(config.slicing.color_mixing.lighting_mode.label())
-                .width(215.0)
+                .width(combo_w)
                 .show_ui(ui, |ui| {
                     for mode in [
                         crate::color_optics::OpticalLightingMode::FrontLitReflectance,
@@ -7822,7 +8003,7 @@ fn render_process_config_tab(
             param_help_button(ui, "slicing.color_mixing.lighting_mode");
         });
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             mix_changed |= ui
                 .checkbox(
                     &mut config.slicing.color_mixing.use_adjacent_layers,
@@ -7864,7 +8045,7 @@ fn render_process_config_tab(
             param_help_button(ui, "slicing.color_mixing.optical_shell_layers");
         });
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             mix_changed |= ui
                 .checkbox(
                     &mut config.slicing.color_mixing.use_short_extrusions,
@@ -7894,7 +8075,7 @@ fn render_process_config_tab(
         });
 
         if config.slicing.color_mixing.lighting_mode.uses_opaque_core_backing() {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Core Backing:");
                 let backing_lbl = match config.slicing.color_mixing.backing_tool_index {
                     None => "Auto (Brightest Neutral / White)".to_string(),
@@ -7904,9 +8085,10 @@ fn render_process_config_tab(
                         .map(|t| format!("T{} — {} ({})", t.id, t.name, t.filament_color_hex))
                         .unwrap_or_else(|| format!("Tool #{idx}")),
                 };
+                let combo_w = (ui.available_width() - 8.0).clamp(105.0, 215.0);
                 egui::ComboBox::from_id_source("color_mixing_backing_tool_combo")
                     .selected_text(backing_lbl)
-                    .width(215.0)
+                    .width(combo_w)
                     .show_ui(ui, |ui| {
                         mix_changed |= ui
                             .selectable_value(
@@ -7930,7 +8112,7 @@ fn render_process_config_tab(
             });
         }
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             mix_changed |= ui
                 .add(
                     egui::Slider::new(&mut config.slicing.color_mixing.dither_strength, 0.0..=1.0)
@@ -8091,7 +8273,7 @@ fn render_process_config_tab(
 
         ui.separator();
         ui.small(egui::RichText::new("Feature Print Speeds (mm/s):").strong());
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Outer / Inner Wall:");
             gc_changed |= ui
                 .add(
@@ -8111,7 +8293,7 @@ fn render_process_config_tab(
                 .changed();
             param_help_button(ui, "gcode.wall_speeds_mms");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Solid / Sparse Infill:");
             gc_changed |= ui
                 .add(
@@ -8131,7 +8313,7 @@ fn render_process_config_tab(
                 .changed();
             param_help_button(ui, "gcode.infill_speeds_mms");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Bridge / Wave:");
             gc_changed |= ui
                 .add(
@@ -8152,7 +8334,7 @@ fn render_process_config_tab(
                 .changed();
             param_help_button(ui, "gcode.wave_overhang_speed_mms");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("1st Layer / Gap Fill:");
             gc_changed |= ui
                 .add(
@@ -8172,7 +8354,7 @@ fn render_process_config_tab(
                 .changed();
             param_help_button(ui, "gcode.gap_fill_speed_mms");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Support Base / Intf:");
             gc_changed |= ui
                 .add(
@@ -8561,7 +8743,7 @@ fn render_view_and_inspection_panel(
         }
 
         if vis_state.show_slice_plane {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Plane:");
                 for axis in [SliceAxis::X, SliceAxis::Y, SliceAxis::Z] {
                     if ui
@@ -10417,9 +10599,14 @@ fn render_object_filament_mode_combo(
         format!("obj_filament_mode_full_{object_id}")
     };
 
+    let combo_w = if compact {
+        92.0
+    } else {
+        (ui.available_width() - 95.0).clamp(115.0, 240.0)
+    };
     egui::ComboBox::from_id_source(combo_id)
         .selected_text(selected_text)
-        .width(if compact { 112.0 } else { 255.0 })
+        .width(combo_w)
         .show_ui(ui, |ui| {
             let def_mode = ObjectFilamentMode::ProjectDefault;
             if ui
