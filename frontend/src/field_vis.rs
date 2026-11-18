@@ -463,6 +463,7 @@ pub struct FieldVisualizationState {
     pub dirty_color_mixing: bool,
     pub dirty_planned_gcode: bool,
     pub dirty_toolpaths_mesh: bool,
+    pub dirty_triangle_slot_remap: bool,
 
     // --- 2D Cross-Section Slice Controls & Persistent Handles ---
     pub show_slice_plane: bool,
@@ -489,8 +490,109 @@ pub struct FieldVisualizationState {
             Vec<(u64, ObjectToolpathsResult)>,
         )>,
     )>,
+    /// Shared live progress tracker for background post-slicing (colour mixing, G-code planning, mesh building).
+    pub post_slice_progress: std::sync::Arc<PostSliceProgress>,
+    /// Background task executing colour mixing, G-code planning, and/or 3D toolpath mesh buffer construction.
+    pub pending_post_slice_task: Option<bevy::tasks::Task<PostSliceTaskOutput>>,
+    /// True when the active `pending_post_slice_task` should display its progress bar immediately.
+    pub post_slice_show_progress: bool,
     /// True while the user is actively holding down the pointer on a UI slider/drag widget.
     pub ui_pointer_down: bool,
+}
+
+/// Thread-safe progress tracker for background Rust post-slicing tasks (colour mixing, G-code planning, mesh build).
+#[derive(Debug)]
+pub struct PostSliceProgress {
+    fraction_bits: std::sync::atomic::AtomicU32,
+    stage: std::sync::Mutex<String>,
+}
+
+impl Default for PostSliceProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PostSliceProgress {
+    pub fn new() -> Self {
+        Self {
+            fraction_bits: std::sync::atomic::AtomicU32::new(0.0f32.to_bits()),
+            stage: std::sync::Mutex::new("Preparing toolpaths...".to_string()),
+        }
+    }
+
+    pub fn set(&self, fraction: f32, stage_msg: impl Into<String>) {
+        self.fraction_bits.store(
+            fraction.clamp(0.0, 1.0).to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if let Ok(mut guard) = self.stage.lock() {
+            *guard = stage_msg.into();
+        }
+    }
+
+    pub fn get(&self) -> (f32, String) {
+        let frac = f32::from_bits(
+            self.fraction_bits
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .clamp(0.0, 1.0);
+        let stg = self
+            .stage
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "Processing toolpaths...".to_string());
+        (frac, stg)
+    }
+}
+
+/// Pre-built 3D toolpath vertex/index buffers produced on a background `IoTaskPool` thread.
+pub enum BuiltToolpathGeometry {
+    Fast {
+        positions: Vec<[f32; 3]>,
+        normals: Vec<[f32; 3]>,
+        colors: Vec<[f32; 4]>,
+        indices: Vec<u32>,
+    },
+    HighQualityPbr(Vec<HqBucketMesh>),
+}
+
+/// Result returned by a background `pending_post_slice_task`.
+pub struct PostSliceTaskOutput {
+    pub selected_obj_id: Option<u64>,
+    pub remapped_triangle_slots: Vec<(u64, Vec<u8>)>,
+    pub updated_mixed_toolpaths: Option<(
+        std::collections::HashMap<u64, ObjectToolpathsResult>,
+        Option<ObjectToolpathsResult>,
+    )>,
+    pub updated_planned_gcode: Option<Option<crate::gcode::PlannedGcodeResult>>,
+    pub built_mesh: Option<(BuiltToolpathGeometry, Transform)>,
+}
+
+/// Lightweight `Copy` snapshot of toolpath visibility and layer-scrub filters for background mesh building.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolpathMeshFilter {
+    pub show_outer_walls: bool,
+    pub show_inner_walls: bool,
+    pub show_bridges: bool,
+    pub show_wave_overhangs: bool,
+    pub show_solid_infill: bool,
+    pub show_sparse_infill: bool,
+    pub show_gap_fill: bool,
+    pub show_supports: bool,
+    pub show_support_interface: bool,
+    pub show_purge_tower: bool,
+    pub show_scarf_seams: bool,
+    pub show_wipes: bool,
+    pub show_travel_moves: bool,
+    pub show_z_hops: bool,
+    pub selected_layer_stride: usize,
+    pub selected_layer_min_idx: usize,
+    pub selected_layer_max_idx: usize,
+    pub highlighted_selected_layer: Option<usize>,
+    pub layer_move_scrub_limit: Option<usize>,
+    pub toolpath_color_mode: ToolpathColorMode,
+    pub toolpath_quality_mode: ToolpathQualityMode,
 }
 
 impl Default for FieldVisualizationState {
@@ -579,6 +681,7 @@ impl Default for FieldVisualizationState {
             dirty_color_mixing: false,
             dirty_planned_gcode: true,
             dirty_toolpaths_mesh: true,
+            dirty_triangle_slot_remap: false,
             show_slice_plane: false,
             slice_axis: SliceAxis::Z,
             slice_normalized_pos: 0.5,
@@ -594,14 +697,73 @@ impl Default for FieldVisualizationState {
             dirty_slice: true,
             pending_field_task: None,
             pending_slicing_task: None,
+            post_slice_progress: std::sync::Arc::new(PostSliceProgress::new()),
+            pending_post_slice_task: None,
+            post_slice_show_progress: false,
             ui_pointer_down: false,
         }
     }
 }
 
 impl FieldVisualizationState {
-    pub fn is_busy(&self) -> bool {
+    /// Returns `true` when a C++ OpenVDB field computation or slicing task is actively running.
+    pub fn is_backend_busy(&self) -> bool {
         self.pending_field_task.is_some() || self.pending_slicing_task.is_some()
+    }
+
+    /// Returns `true` when any background field, slicing, or post-slice G-code/mesh task is running.
+    pub fn is_busy(&self) -> bool {
+        self.pending_field_task.is_some()
+            || self.pending_slicing_task.is_some()
+            || self.pending_post_slice_task.is_some()
+    }
+
+    /// Returns the active background task progress `(fraction_0_to_1, stage_description)` if a
+    /// field computation, non-planar slicing, or post-slice colour/G-code/mesh task is running.
+    pub fn active_progress(&self) -> Option<(f32, String)> {
+        if self.pending_field_task.is_some() || self.pending_slicing_task.is_some() {
+            let prog = ffi::get_field_compute_progress();
+            let stage = if prog.stage.trim().is_empty() {
+                if self.pending_field_task.is_some() {
+                    "Computing OpenVDB scalar fields...".to_string()
+                } else {
+                    "Generating non-planar shell toolpaths...".to_string()
+                }
+            } else {
+                prog.stage
+            };
+            return Some((prog.fraction.clamp(0.0, 1.0), stage));
+        }
+        if self.pending_post_slice_task.is_some() && self.post_slice_show_progress {
+            return Some(self.post_slice_progress.get());
+        }
+        None
+    }
+
+    pub fn toolpath_mesh_filter(&self) -> ToolpathMeshFilter {
+        ToolpathMeshFilter {
+            show_outer_walls: self.show_outer_walls,
+            show_inner_walls: self.show_inner_walls,
+            show_bridges: self.show_bridges,
+            show_wave_overhangs: self.show_wave_overhangs,
+            show_solid_infill: self.show_solid_infill,
+            show_sparse_infill: self.show_sparse_infill,
+            show_gap_fill: self.show_gap_fill,
+            show_supports: self.show_supports,
+            show_support_interface: self.show_support_interface,
+            show_purge_tower: self.show_purge_tower,
+            show_scarf_seams: self.show_scarf_seams,
+            show_wipes: self.show_wipes,
+            show_travel_moves: self.show_travel_moves,
+            show_z_hops: self.show_z_hops,
+            selected_layer_stride: self.selected_layer_stride.max(1),
+            selected_layer_min_idx: self.selected_layer_min_idx,
+            selected_layer_max_idx: self.selected_layer_max_idx,
+            highlighted_selected_layer: self.highlighted_selected_layer,
+            layer_move_scrub_limit: self.layer_move_scrub_limit,
+            toolpath_color_mode: self.toolpath_color_mode,
+            toolpath_quality_mode: self.toolpath_quality_mode,
+        }
     }
 
     pub fn mark_all_dirty(&mut self) {
@@ -622,6 +784,7 @@ impl FieldVisualizationState {
         self.dirty_color_mixing = false;
         self.dirty_planned_gcode = true;
         self.dirty_toolpaths_mesh = true;
+        self.dirty_triangle_slot_remap = false;
         self.dirty_slice = true;
         self.dirty_surface_colors = true;
     }
@@ -1064,7 +1227,7 @@ pub fn build_mixed_toolpaths_for_object_with_mode(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn sync_field_visualization_system(
     mut commands: Commands,
-    plate: Res<BuildPlateState>,
+    mut plate: ResMut<BuildPlateState>,
     config: Res<SlicerConfig>,
     mut vis_state: ResMut<FieldVisualizationState>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -1124,6 +1287,57 @@ pub fn sync_field_visualization_system(
 ) {
     let selected_id = plate.selected_object_id;
 
+    // 0. Poll pending background post-slicing (colour mixing / G-code planning / 3D mesh build) task
+    if let Some(ref mut task) = vis_state.pending_post_slice_task {
+        if let Some(output) =
+            bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(task))
+        {
+            vis_state.pending_post_slice_task = None;
+            vis_state.post_slice_show_progress = false;
+
+            if !output.remapped_triangle_slots.is_empty() {
+                for (oid, slots) in output.remapped_triangle_slots {
+                    if let Some(obj) = plate.objects.iter_mut().find(|o| o.object_id == oid) {
+                        obj.triangle_filament_slots = slots;
+                    }
+                }
+                vis_state.dirty_surface_colors = true;
+            }
+            if let Some((mixed_map, sel_mixed)) = output.updated_mixed_toolpaths {
+                vis_state.plate_mixed_toolpaths = mixed_map;
+                if output.selected_obj_id == selected_id {
+                    vis_state.cached_toolpaths = sel_mixed;
+                }
+            }
+            if let Some(planned_opt) = output.updated_planned_gcode {
+                if let Some(ref combined) = planned_opt {
+                    if !combined.layers.is_empty() {
+                        vis_state.selected_layer_max_idx =
+                            vis_state.selected_layer_max_idx.min(combined.layers.len() - 1);
+                    }
+                    vis_state.planned_gcode_is_world_space = true;
+                } else {
+                    vis_state.planned_gcode_is_world_space = false;
+                }
+                vis_state.cached_planned_gcode = planned_opt;
+            }
+            if let Some((built_geom, render_tf)) = output.built_mesh {
+                if vis_state.show_toolpaths {
+                    apply_built_toolpath_geometry_to_scene(
+                        &mut commands,
+                        &mut vis_state,
+                        &config,
+                        &mut meshes,
+                        &mut materials,
+                        &mut toolpaths_query,
+                        built_geom,
+                        render_tf,
+                    );
+                }
+            }
+        }
+    }
+
     // 1. Detect object selection change
     if vis_state.last_object_id != selected_id {
         if let Some(prev_id) = vis_state.last_object_id {
@@ -1157,7 +1371,7 @@ pub fn sync_field_visualization_system(
         vis_state.last_solved_field_rotation = None;
 
         if let Some(id) = selected_id {
-            if !vis_state.is_busy() {
+            if !vis_state.is_backend_busy() {
                 vis_state.available_fields = ffi::list_object_fields(id);
                 if !vis_state.available_fields.is_empty()
                     && !vis_state
@@ -1217,62 +1431,86 @@ pub fn sync_field_visualization_system(
         .copied()
         .unwrap_or(Transform::IDENTITY);
 
-    if vis_state.cached_stats.is_none() && !vis_state.is_busy() {
+    if vis_state.cached_stats.is_none() && !vis_state.is_backend_busy() {
         vis_state.refresh_stats_for(obj_id);
     }
 
     // 1b. Update CAD object surface vertex colors (Default CAD / Overhang / Tool Angle from Normal)
+    //     Deferred while `ui_pointer_down` is true so dragging colour pickers or ratio sliders never stalls the UI.
     let tf_changed = vis_state.last_surface_color_transform != Some(obj_world_tf);
-    let grav_changed = vis_state.last_surface_color_gravity_bed != config.machine.gravity_direction_bed;
+    let grav_changed =
+        vis_state.last_surface_color_gravity_bed != config.machine.gravity_direction_bed;
     let nozzle_changed = vis_state.last_surface_color_nozzle_bed != config.machine.nozzle_axis_bed;
-    if vis_state.dirty_surface_colors
-        || (vis_state.surface_color_mode != ObjectSurfaceColorMode::DefaultCad
-            && (tf_changed || grav_changed || nozzle_changed))
+    if !vis_state.ui_pointer_down
+        && (vis_state.dirty_surface_colors
+            || (vis_state.surface_color_mode != ObjectSurfaceColorMode::DefaultCad
+                && (tf_changed || grav_changed || nozzle_changed)))
     {
         vis_state.dirty_surface_colors = false;
         vis_state.last_surface_color_transform = Some(obj_world_tf);
         vis_state.last_surface_color_gravity_bed = config.machine.gravity_direction_bed;
         vis_state.last_surface_color_nozzle_bed = config.machine.nozzle_axis_bed;
 
-        let solved_axes = if vis_state.surface_color_mode == ObjectSurfaceColorMode::ToolAngleFromNormal
-            && !vis_state.is_busy()
-            && vis_state.available_fields.iter().any(|f| f == "tool_tilt_deg" || f == "eikonal")
-            && vis_state
-                .last_solved_field_rotation
-                .map_or(true, |r| r.angle_between(obj_world_tf.rotation) < 1.0e-3)
-        {
-            ffi::get_object_vertex_tool_axes(obj_id)
-        } else if vis_state.surface_color_mode == ObjectSurfaceColorMode::SupportNeeded
-            && !vis_state.is_busy()
-            && vis_state.available_fields.iter().any(|f| f == "support_needed" || f == "eikonal")
-        {
-            ffi::get_object_vertex_support_needed(obj_id)
+        if vis_state.surface_color_mode == ObjectSurfaceColorMode::DefaultCad {
+            vis_state.surface_color_min_deg = 0.0;
+            vis_state.surface_color_max_deg = 180.0;
+            vis_state.surface_color_mean_deg = 0.0;
+            vis_state.surface_color_uses_solved_tool = false;
+            for obj in &plate.objects {
+                if obj.plate_index == plate.active_plate_index
+                    && (!obj.vertex_filament_slots.is_empty()
+                        || !obj.vertex_colors_rgba.is_empty()
+                        || obj.object_id == obj_id)
+                {
+                    if let Some(mesh) = meshes.get_mut(&obj.mesh_handle) {
+                        mesh.insert_attribute(
+                            Mesh::ATTRIBUTE_COLOR,
+                            default_cad_vertex_colors_for_object(obj, &config),
+                        );
+                    }
+                }
+            }
         } else {
-            Vec::new()
-        };
+            let solved_axes =
+                if vis_state.surface_color_mode == ObjectSurfaceColorMode::ToolAngleFromNormal
+                    && !vis_state.is_backend_busy()
+                    && vis_state
+                        .available_fields
+                        .iter()
+                        .any(|f| f == "tool_tilt_deg" || f == "eikonal")
+                    && vis_state
+                        .last_solved_field_rotation
+                        .map_or(true, |r| r.angle_between(obj_world_tf.rotation) < 1.0e-3)
+                {
+                    ffi::get_object_vertex_tool_axes(obj_id)
+                } else if vis_state.surface_color_mode == ObjectSurfaceColorMode::SupportNeeded
+                    && !vis_state.is_backend_busy()
+                    && vis_state
+                        .available_fields
+                        .iter()
+                        .any(|f| f == "support_needed" || f == "eikonal")
+                {
+                    ffi::get_object_vertex_support_needed(obj_id)
+                } else {
+                    Vec::new()
+                };
 
-        let (mut colors, min_deg, max_deg, mean_deg, uses_solved) =
-            compute_object_surface_vertex_colors(
-                &scene_obj.vertices,
-                &obj_world_tf,
-                &config,
-                vis_state.surface_color_mode,
-                &solved_axes,
-            );
-        if vis_state.surface_color_mode == ObjectSurfaceColorMode::DefaultCad
-            && (!scene_obj.vertex_filament_slots.is_empty()
-                || !scene_obj.vertex_colors_rgba.is_empty()
-                || scene_obj.resolved_cad_tint_srgba(&config).is_some())
-        {
-            colors = default_cad_vertex_colors_for_object(scene_obj, &config);
-        }
-        vis_state.surface_color_min_deg = min_deg;
-        vis_state.surface_color_max_deg = max_deg;
-        vis_state.surface_color_mean_deg = mean_deg;
-        vis_state.surface_color_uses_solved_tool = uses_solved;
+            let (colors, min_deg, max_deg, mean_deg, uses_solved) =
+                compute_object_surface_vertex_colors(
+                    &scene_obj.vertices,
+                    &obj_world_tf,
+                    &config,
+                    vis_state.surface_color_mode,
+                    &solved_axes,
+                );
+            vis_state.surface_color_min_deg = min_deg;
+            vis_state.surface_color_max_deg = max_deg;
+            vis_state.surface_color_mean_deg = mean_deg;
+            vis_state.surface_color_uses_solved_tool = uses_solved;
 
-        if let Some(mesh) = meshes.get_mut(&scene_obj.mesh_handle) {
-            mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+            if let Some(mesh) = meshes.get_mut(&scene_obj.mesh_handle) {
+                mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+            }
         }
     }
 
@@ -1660,51 +1898,6 @@ pub fn sync_field_visualization_system(
         }
     }
 
-    // 2c-ii. Apply per-object filament assignment, Virtual Filament ratio dithering, and Kubelka-Munk optical mixing
-    if (!vis_state.plate_unmixed_toolpaths.is_empty() || vis_state.cached_unmixed_toolpaths.is_some())
-        && (vis_state.dirty_color_mixing || vis_state.cached_toolpaths.is_none())
-        && !vis_state.ui_pointer_down
-    {
-        vis_state.dirty_color_mixing = false;
-        let unmixed_ids: Vec<u64> = vis_state.plate_unmixed_toolpaths.keys().copied().collect();
-        for oid in unmixed_ids {
-            if let Some(raw_tp) = vis_state.plate_unmixed_toolpaths.get(&oid) {
-                let (o_mode, o_custom_col) = plate
-                    .objects
-                    .iter()
-                    .find(|o| o.object_id == oid)
-                    .map(|o| (o.filament_mode, o.custom_color_srgba))
-                    .unwrap_or((ObjectFilamentMode::ProjectDefault, None));
-                let mixed = build_mixed_toolpaths_for_object_with_mode(
-                    oid,
-                    raw_tp,
-                    &config,
-                    o_mode,
-                    o_custom_col,
-                );
-                if oid == obj_id {
-                    vis_state.cached_toolpaths = Some(mixed.clone());
-                }
-                vis_state.plate_mixed_toolpaths.insert(oid, mixed);
-            }
-        }
-        if !vis_state.plate_mixed_toolpaths.contains_key(&obj_id) {
-            if let Some(ref raw_tp) = vis_state.cached_unmixed_toolpaths {
-                let mixed = build_mixed_toolpaths_for_object_with_mode(
-                    obj_id,
-                    raw_tp,
-                    &config,
-                    scene_obj.filament_mode,
-                    scene_obj.custom_color_srgba,
-                );
-                vis_state.cached_toolpaths = Some(mixed.clone());
-                vis_state.plate_mixed_toolpaths.insert(obj_id, mixed);
-            }
-        }
-        vis_state.dirty_planned_gcode = true;
-        vis_state.dirty_toolpaths_mesh = true;
-    }
-
     // Track changes to active plate printable objects & their transforms
     {
         use std::hash::{Hash, Hasher};
@@ -1752,62 +1945,309 @@ pub fn sync_field_visualization_system(
         }
     }
 
-    // 2d. Plan G-code & Render Non-Planar Toolpaths across all printable objects on the active plate
-    if (!vis_state.plate_mixed_toolpaths.is_empty() || vis_state.cached_toolpaths.is_some())
-        && (vis_state.dirty_planned_gcode || vis_state.cached_planned_gcode.is_none())
+    // 2d. Spawn asynchronous background task on `IoTaskPool` for triangle colour remapping,
+    //     Virtual Filament dithering / Kubelka-Munk optical mixing, G-code & purge planning,
+    //     and 3D toolpath mesh construction so the UI thread never blocks or beachballs!
+    let has_unmixed_tp = !vis_state.plate_unmixed_toolpaths.is_empty()
+        || vis_state.cached_unmixed_toolpaths.is_some();
+    let has_mixed_tp =
+        !vis_state.plate_mixed_toolpaths.is_empty() || vis_state.cached_toolpaths.is_some();
+    let can_start_post_slice = vis_state.pending_post_slice_task.is_none()
+        && !vis_state.is_backend_busy()
         && !vis_state.ui_pointer_down
         && !plate.is_dragging_purge_tower
-        && !plate.is_dragging_object
-    {
-        vis_state.dirty_planned_gcode = false;
-        let mut planned_objects: Vec<(String, crate::gcode::PlannedGcodeResult, Transform)> =
-            Vec::new();
-        for o in &plate.objects {
-            if o.plate_index != plate.active_plate_index || !o.printable {
-                continue;
+        && !plate.is_dragging_object;
+
+    if can_start_post_slice {
+        let want_remap = vis_state.dirty_triangle_slot_remap;
+        let want_mix =
+            has_unmixed_tp && (vis_state.dirty_color_mixing || vis_state.cached_toolpaths.is_none());
+        let want_plan = (has_unmixed_tp || has_mixed_tp)
+            && (want_mix
+                || vis_state.dirty_planned_gcode
+                || vis_state.cached_planned_gcode.is_none());
+        let want_heavy_mesh = !want_mix
+            && !want_plan
+            && vis_state.show_toolpaths
+            && vis_state.dirty_toolpaths_mesh
+            && (vis_state.toolpath_quality_mode == ToolpathQualityMode::HighQualityPbr
+                || vis_state.toolpath_color_mode == ToolpathColorMode::ByOpticalComposite);
+
+        if want_remap || want_mix || want_plan || want_heavy_mesh {
+            if want_remap {
+                vis_state.dirty_triangle_slot_remap = false;
             }
-            let o_tf = object_transforms
-                .get(o.entity)
-                .copied()
-                .unwrap_or(Transform::IDENTITY);
-            let tp_opt = vis_state
-                .plate_mixed_toolpaths
-                .get(&o.object_id)
-                .or_else(|| {
-                    if o.object_id == obj_id {
-                        vis_state.cached_toolpaths.as_ref()
+            if want_mix {
+                vis_state.dirty_color_mixing = false;
+            }
+            if want_plan {
+                vis_state.dirty_planned_gcode = false;
+            }
+            let build_mesh_in_task =
+                vis_state.show_toolpaths && (want_mix || want_plan || want_heavy_mesh);
+            if build_mesh_in_task {
+                vis_state.dirty_toolpaths_mesh = false;
+            }
+
+            let progress = vis_state.post_slice_progress.clone();
+            let initial_stage = if want_remap {
+                "Remapping 3MF triangle colours to filament slots..."
+            } else if want_mix {
+                "Applying filament mappings & optical colour mixing..."
+            } else if want_plan {
+                "Planning non-planar G-code & purges..."
+            } else {
+                "Building 3D toolpath preview mesh..."
+            };
+            progress.set(0.02, initial_stage);
+            vis_state.post_slice_show_progress = true;
+
+            let config_clone = (*config).clone();
+            let sel_oid = obj_id;
+            let sel_obj_mode = scene_obj.filament_mode;
+            let sel_obj_custom_col = scene_obj.custom_color_srgba;
+            let sel_world_tf = obj_world_tf;
+            let mut mesh_filter = vis_state.toolpath_mesh_filter();
+
+            let remap_inputs: Vec<(u64, Vec<u32>, usize)> = if want_remap {
+                plate
+                    .objects
+                    .iter()
+                    .filter(|o| !o.triangle_colors_rgba.is_empty() && o.vertex_filament_slots.is_empty())
+                    .map(|o| (o.object_id, o.triangle_colors_rgba.clone(), o.indices.len() / 3))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let unmixed_snapshot = if want_mix {
+                Some((
+                    vis_state.plate_unmixed_toolpaths.clone(),
+                    vis_state.cached_unmixed_toolpaths.clone(),
+                ))
+            } else {
+                None
+            };
+            let existing_mixed_snapshot = if !want_mix && (want_plan || want_heavy_mesh) {
+                Some((
+                    vis_state.plate_mixed_toolpaths.clone(),
+                    vis_state.cached_toolpaths.clone(),
+                ))
+            } else {
+                None
+            };
+            let existing_planned_for_mesh = if want_heavy_mesh {
+                vis_state
+                    .cached_planned_gcode
+                    .as_ref()
+                    .map(clone_planned_without_gcode_text)
+            } else {
+                None
+            };
+            let existing_planned_is_world = vis_state.planned_gcode_is_world_space;
+
+            let obj_modes: std::collections::HashMap<u64, (ObjectFilamentMode, Option<[f32; 4]>)> =
+                plate
+                    .objects
+                    .iter()
+                    .map(|o| (o.object_id, (o.filament_mode, o.custom_color_srgba)))
+                    .collect();
+
+            let printable_specs: Vec<(u64, String, Transform)> = if want_plan {
+                plate
+                    .objects
+                    .iter()
+                    .filter(|o| o.plate_index == plate.active_plate_index && o.printable)
+                    .map(|o| {
+                        let o_tf = object_transforms
+                            .get(o.entity)
+                            .copied()
+                            .unwrap_or(Transform::IDENTITY);
+                        (o.object_id, o.name.clone(), o_tf)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let task = IoTaskPool::get().spawn(async move {
+                // 1. Optional triangle colour -> slot remapping
+                let mut remapped_triangle_slots: Vec<(u64, Vec<u8>)> = Vec::new();
+                if !remap_inputs.is_empty() {
+                    progress.set(0.03, "Remapping 3MF triangle colours to filament slots...");
+                    let slot_colors = config_clone.imported_slot_colors_srgba();
+                    if !slot_colors.is_empty() {
+                        for (oid, tri_cols, num_tris) in remap_inputs {
+                            let remapped = crate::color_optics::map_triangle_colors_to_slot_colors(
+                                &tri_cols,
+                                &slot_colors,
+                            );
+                            if remapped.len() == num_tris {
+                                ffi::set_object_triangle_filament_slots(oid, &remapped);
+                                remapped_triangle_slots.push((oid, remapped));
+                            }
+                        }
+                    }
+                }
+
+                // 2. Optional Virtual Filament ratio dithering & Kubelka-Munk optical colour mixing
+                let mut updated_mixed_toolpaths: Option<(
+                    std::collections::HashMap<u64, ObjectToolpathsResult>,
+                    Option<ObjectToolpathsResult>,
+                )> = None;
+                let (active_mixed_map, active_sel_mixed) =
+                    if let Some((unmixed_map, cached_unmixed)) = unmixed_snapshot {
+                        progress.set(0.06, "Applying filament mappings & optical colour mixing...");
+                        let mut mixed_map: std::collections::HashMap<u64, ObjectToolpathsResult> =
+                            std::collections::HashMap::with_capacity(unmixed_map.len().max(1));
+                        let mut sel_mixed: Option<ObjectToolpathsResult> = None;
+                        let total_objs = unmixed_map.len().max(1);
+                        for (idx, (&oid, raw_tp)) in unmixed_map.iter().enumerate() {
+                            progress.set(
+                                0.06 + 0.12 * ((idx as f32) / (total_objs as f32)),
+                                format!(
+                                    "Applying filament & colour mixing ({}/{total_objs})...",
+                                    idx + 1
+                                ),
+                            );
+                            let (o_mode, o_custom_col) = obj_modes
+                                .get(&oid)
+                                .copied()
+                                .unwrap_or((ObjectFilamentMode::ProjectDefault, None));
+                            let mixed = build_mixed_toolpaths_for_object_with_mode(
+                                oid,
+                                raw_tp,
+                                &config_clone,
+                                o_mode,
+                                o_custom_col,
+                            );
+                            if oid == sel_oid {
+                                sel_mixed = Some(mixed.clone());
+                            }
+                            mixed_map.insert(oid, mixed);
+                        }
+                        if !mixed_map.contains_key(&sel_oid) {
+                            if let Some(ref raw_tp) = cached_unmixed {
+                                let mixed = build_mixed_toolpaths_for_object_with_mode(
+                                    sel_oid,
+                                    raw_tp,
+                                    &config_clone,
+                                    sel_obj_mode,
+                                    sel_obj_custom_col,
+                                );
+                                sel_mixed = Some(mixed.clone());
+                                mixed_map.insert(sel_oid, mixed);
+                            }
+                        }
+                        updated_mixed_toolpaths = Some((mixed_map.clone(), sel_mixed.clone()));
+                        (mixed_map, sel_mixed)
+                    } else if let Some((mixed_map, sel_mixed)) = existing_mixed_snapshot {
+                        (mixed_map, sel_mixed)
+                    } else {
+                        (std::collections::HashMap::new(), None)
+                    };
+
+                // 3. Optional G-code & purge planning across all printable objects on the active plate
+                let updated_planned_gcode: Option<Option<crate::gcode::PlannedGcodeResult>> =
+                    if want_plan {
+                        let mut planned_objects: Vec<(
+                            String,
+                            crate::gcode::PlannedGcodeResult,
+                            Transform,
+                        )> = Vec::new();
+                        let num_printable = printable_specs.len().max(1);
+                        for (p_idx, (oid, o_name, o_tf)) in printable_specs.into_iter().enumerate()
+                        {
+                            let tp_opt = active_mixed_map.get(&oid).or_else(|| {
+                                if oid == sel_oid {
+                                    active_sel_mixed.as_ref()
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some(tp_res) = tp_opt {
+                                if tp_res.valid && !tp_res.layers.is_empty() {
+                                    let obj_base_frac =
+                                        0.18 + 0.64 * ((p_idx as f32) / (num_printable as f32));
+                                    let obj_span_frac = 0.64 / (num_printable as f32);
+                                    let prog_ref = &progress;
+                                    let p =
+                                        crate::gcode::plan_and_emit_gcode_for_object_with_progress(
+                                            &o_name,
+                                            oid,
+                                            tp_res,
+                                            o_tf,
+                                            &config_clone,
+                                            Some(&|sub_f, sub_msg| {
+                                                prog_ref.set(
+                                                    obj_base_frac + sub_f * obj_span_frac,
+                                                    sub_msg,
+                                                );
+                                            }),
+                                        );
+                                    planned_objects.push((o_name, p, o_tf));
+                                }
+                            }
+                        }
+
+                        if planned_objects.is_empty() {
+                            Some(None)
+                        } else {
+                            progress.set(0.83, "Combining plate G-code & metadata...");
+                            let combined =
+                                crate::gcode::combine_planned_objects_into_plate_result(
+                                    &planned_objects,
+                                    &config_clone,
+                                );
+                            Some(Some(combined))
+                        }
                     } else {
                         None
-                    }
-                });
-            if let Some(tp_res) = tp_opt {
-                if tp_res.valid && !tp_res.layers.is_empty() {
-                    let p = crate::gcode::plan_and_emit_gcode_for_object(
-                        &o.name,
-                        o.object_id,
-                        tp_res,
-                        o_tf,
-                        &config,
-                    );
-                    planned_objects.push((o.name.clone(), p, o_tf));
-                }
-            }
-        }
+                    };
 
-        if planned_objects.is_empty() {
-            vis_state.cached_planned_gcode = None;
-            vis_state.planned_gcode_is_world_space = false;
-        } else {
-            let combined =
-                crate::gcode::combine_planned_objects_into_plate_result(&planned_objects, &config);
-            if !combined.layers.is_empty() {
-                vis_state.selected_layer_max_idx =
-                    vis_state.selected_layer_max_idx.min(combined.layers.len() - 1);
-            }
-            vis_state.cached_planned_gcode = Some(combined);
-            vis_state.planned_gcode_is_world_space = true;
+                // 4. Optional 3D toolpath preview mesh construction
+                let built_mesh = if build_mesh_in_task {
+                    progress.set(0.87, "Building 3D toolpath preview mesh...");
+                    let planned_ref = match &updated_planned_gcode {
+                        Some(Some(ref p)) => Some(p),
+                        Some(None) => None,
+                        None => existing_planned_for_mesh.as_ref(),
+                    };
+                    if let Some(p) = planned_ref {
+                        if !p.layers.is_empty() {
+                            mesh_filter.selected_layer_max_idx =
+                                mesh_filter.selected_layer_max_idx.min(p.layers.len() - 1);
+                        }
+                    }
+                    let geom = mesh_filter.build_geometry(
+                        planned_ref,
+                        active_sel_mixed.as_ref(),
+                        &config_clone,
+                    );
+                    let render_tf = if planned_ref.is_some()
+                        && (updated_planned_gcode.is_some() || existing_planned_is_world)
+                    {
+                        Transform::IDENTITY
+                    } else {
+                        sel_world_tf
+                    };
+                    progress.set(0.99, "Finalizing 3D toolpath preview...");
+                    Some((geom, render_tf))
+                } else {
+                    None
+                };
+
+                PostSliceTaskOutput {
+                    selected_obj_id: Some(sel_oid),
+                    remapped_triangle_slots,
+                    updated_mixed_toolpaths,
+                    updated_planned_gcode,
+                    built_mesh,
+                }
+            });
+
+            vis_state.pending_post_slice_task = Some(task);
         }
-        vis_state.dirty_toolpaths_mesh = true;
     }
 
     let toolpath_render_tf =
@@ -1819,7 +2259,7 @@ pub fn sync_field_visualization_system(
 
     if !vis_state.show_toolpaths {
         hide_all_toolpath_entities(&vis_state, &mut toolpaths_query);
-    } else if vis_state.dirty_toolpaths_mesh {
+    } else if vis_state.dirty_toolpaths_mesh && vis_state.pending_post_slice_task.is_none() {
         vis_state.dirty_toolpaths_mesh = false;
         rebuild_and_sync_toolpath_meshes(
             &mut commands,
@@ -2801,6 +3241,324 @@ fn build_hq_bucket_pbr_material(
     }
 }
 
+fn clone_planned_without_gcode_text(
+    p: &crate::gcode::PlannedGcodeResult,
+) -> crate::gcode::PlannedGcodeResult {
+    crate::gcode::PlannedGcodeResult {
+        layers: p.layers.clone(),
+        gcode_text: String::new(),
+        total_time_s: p.total_time_s,
+        total_filament_mm: p.total_filament_mm,
+        total_filament_volume_mm3: p.total_filament_volume_mm3,
+        total_filament_grams: p.total_filament_grams,
+        bbox_min_bed: p.bbox_min_bed,
+        bbox_max_bed: p.bbox_max_bed,
+        exclude_object_name: String::new(),
+        exclude_object_center_bed: p.exclude_object_center_bed,
+        exclude_object_polygon_bed: Vec::new(),
+        extruding_move_count: p.extruding_move_count,
+        travel_move_count: p.travel_move_count,
+        retract_count: p.retract_count,
+        toolchange_count: p.toolchange_count,
+        min_speed_mms: p.min_speed_mms,
+        max_speed_mms: p.max_speed_mms,
+        min_accel_mms2: p.min_accel_mms2,
+        max_accel_mms2: p.max_accel_mms2,
+        min_flow_mm3s: p.min_flow_mm3s,
+        max_flow_mm3s: p.max_flow_mm3s,
+        min_flow_mult: p.min_flow_mult,
+        max_flow_mult: p.max_flow_mult,
+        min_pa_s: p.min_pa_s,
+        max_pa_s: p.max_pa_s,
+        min_pressure_mm3s: p.min_pressure_mm3s,
+        max_pressure_mm3s: p.max_pressure_mm3s,
+        min_width_mm: p.min_width_mm,
+        max_width_mm: p.max_width_mm,
+        min_height_mm: p.min_height_mm,
+        max_height_mm: p.max_height_mm,
+        min_tool_iso_angle_deg: p.min_tool_iso_angle_deg,
+        max_tool_iso_angle_deg: p.max_tool_iso_angle_deg,
+    }
+}
+
+impl ToolpathMeshFilter {
+    #[inline]
+    pub fn is_planned_segment_visible(&self, seg: &crate::gcode::PlannedSegment) -> bool {
+        match seg.kind {
+            crate::gcode::PlannedMoveKind::OuterWall => self.show_outer_walls,
+            crate::gcode::PlannedMoveKind::InnerWall => self.show_inner_walls,
+            crate::gcode::PlannedMoveKind::Bridge => self.show_bridges,
+            crate::gcode::PlannedMoveKind::WaveOverhang => self.show_wave_overhangs,
+            crate::gcode::PlannedMoveKind::SolidInfill => self.show_solid_infill,
+            crate::gcode::PlannedMoveKind::SparseInfill => self.show_sparse_infill,
+            crate::gcode::PlannedMoveKind::GapFill => self.show_gap_fill,
+            crate::gcode::PlannedMoveKind::Support => self.show_supports,
+            crate::gcode::PlannedMoveKind::SupportInterface => self.show_support_interface,
+            crate::gcode::PlannedMoveKind::PurgeTower => self.show_purge_tower,
+            crate::gcode::PlannedMoveKind::ScarfSeam => self.show_scarf_seams,
+            crate::gcode::PlannedMoveKind::Wipe => self.show_wipes,
+            crate::gcode::PlannedMoveKind::Travel => self.show_travel_moves,
+            crate::gcode::PlannedMoveKind::ZHop => self.show_z_hops,
+        }
+    }
+
+    #[inline]
+    pub fn is_raw_path_visible(&self, feature_kind: u8) -> bool {
+        match feature_kind {
+            0 => self.show_outer_walls,
+            1 => self.show_inner_walls,
+            2 => self.show_solid_infill,
+            3 => self.show_gap_fill,
+            4 => self.show_sparse_infill,
+            5 => self.show_bridges,
+            6 => self.show_wave_overhangs,
+            7 => self.show_supports,
+            8 => self.show_support_interface,
+            _ => self.show_solid_infill,
+        }
+    }
+
+    pub fn build_geometry(
+        &self,
+        planned_opt: Option<&crate::gcode::PlannedGcodeResult>,
+        raw_opt: Option<&ObjectToolpathsResult>,
+        config: &SlicerConfig,
+    ) -> BuiltToolpathGeometry {
+        let stride = self.selected_layer_stride.max(1);
+        let min_idx = self.selected_layer_min_idx;
+        let max_idx = self.selected_layer_max_idx;
+        let highlighted = self.highlighted_selected_layer;
+        let color_mode = self.toolpath_color_mode;
+
+        if self.toolpath_quality_mode == ToolpathQualityMode::Fast {
+            let mut positions: Vec<[f32; 3]> = Vec::new();
+            let mut normals: Vec<[f32; 3]> = Vec::new();
+            let mut colors: Vec<[f32; 4]> = Vec::new();
+            let mut indices: Vec<u32> = Vec::new();
+
+            if let Some(planned) = planned_opt {
+                build_planned_toolpaths_bead_mesh_parallel(
+                    planned,
+                    self,
+                    config,
+                    min_idx,
+                    max_idx,
+                    stride,
+                    highlighted,
+                    color_mode,
+                    &mut positions,
+                    &mut normals,
+                    &mut colors,
+                    &mut indices,
+                );
+            } else if let Some(tp_res) = raw_opt {
+                build_raw_toolpaths_bead_mesh_parallel(
+                    tp_res,
+                    self,
+                    config,
+                    min_idx,
+                    max_idx,
+                    stride,
+                    highlighted,
+                    color_mode,
+                    &mut positions,
+                    &mut normals,
+                    &mut colors,
+                    &mut indices,
+                );
+            }
+            BuiltToolpathGeometry::Fast {
+                positions,
+                normals,
+                colors,
+                indices,
+            }
+        } else {
+            let buckets = if let Some(planned) = planned_opt {
+                build_hq_planned_toolpaths_buckets(
+                    planned,
+                    self,
+                    config,
+                    min_idx,
+                    max_idx,
+                    stride,
+                    highlighted,
+                    color_mode,
+                )
+            } else if let Some(tp_res) = raw_opt {
+                build_hq_raw_toolpaths_buckets(
+                    tp_res,
+                    self,
+                    config,
+                    min_idx,
+                    max_idx,
+                    stride,
+                    highlighted,
+                    color_mode,
+                )
+            } else {
+                Vec::new()
+            };
+            BuiltToolpathGeometry::HighQualityPbr(buckets)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn apply_built_toolpath_geometry_to_scene(
+    commands: &mut Commands,
+    vis_state: &mut FieldVisualizationState,
+    config: &SlicerConfig,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    toolpaths_query: &mut Query<
+        (&mut Transform, &mut Visibility),
+        (
+            With<ToolpathsMeshEntity>,
+            Without<CadObjectEntity>,
+            Without<FieldIsosurfaceEntity>,
+            Without<FieldSliceEntity>,
+            Without<SelectedLayersMeshEntity>,
+        ),
+    >,
+    built_geom: BuiltToolpathGeometry,
+    target_tf: Transform,
+) {
+    match built_geom {
+        BuiltToolpathGeometry::Fast {
+            positions,
+            normals,
+            colors,
+            indices,
+        } => {
+            for part in &vis_state.hq_toolpath_parts {
+                if let Ok((_, mut vis)) = toolpaths_query.get_mut(part.entity) {
+                    *vis = Visibility::Hidden;
+                }
+            }
+
+            if !positions.is_empty() && !indices.is_empty() {
+                let bevy_mesh = Mesh::new(
+                    PrimitiveTopology::TriangleList,
+                    RenderAssetUsages::default(),
+                )
+                .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+                .with_inserted_indices(Indices::U32(indices));
+
+                let fast_mat = build_fast_toolpath_material(vis_state.toolpath_opacity);
+                if let (Some(ent), Some(ref mesh_h), Some(ref mat_h)) = (
+                    vis_state.toolpaths_entity,
+                    &vis_state.toolpaths_mesh_handle,
+                    &vis_state.toolpaths_mat_handle,
+                ) {
+                    meshes.insert(mesh_h, bevy_mesh);
+                    if let Some(mat) = materials.get_mut(mat_h) {
+                        *mat = fast_mat;
+                    }
+                    if let Ok((mut tf, mut vis)) = toolpaths_query.get_mut(ent) {
+                        *tf = target_tf;
+                        *vis = Visibility::Inherited;
+                    }
+                } else {
+                    let mesh_h = meshes.add(bevy_mesh);
+                    let mat_h = materials.add(fast_mat);
+                    let ent = commands
+                        .spawn((
+                            PbrBundle {
+                                mesh: mesh_h.clone(),
+                                material: mat_h.clone(),
+                                transform: target_tf,
+                                ..default()
+                            },
+                            ToolpathsMeshEntity,
+                        ))
+                        .id();
+                    vis_state.toolpaths_entity = Some(ent);
+                    vis_state.toolpaths_mesh_handle = Some(mesh_h);
+                    vis_state.toolpaths_mat_handle = Some(mat_h);
+                }
+            } else if let Some(ent) = vis_state.toolpaths_entity {
+                if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
+                    *vis = Visibility::Hidden;
+                }
+            }
+        }
+        BuiltToolpathGeometry::HighQualityPbr(buckets) => {
+            if let Some(ent) = vis_state.toolpaths_entity {
+                if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
+                    *vis = Visibility::Hidden;
+                }
+            }
+
+            let used_count = buckets.len();
+            for (slot_i, bucket) in buckets.into_iter().enumerate() {
+                let bevy_mesh = Mesh::new(
+                    PrimitiveTopology::TriangleList,
+                    RenderAssetUsages::default(),
+                )
+                .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, bucket.positions)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, bucket.normals)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, bucket.colors)
+                .with_inserted_indices(Indices::U32(bucket.indices));
+
+                let pbr_mat = build_hq_bucket_pbr_material(
+                    bucket.tier,
+                    bucket.mat_slot,
+                    bucket.mean_thickness_mm,
+                    vis_state,
+                    config,
+                );
+
+                if slot_i < vis_state.hq_toolpath_parts.len() {
+                    let part = &mut vis_state.hq_toolpath_parts[slot_i];
+                    part.tier = bucket.tier;
+                    part.mat_slot = bucket.mat_slot;
+                    part.mean_thickness_mm = bucket.mean_thickness_mm;
+                    meshes.insert(&part.mesh_handle, bevy_mesh);
+                    if let Some(mat) = materials.get_mut(&part.mat_handle) {
+                        *mat = pbr_mat;
+                    }
+                    if let Ok((mut tf, mut vis)) = toolpaths_query.get_mut(part.entity) {
+                        *tf = target_tf;
+                        *vis = Visibility::Inherited;
+                    }
+                } else {
+                    let mesh_h = meshes.add(bevy_mesh);
+                    let mat_h = materials.add(pbr_mat);
+                    let ent = commands
+                        .spawn((
+                            PbrBundle {
+                                mesh: mesh_h.clone(),
+                                material: mat_h.clone(),
+                                transform: target_tf,
+                                ..default()
+                            },
+                            bevy::pbr::TransmittedShadowReceiver,
+                            ToolpathsMeshEntity,
+                        ))
+                        .id();
+                    vis_state.hq_toolpath_parts.push(HqToolpathSubMesh {
+                        entity: ent,
+                        mesh_handle: mesh_h,
+                        mat_handle: mat_h,
+                        tier: bucket.tier,
+                        mat_slot: bucket.mat_slot,
+                        mean_thickness_mm: bucket.mean_thickness_mm,
+                    });
+                }
+            }
+
+            for unused in vis_state.hq_toolpath_parts.iter().skip(used_count) {
+                if let Ok((_, mut vis)) = toolpaths_query.get_mut(unused.entity) {
+                    *vis = Visibility::Hidden;
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn rebuild_and_sync_toolpath_meshes(
     commands: &mut Commands,
@@ -2820,202 +3578,22 @@ fn rebuild_and_sync_toolpath_meshes(
     >,
     target_tf: Transform,
 ) {
-    let stride = vis_state.selected_layer_stride.max(1);
-    let min_idx = vis_state.selected_layer_min_idx;
-    let max_idx = vis_state.selected_layer_max_idx;
-    let highlighted = vis_state.highlighted_selected_layer;
-    let color_mode = vis_state.toolpath_color_mode;
-
-    if vis_state.toolpath_quality_mode == ToolpathQualityMode::Fast {
-        for part in &vis_state.hq_toolpath_parts {
-            if let Ok((_, mut vis)) = toolpaths_query.get_mut(part.entity) {
-                *vis = Visibility::Hidden;
-            }
-        }
-
-        let mut positions: Vec<[f32; 3]> = Vec::new();
-        let mut normals: Vec<[f32; 3]> = Vec::new();
-        let mut colors: Vec<[f32; 4]> = Vec::new();
-        let mut indices: Vec<u32> = Vec::new();
-
-        if let Some(ref planned) = vis_state.cached_planned_gcode {
-            build_planned_toolpaths_bead_mesh_parallel(
-                planned,
-                vis_state,
-                config,
-                min_idx,
-                max_idx,
-                stride,
-                highlighted,
-                color_mode,
-                &mut positions,
-                &mut normals,
-                &mut colors,
-                &mut indices,
-            );
-        } else if let Some(ref tp_res) = vis_state.cached_toolpaths {
-            build_raw_toolpaths_bead_mesh_parallel(
-                tp_res,
-                vis_state,
-                config,
-                min_idx,
-                max_idx,
-                stride,
-                highlighted,
-                color_mode,
-                &mut positions,
-                &mut normals,
-                &mut colors,
-                &mut indices,
-            );
-        }
-
-        if !positions.is_empty() && !indices.is_empty() {
-            let bevy_mesh = Mesh::new(
-                PrimitiveTopology::TriangleList,
-                RenderAssetUsages::default(),
-            )
-            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-            .with_inserted_indices(Indices::U32(indices));
-
-            let fast_mat = build_fast_toolpath_material(vis_state.toolpath_opacity);
-            if let (Some(ent), Some(ref mesh_h), Some(ref mat_h)) = (
-                vis_state.toolpaths_entity,
-                &vis_state.toolpaths_mesh_handle,
-                &vis_state.toolpaths_mat_handle,
-            ) {
-                meshes.insert(mesh_h, bevy_mesh);
-                if let Some(mat) = materials.get_mut(mat_h) {
-                    *mat = fast_mat;
-                }
-                if let Ok((mut tf, mut vis)) = toolpaths_query.get_mut(ent) {
-                    *tf = target_tf;
-                    *vis = Visibility::Inherited;
-                }
-            } else {
-                let mesh_h = meshes.add(bevy_mesh);
-                let mat_h = materials.add(fast_mat);
-                let ent = commands
-                    .spawn((
-                        PbrBundle {
-                            mesh: mesh_h.clone(),
-                            material: mat_h.clone(),
-                            transform: target_tf,
-                            ..default()
-                        },
-                        ToolpathsMeshEntity,
-                    ))
-                    .id();
-                vis_state.toolpaths_entity = Some(ent);
-                vis_state.toolpaths_mesh_handle = Some(mesh_h);
-                vis_state.toolpaths_mat_handle = Some(mat_h);
-            }
-        } else if let Some(ent) = vis_state.toolpaths_entity {
-            if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
-                *vis = Visibility::Hidden;
-            }
-        }
-        return;
-    }
-
-    // HighQualityPbr mode: hide Fast entity and build 12-vertex pressed-stadium PBR buckets
-    if let Some(ent) = vis_state.toolpaths_entity {
-        if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
-            *vis = Visibility::Hidden;
-        }
-    }
-
-    let buckets = if let Some(ref planned) = vis_state.cached_planned_gcode {
-        build_hq_planned_toolpaths_buckets(
-            planned,
-            vis_state,
-            config,
-            min_idx,
-            max_idx,
-            stride,
-            highlighted,
-            color_mode,
-        )
-    } else if let Some(ref tp_res) = vis_state.cached_toolpaths {
-        build_hq_raw_toolpaths_buckets(
-            tp_res,
-            vis_state,
-            config,
-            min_idx,
-            max_idx,
-            stride,
-            highlighted,
-            color_mode,
-        )
-    } else {
-        Vec::new()
-    };
-
-    let used_count = buckets.len();
-    for (slot_i, bucket) in buckets.into_iter().enumerate() {
-        let bevy_mesh = Mesh::new(
-            PrimitiveTopology::TriangleList,
-            RenderAssetUsages::default(),
-        )
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, bucket.positions)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, bucket.normals)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, bucket.colors)
-        .with_inserted_indices(Indices::U32(bucket.indices));
-
-        let pbr_mat = build_hq_bucket_pbr_material(
-            bucket.tier,
-            bucket.mat_slot,
-            bucket.mean_thickness_mm,
-            vis_state,
-            config,
-        );
-
-        if slot_i < vis_state.hq_toolpath_parts.len() {
-            let part = &mut vis_state.hq_toolpath_parts[slot_i];
-            part.tier = bucket.tier;
-            part.mat_slot = bucket.mat_slot;
-            part.mean_thickness_mm = bucket.mean_thickness_mm;
-            meshes.insert(&part.mesh_handle, bevy_mesh);
-            if let Some(mat) = materials.get_mut(&part.mat_handle) {
-                *mat = pbr_mat;
-            }
-            if let Ok((mut tf, mut vis)) = toolpaths_query.get_mut(part.entity) {
-                *tf = target_tf;
-                *vis = Visibility::Inherited;
-            }
-        } else {
-            let mesh_h = meshes.add(bevy_mesh);
-            let mat_h = materials.add(pbr_mat);
-            let ent = commands
-                .spawn((
-                    PbrBundle {
-                        mesh: mesh_h.clone(),
-                        material: mat_h.clone(),
-                        transform: target_tf,
-                        ..default()
-                    },
-                    bevy::pbr::TransmittedShadowReceiver,
-                    ToolpathsMeshEntity,
-                ))
-                .id();
-            vis_state.hq_toolpath_parts.push(HqToolpathSubMesh {
-                entity: ent,
-                mesh_handle: mesh_h,
-                mat_handle: mat_h,
-                tier: bucket.tier,
-                mat_slot: bucket.mat_slot,
-                mean_thickness_mm: bucket.mean_thickness_mm,
-            });
-        }
-    }
-
-    for unused in vis_state.hq_toolpath_parts.iter().skip(used_count) {
-        if let Ok((_, mut vis)) = toolpaths_query.get_mut(unused.entity) {
-            *vis = Visibility::Hidden;
-        }
-    }
+    let filter = vis_state.toolpath_mesh_filter();
+    let built_geom = filter.build_geometry(
+        vis_state.cached_planned_gcode.as_ref(),
+        vis_state.cached_toolpaths.as_ref(),
+        config,
+    );
+    apply_built_toolpath_geometry_to_scene(
+        commands,
+        vis_state,
+        config,
+        meshes,
+        materials,
+        toolpaths_query,
+        built_geom,
+        target_tf,
+    );
 }
 
 /// Builds 3D oriented bead prism geometry across visible layers of a `PlannedGcodeResult`
@@ -3023,7 +3601,7 @@ fn rebuild_and_sync_toolpath_meshes(
 #[allow(clippy::too_many_arguments)]
 fn build_planned_toolpaths_bead_mesh_parallel(
     planned: &crate::gcode::PlannedGcodeResult,
-    vis_state: &FieldVisualizationState,
+    filter: &ToolpathMeshFilter,
     config: &SlicerConfig,
     min_idx: usize,
     max_idx: usize,
@@ -3062,12 +3640,12 @@ fn build_planned_toolpaths_bead_mesh_parallel(
         };
         let mut layer_segs = 0usize;
         for seg in &layer_p.segments {
-            if vis_state.is_planned_segment_visible(seg) {
+            if filter.is_planned_segment_visible(seg) {
                 layer_segs += 1;
             }
         }
         if idx == active_scrub_layer {
-            if let Some(limit) = vis_state.layer_move_scrub_limit {
+            if let Some(limit) = filter.layer_move_scrub_limit {
                 layer_segs = layer_segs.min(limit);
             }
         }
@@ -3102,7 +3680,7 @@ fn build_planned_toolpaths_bead_mesh_parallel(
         for &(idx, dim_factor, max_layer_segs) in &visible_layers {
             let mut emitted = 0usize;
             for (seg_i, seg) in planned.layers[idx].segments.iter().enumerate() {
-                if !vis_state.is_planned_segment_visible(seg) {
+                if !filter.is_planned_segment_visible(seg) {
                     continue;
                 }
                 if emitted >= max_layer_segs {
@@ -3148,7 +3726,7 @@ fn build_planned_toolpaths_bead_mesh_parallel(
                 for &(idx, dim_factor, max_layer_segs) in chunk {
                     let mut emitted = 0usize;
                     for (seg_i, seg) in planned.layers[idx].segments.iter().enumerate() {
-                        if !vis_state.is_planned_segment_visible(seg) {
+                        if !filter.is_planned_segment_visible(seg) {
                             continue;
                         }
                         if emitted >= max_layer_segs {
@@ -3199,7 +3777,7 @@ fn build_planned_toolpaths_bead_mesh_parallel(
 #[allow(clippy::too_many_arguments)]
 fn build_raw_toolpaths_bead_mesh_parallel(
     tp_res: &ObjectToolpathsResult,
-    vis_state: &FieldVisualizationState,
+    filter: &ToolpathMeshFilter,
     config: &SlicerConfig,
     min_idx: usize,
     max_idx: usize,
@@ -3238,12 +3816,12 @@ fn build_raw_toolpaths_bead_mesh_parallel(
         };
         let mut layer_pts = 0usize;
         for path in &layer_tp.paths {
-            if vis_state.is_raw_path_visible(path.feature_kind) && path.points.len() >= 2 {
+            if filter.is_raw_path_visible(path.feature_kind) && path.points.len() >= 2 {
                 layer_pts += path.points.len();
             }
         }
         let seg_limit = if idx == active_scrub_layer {
-            vis_state.layer_move_scrub_limit
+            filter.layer_move_scrub_limit
         } else {
             None
         };
@@ -3271,7 +3849,7 @@ fn build_raw_toolpaths_bead_mesh_parallel(
         for &(idx, dim_factor, _, seg_limit_opt) in &visible_layers {
             let mut rem_segs = seg_limit_opt;
             for path in &tp_res.layers[idx].paths {
-                if !vis_state.is_raw_path_visible(path.feature_kind) || path.points.len() < 2 {
+                if !filter.is_raw_path_visible(path.feature_kind) || path.points.len() < 2 {
                     continue;
                 }
                 if rem_segs == Some(0) {
@@ -3314,7 +3892,7 @@ fn build_raw_toolpaths_bead_mesh_parallel(
                 for &(idx, dim_factor, _, seg_limit_opt) in chunk {
                     let mut rem_segs = seg_limit_opt;
                     for path in &tp_res.layers[idx].paths {
-                        if !vis_state.is_raw_path_visible(path.feature_kind)
+                        if !filter.is_raw_path_visible(path.feature_kind)
                             || path.points.len() < 2
                         {
                             continue;
@@ -3604,9 +4182,15 @@ pub fn default_cad_vertex_colors(
             })
             .collect()
     } else if has_slots {
+        // Precompute all 256 possible filament slot Linear RGBA colours once so per-vertex
+        // lookup across hundreds of thousands of vertices is a single array index operation.
+        let mut slot_lut = [[1.0f32; 4]; 256];
+        for s in 0..=255u8 {
+            slot_lut[s as usize] = srgba_to_linear_rgba(config.color_srgba_for_filament_slot(s));
+        }
         vertex_filament_slots
             .iter()
-            .map(|&slot| srgba_to_linear_rgba(config.color_srgba_for_filament_slot(slot)))
+            .map(|&slot| slot_lut[slot as usize])
             .collect()
     } else if has_true_colors {
         vertex_colors_rgba
@@ -4003,14 +4587,14 @@ fn append_extrusion_path_bead_mesh(
 const HQ_RING_VERTS: usize = 12;
 
 /// Assembled triangle mesh for one `(tier, mat_slot)` PBR sub-mesh bucket.
-struct HqBucketMesh {
-    tier: u8,
-    mat_slot: u16,
-    mean_thickness_mm: f32,
-    positions: Vec<[f32; 3]>,
-    normals: Vec<[f32; 3]>,
-    colors: Vec<[f32; 4]>,
-    indices: Vec<u32>,
+pub struct HqBucketMesh {
+    pub tier: u8,
+    pub mat_slot: u16,
+    pub mean_thickness_mm: f32,
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub colors: Vec<[f32; 4]>,
+    pub indices: Vec<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -4107,7 +4691,7 @@ fn classify_hq_raw_bucket(
 #[allow(clippy::too_many_arguments)]
 fn build_hq_planned_toolpaths_buckets(
     planned: &crate::gcode::PlannedGcodeResult,
-    vis_state: &FieldVisualizationState,
+    filter: &ToolpathMeshFilter,
     config: &SlicerConfig,
     min_idx: usize,
     max_idx: usize,
@@ -4143,12 +4727,12 @@ fn build_hq_planned_toolpaths_buckets(
         };
         let mut layer_segs = 0usize;
         for seg in &layer_p.segments {
-            if vis_state.is_planned_segment_visible(seg) {
+            if filter.is_planned_segment_visible(seg) {
                 layer_segs += 1;
             }
         }
         if idx == active_scrub_layer {
-            if let Some(limit) = vis_state.layer_move_scrub_limit {
+            if let Some(limit) = filter.layer_move_scrub_limit {
                 layer_segs = layer_segs.min(limit);
             }
         }
@@ -4177,7 +4761,7 @@ fn build_hq_planned_toolpaths_buckets(
         for &(idx, dim_factor, max_layer_segs) in chunk {
             let mut emitted = 0usize;
             for (seg_i, seg) in planned.layers[idx].segments.iter().enumerate() {
-                if !vis_state.is_planned_segment_visible(seg) {
+                if !filter.is_planned_segment_visible(seg) {
                     continue;
                 }
                 if emitted >= max_layer_segs {
@@ -4312,7 +4896,7 @@ fn build_hq_planned_toolpaths_buckets(
 #[allow(clippy::too_many_arguments)]
 fn build_hq_raw_toolpaths_buckets(
     tp_res: &ObjectToolpathsResult,
-    vis_state: &FieldVisualizationState,
+    filter: &ToolpathMeshFilter,
     config: &SlicerConfig,
     min_idx: usize,
     max_idx: usize,
@@ -4350,13 +4934,13 @@ fn build_hq_raw_toolpaths_buckets(
             1.0
         };
         let mut rem_segs = if idx == active_scrub_layer {
-            vis_state.layer_move_scrub_limit
+            filter.layer_move_scrub_limit
         } else {
             None
         };
 
         for path in &layer_tp.paths {
-            if !vis_state.is_raw_path_visible(path.feature_kind) || path.points.len() < 2 {
+            if !filter.is_raw_path_visible(path.feature_kind) || path.points.len() < 2 {
                 continue;
             }
             if rem_segs == Some(0) {
@@ -9025,7 +9609,7 @@ mod tests {
         let mut ind = Vec::new();
         build_planned_toolpaths_bead_mesh_parallel(
             vis.cached_planned_gcode.as_ref().unwrap(),
-            &vis,
+            &vis.toolpath_mesh_filter(),
             &cfg,
             0,
             1,

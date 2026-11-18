@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use bevy::prelude::*;
 
@@ -250,6 +251,7 @@ struct WorkingChain {
 }
 
 /// Non-Newtonian rheology & viscoelastic die-swell helper corresponding to `FluidDynamicsEngine`.
+#[derive(Clone, Copy, Debug)]
 struct FluidDynamicsModel {
     pa_zero: f32,
     pa_alpha: f32,
@@ -727,9 +729,7 @@ fn orient_chain_for_minimal_travel(chain: &mut WorkingChain, from_pos_bed: Vec3,
 
     if chain.is_closed && chain.pts.len() >= 3 {
         let n = chain.pts.len();
-        let mut best_idx = 0usize;
-        let mut best_score = f32::MAX;
-        for i in 0..n {
+        let score_at = |i: usize| -> f32 {
             let p_prev = chain.pts[(i + n - 1) % n].pos_bed;
             let p_curr = chain.pts[i].pos_bed;
             let p_next = chain.pts[(i + 1) % n].pos_bed;
@@ -737,10 +737,37 @@ fn orient_chain_for_minimal_travel(chain: &mut WorkingChain, from_pos_bed: Vec3,
             let d_out = (p_next - p_curr).try_normalize().unwrap_or(Vec3::X);
             // Prefer sharper corners (smaller dot product) when travel distances are similar
             let corner_bonus = 1.0 - 0.15 * (1.0 - d_in.dot(d_out)).clamp(0.0, 2.0);
-            let score = weighted_dist_sq(from_pos_bed, p_curr) * corner_bonus;
-            if score < best_score {
-                best_score = score;
-                best_idx = i;
+            weighted_dist_sq(from_pos_bed, p_curr) * corner_bonus
+        };
+
+        let mut best_idx = 0usize;
+        let mut best_score = f32::MAX;
+        if n <= 64 {
+            for i in 0..n {
+                let s = score_at(i);
+                if s < best_score {
+                    best_score = s;
+                    best_idx = i;
+                }
+            }
+        } else {
+            let stride = (n / 32).max(2);
+            let mut coarse_idx = 0usize;
+            for i in (0..n).step_by(stride) {
+                let s = score_at(i);
+                if s < best_score {
+                    best_score = s;
+                    coarse_idx = i;
+                }
+            }
+            best_idx = coarse_idx;
+            for offset in 0..=(2 * stride) {
+                let i = (coarse_idx + n - stride + offset) % n;
+                let s = score_at(i);
+                if s < best_score {
+                    best_score = s;
+                    best_idx = i;
+                }
             }
         }
         if best_idx > 0 {
@@ -799,22 +826,37 @@ impl BedUpBasis {
 }
 
 /// 2D spatial heightmap of already-printed material in the `BedUpBasis` `(u, v)` plane.
-/// Tracks all-printed-so-far heights (`curr_max_h`) at `1.0 mm` cell resolution so
-/// non-extruding travel corridors (`max_corridor_obstacle_h`) lift cleanly over obstacles in $O(1)$ per sample,
-/// without ever displacing extruding vertices off their 3D slicing isosurfaces.
+/// Uses a flat, cache-resident 2D array (`grid: Vec<f32>`) at `1.0 mm` cell resolution
+/// (with `overflow_cells` fallback for out-of-bounds test coordinates) so recording segments
+/// and querying travel corridors execute in $O(1)$ per cell with zero hashing overhead.
 struct PrintedHeightMap {
     basis: BedUpBasis,
     cell_size_mm: f32,
-    curr_max_h: HashMap<(i32, i32), f32>,
+    min_ix: i32,
+    min_iy: i32,
+    width: usize,
+    height: usize,
+    grid: Vec<f32>,
+    overflow_cells: HashMap<(i32, i32), f32>,
     global_max_h: Option<f32>,
 }
 
 impl PrintedHeightMap {
     fn new(basis: BedUpBasis) -> Self {
+        // Default 800 x 800 mm grid centered around [-250 .. +550] in (u, v)
+        let min_ix = -250;
+        let min_iy = -250;
+        let width = 800;
+        let height = 800;
         Self {
             basis,
             cell_size_mm: 1.0,
-            curr_max_h: HashMap::new(),
+            min_ix,
+            min_iy,
+            width,
+            height,
+            grid: vec![f32::NEG_INFINITY; width * height],
+            overflow_cells: HashMap::new(),
             global_max_h: None,
         }
     }
@@ -832,24 +874,61 @@ impl PrintedHeightMap {
         )
     }
 
-    /// Records an extruding segment `(p0_bed -> p1_bed)` into `curr_max_h`.
+    #[inline]
+    fn update_cell(&mut self, ix: i32, iy: i32, h: f32) {
+        let rx = ix - self.min_ix;
+        let ry = iy - self.min_iy;
+        if rx >= 0 && (rx as usize) < self.width && ry >= 0 && (ry as usize) < self.height {
+            let idx = (ry as usize) * self.width + (rx as usize);
+            if h > self.grid[idx] {
+                self.grid[idx] = h;
+            }
+        } else {
+            let entry = self.overflow_cells.entry((ix, iy)).or_insert(h);
+            if h > *entry {
+                *entry = h;
+            }
+        }
+    }
+
+    #[inline]
+    fn get_cell(&self, ix: i32, iy: i32) -> Option<f32> {
+        let rx = ix - self.min_ix;
+        let ry = iy - self.min_iy;
+        if rx >= 0 && (rx as usize) < self.width && ry >= 0 && (ry as usize) < self.height {
+            let val = self.grid[(ry as usize) * self.width + (rx as usize)];
+            if val.is_finite() {
+                Some(val)
+            } else {
+                None
+            }
+        } else {
+            self.overflow_cells.get(&(ix, iy)).copied()
+        }
+    }
+
+    /// Records an extruding segment `(p0_bed -> p1_bed)` into `grid`.
     fn record_extrusion_segment(&mut self, p0_bed: Vec3, p1_bed: Vec3) {
         let (u0, v0, h0) = self.basis.project_uvh(p0_bed);
         let (u1, v1, h1) = self.basis.project_uvh(p1_bed);
         let seg_max_h = h0.max(h1);
         self.global_max_h = Some(self.global_max_h.map_or(seg_max_h, |m| m.max(seg_max_h)));
+        let (ix0, iy0) = self.cell_coords(u0, v0);
+        let (ix1, iy1) = self.cell_coords(u1, v1);
+        if ix0 == ix1 && iy0 == iy1 {
+            self.update_cell(ix0, iy0, seg_max_h);
+            return;
+        }
         let dist_uv = ((u1 - u0) * (u1 - u0) + (v1 - v0) * (v1 - v0)).sqrt();
-        let steps = ((dist_uv / 0.45).ceil() as usize).max(1);
+        let steps = ((dist_uv / 0.65).ceil() as usize).max(1);
+        let inv_steps = 1.0 / (steps as f32);
         for s in 0..=steps {
-            let t = (s as f32) / (steps as f32);
+            let t = (s as f32) * inv_steps;
             let su = u0 + t * (u1 - u0);
             let sv = v0 + t * (v1 - v0);
             let sh = h0 + t * (h1 - h0);
-            let key = self.cell_coords(su, sv);
-            let entry = self.curr_max_h.entry(key).or_insert(sh);
-            if sh > *entry {
-                *entry = sh;
-            }
+            let (ix, iy) = self.cell_coords(su, sv);
+            self.update_cell(ix, iy, sh);
         }
     }
 
@@ -857,31 +936,41 @@ impl PrintedHeightMap {
     /// extruding vertices they wipe across within the same chain, while leaving all extruding
     /// vertices strictly untouched on their 3D slicing isosurface.
     fn clamp_wipe_vertices(&self, pts: &mut [WorkingVertex]) {
-        if pts.is_empty() {
+        let n = pts.len();
+        if n < 2 {
             return;
         }
+        // Fast path: if the chain does not end with a non-extruding Wipe vertex, return in O(1)!
+        let is_wipe_vtx = |v: &WorkingVertex| -> bool {
+            v.kind_override == Some(PlannedMoveKind::Wipe) || v.flow_rate_mult <= 1.0e-4
+        };
+        if !is_wipe_vtx(&pts[n - 1]) && !pts.iter().any(is_wipe_vtx) {
+            return;
+        }
+
+        // Collect the (u, v, h) of extruding vertices in this chain (without allocating a HashMap)
         let mut last_ext_h: Option<f32> = None;
-        let mut chain_cell_max_h: HashMap<(i32, i32), f32> = HashMap::new();
-        for i in 0..pts.len() {
+        for i in 0..n {
             let (u, v, h) = self.basis.project_uvh(pts[i].pos_bed);
-            let is_wipe = pts[i].kind_override == Some(PlannedMoveKind::Wipe)
-                || pts[i].flow_rate_mult <= 1.0e-4;
-            if is_wipe {
+            if is_wipe_vtx(&pts[i]) {
                 let mut req_h = last_ext_h.unwrap_or(h);
                 let (u_prev, v_prev, _) = if i > 0 {
                     self.basis.project_uvh(pts[i - 1].pos_bed)
                 } else {
                     (u, v, h)
                 };
-                let dist_uv = ((u - u_prev) * (u - u_prev) + (v - v_prev) * (v - v_prev)).sqrt();
-                let steps = ((dist_uv / 0.30).ceil() as usize).max(1);
-                for s in 0..=steps {
-                    let t = (s as f32) / (steps as f32);
-                    let su = u_prev + t * (u - u_prev);
-                    let sv = v_prev + t * (v - v_prev);
-                    let cell = self.cell_coords(su, sv);
-                    if let Some(&ch) = chain_cell_max_h.get(&cell) {
-                        req_h = req_h.max(ch);
+                let wu_min = u.min(u_prev) - 1.0;
+                let wu_max = u.max(u_prev) + 1.0;
+                let wv_min = v.min(v_prev) - 1.0;
+                let wv_max = v.max(v_prev) + 1.0;
+
+                // Check extruding vertices in `pts[..i]` that lie within 1.0 mm of the wipe segment
+                for prev_v in &pts[..i] {
+                    if !is_wipe_vtx(prev_v) {
+                        let (pu, pv, ph) = self.basis.project_uvh(prev_v.pos_bed);
+                        if pu >= wu_min && pu <= wu_max && pv >= wv_min && pv <= wv_max {
+                            req_h = req_h.max(ph);
+                        }
                     }
                 }
                 if req_h > h {
@@ -889,25 +978,6 @@ impl PrintedHeightMap {
                 }
                 last_ext_h = Some(req_h.max(h));
             } else {
-                if i > 0 {
-                    let (u0, v0, h0) = self.basis.project_uvh(pts[i - 1].pos_bed);
-                    let dist_uv = ((u - u0) * (u - u0) + (v - v0) * (v - v0)).sqrt();
-                    let steps = ((dist_uv / 0.35).ceil() as usize).max(1);
-                    for s in 0..=steps {
-                        let t = (s as f32) / (steps as f32);
-                        let su = u0 + t * (u - u0);
-                        let sv = v0 + t * (v - v0);
-                        let sh = h0 + t * (h - h0);
-                        let cell = self.cell_coords(su, sv);
-                        let entry = chain_cell_max_h.entry(cell).or_insert(sh);
-                        if sh > *entry {
-                            *entry = sh;
-                        }
-                    }
-                } else {
-                    let cell = self.cell_coords(u, v);
-                    chain_cell_max_h.insert(cell, h);
-                }
                 last_ext_h = Some(h);
             }
         }
@@ -916,23 +986,31 @@ impl PrintedHeightMap {
     /// Queries the maximum already-printed elevation `h` along the 2D travel corridor `(p0_bed -> p1_bed)`
     /// (including a 1-cell lateral safety margin for the nozzle tip).
     fn max_corridor_obstacle_h(&self, p0_bed: Vec3, p1_bed: Vec3) -> Option<f32> {
+        self.global_max_h?;
         let (u0, v0, _) = self.basis.project_uvh(p0_bed);
         let (u1, v1, _) = self.basis.project_uvh(p1_bed);
         let dist_uv = ((u1 - u0) * (u1 - u0) + (v1 - v0) * (v1 - v0)).sqrt();
         if dist_uv <= 1.0e-4 {
             return None;
         }
-        let steps = ((dist_uv / 0.35).ceil() as usize).max(1);
+        let steps = ((dist_uv / 0.65).ceil() as usize).max(1);
+        let inv_steps = 1.0 / (steps as f32);
         let mut max_obs_h: Option<f32> = None;
+        let mut last_cell: Option<(i32, i32)> = None;
 
         for s in 0..=steps {
-            let t = (s as f32) / (steps as f32);
+            let t = (s as f32) * inv_steps;
             let su = u0 + t * (u1 - u0);
             let sv = v0 + t * (v1 - v0);
-            let (ix, iy) = self.cell_coords(su, sv);
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    if let Some(&ch) = self.curr_max_h.get(&(ix + dx, iy + dy)) {
+            let cell = self.cell_coords(su, sv);
+            if last_cell == Some(cell) {
+                continue;
+            }
+            last_cell = Some(cell);
+            let (ix, iy) = cell;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if let Some(ch) = self.get_cell(ix + dx, iy + dy) {
                         max_obs_h = Some(max_obs_h.map_or(ch, |m| m.max(ch)));
                     }
                 }
@@ -940,6 +1018,100 @@ impl PrintedHeightMap {
         }
         max_obs_h
     }
+}
+
+/// Fast greedy nearest-neighbor ordering within a single homogeneous tier/bucket of chains.
+/// Precomputes up to 8 perimeter sample points per chain so candidate selection is $O(1)$ per chain
+/// and moves `WorkingChain`s in-place without cloning.
+fn greedy_order_chains_in_tier(
+    mut group: Vec<WorkingChain>,
+    mut curr_pos: Vec3,
+    z_penalty: f32,
+    out: &mut Vec<WorkingChain>,
+) -> Vec3 {
+    let n = group.len();
+    if n == 0 {
+        return curr_pos;
+    }
+    if n == 1 {
+        let mut chosen = group.pop().unwrap();
+        if !chosen.pts.is_empty() {
+            orient_chain_for_minimal_travel(&mut chosen, curr_pos, z_penalty);
+            curr_pos = if chosen.is_closed {
+                chosen.pts.first().unwrap().pos_bed
+            } else {
+                chosen.pts.last().unwrap().pos_bed
+            };
+        }
+        out.push(chosen);
+        return curr_pos;
+    }
+
+    let weighted_dist_sq = |a: Vec3, b: Vec3| -> f32 {
+        let d = b - a;
+        d.x * d.x + d.y * d.y + (z_penalty * d.z) * (z_penalty * d.z)
+    };
+
+    // Precompute up to 8 sample points per chain for fast O(1) distance queries
+    let mut samples: Vec<([Vec3; 8], u8)> = Vec::with_capacity(n);
+    for ch in &group {
+        let m = ch.pts.len();
+        if m == 0 {
+            samples.push(([Vec3::ZERO; 8], 0));
+        } else if !ch.is_closed || m <= 2 {
+            let mut arr = [Vec3::ZERO; 8];
+            arr[0] = ch.pts[0].pos_bed;
+            arr[1] = ch.pts[m - 1].pos_bed;
+            samples.push((arr, 2));
+        } else {
+            let k = m.min(8);
+            let mut arr = [Vec3::ZERO; 8];
+            for s in 0..k {
+                arr[s] = ch.pts[(s * m) / k].pos_bed;
+            }
+            samples.push((arr, k as u8));
+        }
+    }
+
+    let mut used = vec![false; n];
+    for _ in 0..n {
+        let mut best_i = None;
+        let mut best_d = f32::MAX;
+        for i in 0..n {
+            if used[i] || samples[i].1 == 0 {
+                continue;
+            }
+            let (ref pts_arr, cnt) = samples[i];
+            let mut d = f32::MAX;
+            for k in 0..(cnt as usize) {
+                d = d.min(weighted_dist_sq(curr_pos, pts_arr[k]));
+            }
+            if d < best_d {
+                best_d = d;
+                best_i = Some(i);
+            }
+        }
+        let Some(idx) = best_i else {
+            break;
+        };
+        used[idx] = true;
+        let mut chosen = WorkingChain {
+            pts: std::mem::take(&mut group[idx].pts),
+            base_kind: group[idx].base_kind,
+            wall_index: group[idx].wall_index,
+            filament_slot: group[idx].filament_slot,
+            is_closed: group[idx].is_closed,
+        };
+        orient_chain_for_minimal_travel(&mut chosen, curr_pos, z_penalty);
+        curr_pos = if chosen.is_closed {
+            chosen.pts.first().unwrap().pos_bed
+        } else {
+            chosen.pts.last().unwrap().pos_bed
+        };
+        out.push(chosen);
+    }
+
+    curr_pos
 }
 
 /// Orders a single elevation band of chains according to `Supports -> (per FilamentSlot: Walls -> WaveOverhangs -> Bridges -> Infill)`.
@@ -961,28 +1133,28 @@ fn order_chain_band(
     }
     if slot_order.len() > 1 {
         let mut supports = Vec::new();
-        let mut non_supports = Vec::new();
+        let mut slot_buckets: Vec<(u8, Vec<WorkingChain>)> = slot_order
+            .into_iter()
+            .map(|s| (s, Vec::new()))
+            .collect();
         for ch in chains.drain(..) {
             if ch.base_kind.is_support() {
                 supports.push(ch);
-            } else {
-                non_supports.push(ch);
+            } else if let Some((_, bucket)) =
+                slot_buckets.iter_mut().find(|(s, _)| *s == ch.filament_slot)
+            {
+                bucket.push(ch);
             }
         }
-        let mut ordered = Vec::with_capacity(supports.len() + non_supports.len());
+        let mut ordered = Vec::with_capacity(supports.len() + slot_buckets.iter().map(|(_, b)| b.len()).sum::<usize>());
         let mut curr_pos = start_pos_bed;
         if !supports.is_empty() {
             let (mut sup_ord, next_pos) =
-                order_chain_band(supports, wall_order, curr_pos, z_penalty);
+                order_chain_band_single_slot(supports, wall_order, curr_pos, z_penalty);
             curr_pos = next_pos;
             ordered.append(&mut sup_ord);
         }
-        for slot in slot_order {
-            let slot_chains: Vec<WorkingChain> = non_supports
-                .iter()
-                .filter(|ch| ch.filament_slot == slot)
-                .cloned()
-                .collect();
+        for (_, slot_chains) in slot_buckets {
             if !slot_chains.is_empty() {
                 let (mut slot_ord, next_pos) =
                     order_chain_band_single_slot(slot_chains, wall_order, curr_pos, z_penalty);
@@ -1021,258 +1193,138 @@ fn order_chain_band_single_slot(
         }
     }
 
-    // Sort supported walls according to `WallPrintOrder`, and when Vertical Half-Layer Brick
-    // Interlocking is present on an odd wall chain, order monotonically by local elevation tier
-    // relative to the nearest adjacent even wall point:
-    // - Tier 0: First-layer 0.5*h starter pass (\Delta z_noz < -0.25*h, r_h < 0.72)
-    // - Tier 1: Unshifted even walls (0, 2, 4...) AND unshifted overhang/anchor odd walls
-    // - Tier 2: Raised +0.5*h odd brick walls (\Delta z_noz > +0.30*h) or top-layer 0.5*h cap passes
-    let max_wall_idx = walls.iter().map(|w| w.wall_index).max().unwrap_or(0);
-    let mut even_wall_pts: Vec<(Vec3, f32)> = Vec::new();
-    for ew in &walls {
-        if ew.wall_index % 2 == 0 {
-            for ept in &ew.pts {
-                even_wall_pts.push((ept.pos_bed, ept.height_mm));
-            }
-        }
-    }
-    let wall_tier = |w: &WorkingChain| -> u32 {
-        if w.wall_index % 2 == 0 || w.pts.is_empty() || even_wall_pts.is_empty() {
-            return 1u32;
-        }
-        let sample_pt = &w.pts[w.pts.len() / 2];
-        let mut best_dist_sq = f32::MAX;
-        let mut nearest_even: Option<(Vec3, f32)> = None;
-        for &(epos, eh) in &even_wall_pts {
-            let dsq = (epos - sample_pt.pos_bed).length_squared();
-            if dsq < best_dist_sq {
-                best_dist_sq = dsq;
-                nearest_even = Some((epos, eh));
-            }
-        }
-        let Some((epos, eh)) = nearest_even else {
-            return 1u32;
-        };
-        let h_ref = eh.max(0.02);
-        let r_h = sample_pt.height_mm / h_ref;
-        let noz = sample_pt.nozzle_bed.try_normalize().unwrap_or(Vec3::Z);
-        let delta_z_noz = (sample_pt.pos_bed - epos).dot(noz);
-        if r_h < 0.72 && delta_z_noz < -0.22 * h_ref {
-            0u32 // First-layer half-height starter pass (-0.5 * h_0)
-        } else if delta_z_noz > 0.28 * h_ref || r_h < 0.72 {
-            2u32 // Raised +0.5 * h_k brick pass (or top-layer 0.5 * h closing cap pass)
-        } else {
-            1u32 // Unshifted overhang inner wall or wave-overhang anchor contour
-        }
-    };
-
-    let wall_rank = |w: &WorkingChain| -> u32 {
-        let base_rank = match wall_order {
-            WallPrintOrder::OutsideIn => w.wall_index,
-            WallPrintOrder::InnerOuterInner => {
-                // [n..=2, 0, 1]: print inner walls >= 2 from inside out, then outer wall 0, then backing wall 1
-                if w.wall_index >= 2 {
-                    max_wall_idx - w.wall_index
-                } else if w.wall_index == 0 {
-                    max_wall_idx
-                } else {
-                    max_wall_idx + 1
-                }
-            }
-        };
-        let tier = wall_tier(w);
-        tier * 1024 + base_rank
-    };
-    walls.sort_by_key(|w| wall_rank(w));
-
-    let weighted_dist_sq = |a: Vec3, b: Vec3| -> f32 {
-        let d = b - a;
-        d.x * d.x + d.y * d.y + (z_penalty * d.z) * (z_penalty * d.z)
-    };
-
     let mut ordered: Vec<WorkingChain> = Vec::with_capacity(
         supports.len() + walls.len() + wave_overhangs.len() + bridges.len() + infills.len(),
     );
     let mut curr_pos = start_pos_bed;
 
-    // 0. Print Support Base before Support Interface on each band so overhanging
-    //    interfaces, walls, wave overhangs, and bridges have their support foundation in place,
-    //    and group by `filament_slot` within each tier to avoid unnecessary toolchanges.
-    let mut used_supports = vec![false; supports.len()];
-    for _ in 0..supports.len() {
-        let min_sup_tier = supports
-            .iter()
-            .enumerate()
-            .filter(|(i, sp)| !used_supports[*i] && !sp.pts.is_empty())
-            .map(|(_, sp)| {
-                let is_iface = u16::from(sp.base_kind == PlannedMoveKind::SupportInterface);
-                (is_iface << 8) | (sp.filament_slot as u16)
-            })
-            .min()
-            .unwrap_or(0);
-        let mut best_i = 0usize;
-        let mut best_d = f32::MAX;
-        for (i, sp) in supports.iter().enumerate() {
-            if used_supports[i] || sp.pts.is_empty() {
+    // 0. Print Support Base before Support Interface on each band, grouped by `(is_iface, filament_slot)`.
+    if !supports.is_empty() {
+        let mut sup_buckets: std::collections::BTreeMap<u16, Vec<WorkingChain>> =
+            std::collections::BTreeMap::new();
+        for sp in supports {
+            if sp.pts.is_empty() {
                 continue;
             }
-            let tier = (u16::from(sp.base_kind == PlannedMoveKind::SupportInterface) << 8)
+            let key = (u16::from(sp.base_kind == PlannedMoveKind::SupportInterface) << 8)
                 | (sp.filament_slot as u16);
-            if tier != min_sup_tier {
-                continue;
-            }
-            let d = weighted_dist_sq(curr_pos, sp.pts.first().unwrap().pos_bed)
-                .min(weighted_dist_sq(curr_pos, sp.pts.last().unwrap().pos_bed));
-            if d < best_d {
-                best_d = d;
-                best_i = i;
-            }
+            sup_buckets.entry(key).or_default().push(sp);
         }
-        used_supports[best_i] = true;
-        let mut chosen = supports[best_i].clone();
-        orient_chain_for_minimal_travel(&mut chosen, curr_pos, z_penalty);
-        curr_pos = chosen.pts.last().unwrap().pos_bed;
-        ordered.push(chosen);
+        for (_, grp) in sup_buckets {
+            curr_pos = greedy_order_chains_in_tier(grp, curr_pos, z_penalty, &mut ordered);
+        }
     }
 
-    // 1. Group supported walls by rank and greedily pick nearest within each rank
-    let mut used_walls = vec![false; walls.len()];
-    for _ in 0..walls.len() {
-        let min_remaining_rank = walls
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !used_walls[*i])
-            .map(|(_, w)| wall_rank(w))
-            .min()
-            .unwrap_or(0);
+    // 1. Group supported walls by precomputed `wall_rank` (evaluating `wall_tier` at most once per odd wall!)
+    if !walls.is_empty() {
+        let max_wall_idx = walls.iter().map(|w| w.wall_index).max().unwrap_or(0);
+        let any_odd_wall = walls.iter().any(|w| w.wall_index % 2 == 1);
+        let even_wall_pts: Vec<(Vec3, f32)> = if any_odd_wall {
+            let total_even_pts: usize = walls
+                .iter()
+                .filter(|w| w.wall_index % 2 == 0)
+                .map(|w| w.pts.len())
+                .sum();
+            let stride = (total_even_pts / 192).max(1);
+            let mut pts = Vec::with_capacity(total_even_pts.min(256));
+            let mut k = 0usize;
+            for ew in &walls {
+                if ew.wall_index % 2 == 0 {
+                    for ept in &ew.pts {
+                        if k % stride == 0 {
+                            pts.push((ept.pos_bed, ept.height_mm));
+                        }
+                        k += 1;
+                    }
+                }
+            }
+            pts
+        } else {
+            Vec::new()
+        };
 
-        let mut best_i = 0usize;
-        let mut best_d = f32::MAX;
-        for (i, w) in walls.iter().enumerate() {
-            if used_walls[i] || wall_rank(w) != min_remaining_rank {
+        let compute_wall_rank = |w: &WorkingChain| -> u32 {
+            let base_rank = match wall_order {
+                WallPrintOrder::OutsideIn => w.wall_index,
+                WallPrintOrder::InnerOuterInner => {
+                    if w.wall_index >= 2 {
+                        max_wall_idx - w.wall_index
+                    } else if w.wall_index == 0 {
+                        max_wall_idx
+                    } else {
+                        max_wall_idx + 1
+                    }
+                }
+            };
+            let tier = if w.wall_index % 2 == 0 || w.pts.is_empty() || even_wall_pts.is_empty() {
+                1u32
+            } else {
+                let sample_pt = &w.pts[w.pts.len() / 2];
+                let mut best_dist_sq = f32::MAX;
+                let mut nearest_even: Option<(Vec3, f32)> = None;
+                for &(epos, eh) in &even_wall_pts {
+                    let dsq = (epos - sample_pt.pos_bed).length_squared();
+                    if dsq < best_dist_sq {
+                        best_dist_sq = dsq;
+                        nearest_even = Some((epos, eh));
+                    }
+                }
+                if let Some((epos, eh)) = nearest_even {
+                    let h_ref = eh.max(0.02);
+                    let r_h = sample_pt.height_mm / h_ref;
+                    let noz = sample_pt.nozzle_bed.try_normalize().unwrap_or(Vec3::Z);
+                    let delta_z_noz = (sample_pt.pos_bed - epos).dot(noz);
+                    if r_h < 0.72 && delta_z_noz < -0.22 * h_ref {
+                        0u32
+                    } else if delta_z_noz > 0.28 * h_ref || r_h < 0.72 {
+                        2u32
+                    } else {
+                        1u32
+                    }
+                } else {
+                    1u32
+                }
+            };
+            tier * 1024 + base_rank
+        };
+
+        let mut wall_buckets: std::collections::BTreeMap<u32, Vec<WorkingChain>> =
+            std::collections::BTreeMap::new();
+        for w in walls {
+            if w.pts.is_empty() {
                 continue;
             }
-            let d = if w.is_closed {
-                w.pts
-                    .iter()
-                    .map(|pt| weighted_dist_sq(curr_pos, pt.pos_bed))
-                    .fold(f32::MAX, f32::min)
-            } else {
-                weighted_dist_sq(curr_pos, w.pts.first().unwrap().pos_bed)
-                    .min(weighted_dist_sq(curr_pos, w.pts.last().unwrap().pos_bed))
-            };
-            if d < best_d {
-                best_d = d;
-                best_i = i;
-            }
+            let r = compute_wall_rank(&w);
+            wall_buckets.entry(r).or_default().push(w);
         }
-        used_walls[best_i] = true;
-        let mut chosen = walls[best_i].clone();
-        orient_chain_for_minimal_travel(&mut chosen, curr_pos, z_penalty);
-        curr_pos = if chosen.is_closed {
-            chosen.pts.first().unwrap().pos_bed
-        } else {
-            chosen.pts.last().unwrap().pos_bed
-        };
-        ordered.push(chosen);
+        for (_, grp) in wall_buckets {
+            curr_pos = greedy_order_chains_in_tier(grp, curr_pos, z_penalty, &mut ordered);
+        }
     }
 
-    // 2. Order Wave Overhangs strictly inside-out (`wall_index = 1, 2, ...`) so each pass
-    //    prints in continuous contact with the preceding supported or wave extrusion.
-    wave_overhangs.sort_by_key(|w| w.wall_index);
-    let mut used_waves = vec![false; wave_overhangs.len()];
-    for _ in 0..wave_overhangs.len() {
-        let min_wave_idx = wave_overhangs
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !used_waves[*i])
-            .map(|(_, w)| w.wall_index)
-            .min()
-            .unwrap_or(0);
-
-        let mut best_i = 0usize;
-        let mut best_d = f32::MAX;
-        for (i, w) in wave_overhangs.iter().enumerate() {
-            if used_waves[i] || w.wall_index != min_wave_idx || w.pts.is_empty() {
+    // 2. Order Wave Overhangs strictly inside-out (`wall_index = 1, 2, ...`)
+    if !wave_overhangs.is_empty() {
+        let mut wave_buckets: std::collections::BTreeMap<u32, Vec<WorkingChain>> =
+            std::collections::BTreeMap::new();
+        for w in wave_overhangs {
+            if w.pts.is_empty() {
                 continue;
             }
-            let d = if w.is_closed {
-                w.pts
-                    .iter()
-                    .map(|pt| weighted_dist_sq(curr_pos, pt.pos_bed))
-                    .fold(f32::MAX, f32::min)
-            } else {
-                weighted_dist_sq(curr_pos, w.pts.first().unwrap().pos_bed)
-                    .min(weighted_dist_sq(curr_pos, w.pts.last().unwrap().pos_bed))
-            };
-            if d < best_d {
-                best_d = d;
-                best_i = i;
-            }
+            wave_buckets.entry(w.wall_index).or_default().push(w);
         }
-        used_waves[best_i] = true;
-        let mut chosen = wave_overhangs[best_i].clone();
-        orient_chain_for_minimal_travel(&mut chosen, curr_pos, z_penalty);
-        curr_pos = if chosen.is_closed {
-            chosen.pts.first().unwrap().pos_bed
-        } else {
-            chosen.pts.last().unwrap().pos_bed
-        };
-        ordered.push(chosen);
+        for (_, grp) in wave_buckets {
+            curr_pos = greedy_order_chains_in_tier(grp, curr_pos, z_penalty, &mut ordered);
+        }
     }
 
     // 3. Order straight-line circular Bridge chains by nearest neighbor
-    let mut used_bridges = vec![false; bridges.len()];
-    for _ in 0..bridges.len() {
-        let mut best_i = 0usize;
-        let mut best_d = f32::MAX;
-        for (i, br) in bridges.iter().enumerate() {
-            if used_bridges[i] || br.pts.is_empty() {
-                continue;
-            }
-            let d = weighted_dist_sq(curr_pos, br.pts.first().unwrap().pos_bed)
-                .min(weighted_dist_sq(curr_pos, br.pts.last().unwrap().pos_bed));
-            if d < best_d {
-                best_d = d;
-                best_i = i;
-            }
-        }
-        used_bridges[best_i] = true;
-        let mut chosen = bridges[best_i].clone();
-        orient_chain_for_minimal_travel(&mut chosen, curr_pos, z_penalty);
-        curr_pos = chosen.pts.last().unwrap().pos_bed;
-        ordered.push(chosen);
+    if !bridges.is_empty() {
+        curr_pos = greedy_order_chains_in_tier(bridges, curr_pos, z_penalty, &mut ordered);
     }
 
     // 4. Greedily order remaining infill & gap-fill chains
-    let mut used_infill = vec![false; infills.len()];
-    for _ in 0..infills.len() {
-        let mut best_i = 0usize;
-        let mut best_d = f32::MAX;
-        for (i, inf) in infills.iter().enumerate() {
-            if used_infill[i] || inf.pts.is_empty() {
-                continue;
-            }
-            let d = if inf.is_closed {
-                weighted_dist_sq(curr_pos, inf.pts.first().unwrap().pos_bed)
-            } else {
-                weighted_dist_sq(curr_pos, inf.pts.first().unwrap().pos_bed)
-                    .min(weighted_dist_sq(curr_pos, inf.pts.last().unwrap().pos_bed))
-            };
-            if d < best_d {
-                best_d = d;
-                best_i = i;
-            }
-        }
-        used_infill[best_i] = true;
-        let mut chosen = infills[best_i].clone();
-        orient_chain_for_minimal_travel(&mut chosen, curr_pos, z_penalty);
-        curr_pos = if chosen.is_closed {
-            chosen.pts.first().unwrap().pos_bed
-        } else {
-            chosen.pts.last().unwrap().pos_bed
-        };
-        ordered.push(chosen);
+    if !infills.is_empty() {
+        curr_pos = greedy_order_chains_in_tier(infills, curr_pos, z_penalty, &mut ordered);
     }
 
     (ordered, curr_pos)
@@ -1379,7 +1431,7 @@ fn sample_closed_loop_at_arc_length(pts: &[WorkingVertex], s_target: f32) -> Wor
 ///   explicit loop closure + seam gap (`apply_seam_gap`) + forward wipe (`apply_wipe_moves`).
 /// - **Open paths (`is_closed == false`)**: Pre-retract taper (`apply_pre_retract_taper`) +
 ///   **backward** wipe retracing the end of the path so the nozzle never wipes outside the boundary!
-fn finalize_chain_seam_and_wipe(chain: &WorkingChain, cfg: &GcodeProcessConfig) -> Vec<WorkingVertex> {
+fn finalize_chain_seam_and_wipe(chain: &mut WorkingChain, cfg: &GcodeProcessConfig) -> Vec<WorkingVertex> {
     if chain.pts.len() < 2 {
         return Vec::new();
     }
@@ -1466,8 +1518,14 @@ fn finalize_chain_seam_and_wipe(chain: &WorkingChain, cfg: &GcodeProcessConfig) 
 
     // 2. Closed loop without scarf joint: explicit closure + optional seam gap + forward wipe
     if chain.is_closed {
-        let mut out = chain.pts.clone();
-        let mut close_pt = chain.pts[0].clone();
+        let w_v_opt = if cfg.wipe_length_mm > 1.0e-3 && chain.pts.len() >= 2 {
+            Some(sample_closed_loop_at_arc_length(&chain.pts, cfg.wipe_length_mm))
+        } else {
+            None
+        };
+        let mut out = std::mem::take(&mut chain.pts);
+        out.reserve(3);
+        let mut close_pt = out[0].clone();
         if cfg.seam_gap_mm > 1.0e-3 && total_len > 4.0 * cfg.seam_gap_mm {
             let last_pos = out.last().unwrap().pos_bed;
             let close_vec = close_pt.pos_bed - last_pos;
@@ -1484,7 +1542,7 @@ fn finalize_chain_seam_and_wipe(chain: &WorkingChain, cfg: &GcodeProcessConfig) 
         out.push(close_pt);
 
         // Forward wipe along p0 -> p1 on closed loop (never descending below close_pt)
-        if cfg.wipe_length_mm > 1.0e-3 && chain.pts.len() >= 2 {
+        if let Some(mut w_v) = w_v_opt {
             let p_close = out.last().unwrap().pos_bed;
             let n_close = out
                 .last()
@@ -1492,7 +1550,6 @@ fn finalize_chain_seam_and_wipe(chain: &WorkingChain, cfg: &GcodeProcessConfig) 
                 .nozzle_bed
                 .try_normalize()
                 .unwrap_or(Vec3::Z);
-            let mut w_v = sample_closed_loop_at_arc_length(&chain.pts, cfg.wipe_length_mm);
             let down_comp = (w_v.pos_bed - p_close).dot(n_close).min(0.0);
             w_v.pos_bed -= n_close * down_comp;
             w_v.flow_rate_mult = 0.0;
@@ -1505,7 +1562,7 @@ fn finalize_chain_seam_and_wipe(chain: &WorkingChain, cfg: &GcodeProcessConfig) 
     // 3. Open path (`!chain.is_closed`, including open non-planar walls and infill):
     //    Apply optional pre-retract taper near the tail, and wipe BACKWARD along the tail
     //    so the nozzle never protrudes past the open endpoint!
-    let mut out = chain.pts.clone();
+    let mut out = std::mem::take(&mut chain.pts);
     if !chain.base_kind.is_wall()
         && cfg.pre_retract_taper_mm > 1.0e-3
         && total_len >= 2.0 * cfg.pre_retract_taper_mm
@@ -1548,6 +1605,23 @@ fn subdivide_long_segments(pts: Vec<WorkingVertex>) -> Vec<WorkingVertex> {
     if pts.len() < 2 {
         return pts;
     }
+    // cos(2.0 deg) == 0.99939083: check dot product before invoking `acos()`
+    const COS_2_DEG: f32 = 0.999_390_83;
+    let any_needs_subdiv = pts.windows(2).any(|w| {
+        let a = &w[0];
+        let b = &w[1];
+        let len_sq = (b.pos_bed - a.pos_bed).length_squared();
+        if len_sq <= 0.36 {
+            return false;
+        }
+        let n_dot = a.nozzle_bed.dot(b.nozzle_bed).clamp(-1.0, 1.0);
+        let h_diff = (b.height_mm - a.height_mm).abs();
+        (len_sq > 6.25 && (len_sq > 36.0 || n_dot < 0.998 || h_diff > 0.02)) || n_dot < COS_2_DEG
+    });
+    if !any_needs_subdiv {
+        return pts;
+    }
+
     let mut out: Vec<WorkingVertex> = Vec::with_capacity(pts.len() + 8);
     out.push(pts[0].clone());
 
@@ -1557,11 +1631,15 @@ fn subdivide_long_segments(pts: Vec<WorkingVertex>) -> Vec<WorkingVertex> {
         let len = (b.pos_bed - a.pos_bed).length();
         let n_dot = a.nozzle_bed.dot(b.nozzle_bed).clamp(-1.0, 1.0);
         let h_diff = (b.height_mm - a.height_mm).abs();
-        let angle_deg = n_dot.acos().to_degrees();
 
         let needs_subdiv = (len > 2.5 && (len > 6.0 || n_dot < 0.998 || h_diff > 0.02))
-            || (len > 0.6 && angle_deg > 2.0);
+            || (len > 0.6 && n_dot < COS_2_DEG);
         if needs_subdiv {
+            let angle_deg = if n_dot < 0.999_999 {
+                n_dot.acos().to_degrees()
+            } else {
+                0.0
+            };
             let steps_len = (len / 2.5).ceil() as usize;
             let steps_ang = (angle_deg / 2.0).ceil() as usize;
             let steps = steps_len.max(steps_ang).clamp(2, 16);
@@ -1608,6 +1686,18 @@ pub(crate) fn assign_five_axis_bc_postures_and_rotary_limits(
         return;
     }
     let is_five_axis = machine.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC;
+    if !is_five_axis && max_tool_tilt_deg <= 1.0e-4 {
+        let b_const = *curr_b_deg;
+        let c_const = *curr_c_deg;
+        for seg in segments.iter_mut() {
+            seg.b0_deg = b_const;
+            seg.c0_deg = c_const;
+            seg.b1_deg = b_const;
+            seg.c1_deg = c_const;
+        }
+        return;
+    }
+
     let max_b_spd = machine.max_b_speed_deg_s.max(1.0);
     let max_c_spd = machine.max_c_speed_deg_s.max(1.0);
     let max_b_acc = machine.b_accel_deg_s2.max(10.0);
@@ -1617,7 +1707,8 @@ pub(crate) fn assign_five_axis_bc_postures_and_rotary_limits(
         let mut solved_by_lookahead = false;
         // Zenith azimuth lookahead pre-positioning during non-extruding Travel moves:
         // If we are on a Travel move and the nozzle is vertical (B ~ 0), look ahead to the
-        // first tilted extruding segment and pre-align C during the Travel move.
+        // first tilted extruding segment in the upcoming chain (up to 8 extruding segments,
+        // stopping before the next Travel move) and pre-align C during the Travel move.
         if segments[i].kind == PlannedMoveKind::Travel {
             let (b_start_check, _, _) = machine.nozzle_axis_to_bc_deg(
                 segments[i].nozzle_bed_0,
@@ -1626,8 +1717,13 @@ pub(crate) fn assign_five_axis_bc_postures_and_rotary_limits(
                 max_tool_tilt_deg,
             );
             if b_start_check.abs() < 0.25 {
+                let mut checked_extruding = 0usize;
                 for future in &segments[(i + 1)..n] {
+                    if future.kind == PlannedMoveKind::Travel {
+                        break;
+                    }
                     if future.kind.is_extruding() {
+                        checked_extruding += 1;
                         let (b_fut0, c_fut0, _) = machine.nozzle_axis_to_bc_deg(
                             future.nozzle_bed_0,
                             *curr_b_deg,
@@ -1676,6 +1772,9 @@ pub(crate) fn assign_five_axis_bc_postures_and_rotary_limits(
                             *curr_b_deg = b1;
                             *curr_c_deg = c1;
                             solved_by_lookahead = true;
+                            break;
+                        }
+                        if checked_extruding >= 8 {
                             break;
                         }
                     }
@@ -4226,6 +4325,29 @@ pub fn plan_and_emit_gcode_for_object(
     obj_world_tf: Transform,
     config: &SlicerConfig,
 ) -> PlannedGcodeResult {
+    plan_and_emit_gcode_for_object_with_progress(
+        object_name,
+        object_id,
+        raw_toolpaths,
+        obj_world_tf,
+        config,
+        None,
+    )
+}
+
+/// Executes the complete Toolpath-to-Gcode planning & emission pipeline for a named object,
+/// reporting live fraction (`0.0..=1.0`) and stage description to `progress_cb` when provided.
+pub fn plan_and_emit_gcode_for_object_with_progress(
+    object_name: &str,
+    object_id: u64,
+    raw_toolpaths: &ObjectToolpathsResult,
+    obj_world_tf: Transform,
+    config: &SlicerConfig,
+    progress_cb: Option<&(dyn Fn(f32, &str) + Send + Sync)>,
+) -> PlannedGcodeResult {
+    if let Some(cb) = progress_cb {
+        cb(0.02, "Preparing non-planar toolpath chains...");
+    }
     let mut gcfg = config.gcode.clone();
     gcfg.sanitize();
     let mut mcfg = config.machine.clone();
@@ -4358,7 +4480,87 @@ pub fn plan_and_emit_gcode_for_object(
         FluidDynamicsModel::from_config(&support_iface_tool_gcfg, support_iface_nozzle_temp_c);
     let min_retract_travel_mm = gcfg.effective_min_travel_for_retract();
 
-    let mut planned_layers: Vec<PlannedLayerGcode> = Vec::with_capacity(raw_toolpaths.layers.len());
+    // Precompute per-tool `(tool_id, nozzle_diam_mm, temp_c, max_tilt_deg, GcodeProcessConfig, FluidDynamicsModel)`
+    // once outside all loops so neither `prep_single_layer`, the per-chain loop, Step 6, nor the G-code
+    // emission loop ever calls `GcodeProcessConfig::clone()` or `FluidDynamicsModel::from_config()` per chain/segment!
+    struct PrecomputedToolModel {
+        id: u32,
+        nozzle_diam_mm: f32,
+        temp_c: f32,
+        max_tilt_deg: f32,
+        gcfg: GcodeProcessConfig,
+        fluid: FluidDynamicsModel,
+    }
+    let default_tool_model = PrecomputedToolModel {
+        id: tool_id,
+        nozzle_diam_mm,
+        temp_c: nozzle_temp_c,
+        max_tilt_deg: max_tool_tilt_deg,
+        gcfg: active_tool_gcfg.clone(),
+        fluid: fluid.clone(),
+    };
+    let support_tool_model = PrecomputedToolModel {
+        id: support_tool_id,
+        nozzle_diam_mm: support_nozzle_diam_mm,
+        temp_c: support_nozzle_temp_c,
+        max_tilt_deg: support_max_tool_tilt_deg,
+        gcfg: support_tool_gcfg.clone(),
+        fluid: support_fluid.clone(),
+    };
+    let support_iface_tool_model = PrecomputedToolModel {
+        id: support_iface_tool_id,
+        nozzle_diam_mm: support_iface_nozzle_diam_mm,
+        temp_c: support_iface_nozzle_temp_c,
+        max_tilt_deg: support_iface_max_tool_tilt_deg,
+        gcfg: support_iface_tool_gcfg.clone(),
+        fluid: support_iface_fluid.clone(),
+    };
+    let per_tool_models: Vec<PrecomputedToolModel> = config
+        .tools
+        .iter()
+        .map(|t| {
+            let t_gcfg = tool_gcfg_for(Some(t));
+            let t_fluid = FluidDynamicsModel::from_config(&t_gcfg, t.temperature_celsius);
+            let t_max_tilt = if t.has_rotational_axes {
+                t.max_angle_from_bed_normal_deg
+            } else if is_five_axis_bc {
+                max_bs_bound
+            } else {
+                0.0
+            };
+            PrecomputedToolModel {
+                id: t.id,
+                nozzle_diam_mm: t.nozzle_diameter_mm.max(0.10),
+                temp_c: t.temperature_celsius,
+                max_tilt_deg: t_max_tilt,
+                gcfg: t_gcfg,
+                fluid: t_fluid,
+            }
+        })
+        .collect();
+    let lookup_tool_by_id = |tid: u32, is_support: bool| -> &PrecomputedToolModel {
+        per_tool_models
+            .iter()
+            .find(|m| m.id == tid)
+            .unwrap_or(if is_support {
+                &support_tool_model
+            } else {
+                &default_tool_model
+            })
+    };
+    let lookup_tool_for_slot = |slot: u8, base_kind: PlannedMoveKind| -> &PrecomputedToolModel {
+        match base_kind {
+            PlannedMoveKind::Support => &support_tool_model,
+            PlannedMoveKind::SupportInterface => &support_iface_tool_model,
+            _ => config
+                .tool_for_filament_slot(slot)
+                .and_then(|t| per_tool_models.iter().find(|m| m.id == t.id))
+                .unwrap_or(&default_tool_model),
+        }
+    };
+
+    let num_layers = raw_toolpaths.layers.len();
+    let mut planned_layers: Vec<PlannedLayerGcode> = Vec::with_capacity(num_layers);
     let mut curr_nozzle_bed: Option<Vec3> = None;
     let mut curr_nozzle_axis_bed = Vec3::from_array(config.machine.nozzle_axis_bed)
         .try_normalize()
@@ -4371,153 +4573,196 @@ pub fn plan_and_emit_gcode_for_object(
     let mut bbox_min = Vec3::splat(f32::MAX);
     let mut bbox_max = Vec3::splat(f32::MIN);
 
-    for (layer_ord, raw_layer) in raw_toolpaths.layers.iter().enumerate() {
-        let is_first_layer = layer_ord == 0;
-
-        // 1. Convert raw FFI paths into bed-space `WorkingChain`s, simplify walls, and compensate nozzle geometry
-        let mut chains: Vec<WorkingChain> = Vec::with_capacity(raw_layer.paths.len());
-        for raw_path in &raw_layer.paths {
-            if raw_path.points.len() < 2 {
-                continue;
-            }
-            let base_kind = PlannedMoveKind::from_feature_kind(raw_path.feature_kind);
-            let pts: Vec<WorkingVertex> = raw_path
-                .points
-                .iter()
-                .map(|pt| {
-                    let p_local = Vec3::new(pt.x, pt.y, pt.z);
-                    let n_local = Vec3::new(pt.nx, pt.ny, pt.nz)
-                        .try_normalize()
-                        .unwrap_or(Vec3::Z);
-                    let p_bed = obj_world_tf.transform_point(p_local) + bed_origin_offset;
-                    let n_bed = (obj_world_tf.rotation * n_local)
-                        .try_normalize()
-                        .unwrap_or(up_bed);
-                    WorkingVertex {
-                        pos_bed: p_bed,
-                        nozzle_bed: n_bed,
-                        width_mm: pt.width_mm.max(0.08),
-                        height_mm: pt.height_mm.max(0.02),
-                        flow_rate_mult: 1.0,
-                        kind_override: None,
-                        tool_iso_angle_deg: if pt.tool_iso_angle_deg.is_finite() {
-                            pt.tool_iso_angle_deg.max(0.0)
-                        } else {
-                            0.0
-                        },
-                        uses_surface_normal: pt.uses_surface_normal,
-                    }
-                })
-                .collect();
-
-            let mut resolved_slot = raw_path.filament_slot;
-            match base_kind {
-                PlannedMoveKind::Support => {
-                    if config.slicing.support_tool_index.is_some() {
-                        resolved_slot = crate::color_optics::encode_direct_tool_slot(
-                            config.support_tool_index_resolved(),
-                        );
-                    }
+    // 1. Convert raw FFI paths into bed-space `WorkingChain`s, simplify walls, smooth nozzle
+    //    orientations, compensate wall geometry, AND order layer chains (`order_layer_chains`)
+    //    in parallel across worker threads!
+    let prep_single_layer =
+        |layer_ord: usize, raw_layer: &crate::bridge::ffi::LayerToolpaths| -> Vec<WorkingChain> {
+            let is_first_layer = layer_ord == 0;
+            let mut chains: Vec<WorkingChain> = Vec::with_capacity(raw_layer.paths.len());
+            for raw_path in &raw_layer.paths {
+                if raw_path.points.len() < 2 {
+                    continue;
                 }
-                PlannedMoveKind::SupportInterface => {
-                    if config.slicing.support_interface_tool_index.is_some()
-                        || config.slicing.support_tool_index.is_some()
-                    {
-                        resolved_slot = crate::color_optics::encode_direct_tool_slot(
-                            config.support_interface_tool_index_resolved(),
-                        );
-                    }
-                }
-                PlannedMoveKind::SparseInfill => match config.slicing.infill_filament_mode {
-                    InfillFilamentMode::SingleTool(t_idx) => {
-                        resolved_slot = crate::color_optics::encode_direct_tool_slot(
-                            t_idx.min(config.tools.len().saturating_sub(1)),
-                        );
-                    }
-                    InfillFilamentMode::FilamentSlot(s_idx) => {
-                        if crate::color_optics::decode_direct_tool_slot(resolved_slot).is_none() {
-                            resolved_slot = s_idx;
+                let base_kind = PlannedMoveKind::from_feature_kind(raw_path.feature_kind);
+                let pts: Vec<WorkingVertex> = raw_path
+                    .points
+                    .iter()
+                    .map(|pt| {
+                        let p_local = Vec3::new(pt.x, pt.y, pt.z);
+                        let n_local = Vec3::new(pt.nx, pt.ny, pt.nz)
+                            .try_normalize()
+                            .unwrap_or(Vec3::Z);
+                        let p_bed = obj_world_tf.transform_point(p_local) + bed_origin_offset;
+                        let n_bed = (obj_world_tf.rotation * n_local)
+                            .try_normalize()
+                            .unwrap_or(up_bed);
+                        WorkingVertex {
+                            pos_bed: p_bed,
+                            nozzle_bed: n_bed,
+                            width_mm: pt.width_mm.max(0.08),
+                            height_mm: pt.height_mm.max(0.02),
+                            flow_rate_mult: 1.0,
+                            kind_override: None,
+                            tool_iso_angle_deg: if pt.tool_iso_angle_deg.is_finite() {
+                                pt.tool_iso_angle_deg.max(0.0)
+                            } else {
+                                0.0
+                            },
+                            uses_surface_normal: pt.uses_surface_normal,
+                        }
+                    })
+                    .collect();
+
+                let mut resolved_slot = raw_path.filament_slot;
+                match base_kind {
+                    PlannedMoveKind::Support => {
+                        if config.slicing.support_tool_index.is_some() {
+                            resolved_slot = crate::color_optics::encode_direct_tool_slot(
+                                config.support_tool_index_resolved(),
+                            );
                         }
                     }
-                    InfillFilamentMode::FollowObject | InfillFilamentMode::AutoPurgeIntoInfill => {}
-                },
-                _ => {}
-            }
-
-            let mut wc = WorkingChain {
-                pts,
-                base_kind,
-                wall_index: raw_path.wall_index,
-                is_closed: raw_path.is_closed,
-                filament_slot: resolved_slot,
-            };
-            let slot_tool = config.tool_for_filament_slot(wc.filament_slot);
-            let slot_nozzle_diam_mm = slot_tool
-                .map(|t| t.nozzle_diameter_mm.max(0.1))
-                .unwrap_or(nozzle_diam_mm);
-            let slot_nozzle_temp_c = slot_tool
-                .map(|t| t.temperature_celsius)
-                .unwrap_or(nozzle_temp_c);
-            let slot_max_tilt_deg = slot_tool
-                .map(|t| {
-                    if t.has_rotational_axes {
-                        t.max_angle_from_bed_normal_deg
-                    } else if is_five_axis_bc {
-                        max_bs_bound
-                    } else {
-                        0.0
+                    PlannedMoveKind::SupportInterface => {
+                        if config.slicing.support_interface_tool_index.is_some()
+                            || config.slicing.support_tool_index.is_some()
+                        {
+                            resolved_slot = crate::color_optics::encode_direct_tool_slot(
+                                config.support_interface_tool_index_resolved(),
+                            );
+                        }
                     }
-                })
-                .unwrap_or(max_tool_tilt_deg);
-            let slot_tool_gcfg = tool_gcfg_for(slot_tool);
-            let slot_fluid = FluidDynamicsModel::from_config(&slot_tool_gcfg, slot_nozzle_temp_c);
-            let chain_nozzle_diam = match base_kind {
-                PlannedMoveKind::Support => support_nozzle_diam_mm,
-                PlannedMoveKind::SupportInterface => support_iface_nozzle_diam_mm,
-                _ => slot_nozzle_diam_mm,
-            };
-            let chain_max_tilt_deg = match base_kind {
-                PlannedMoveKind::Support => support_max_tool_tilt_deg,
-                PlannedMoveKind::SupportInterface => support_iface_max_tool_tilt_deg,
-                _ => slot_max_tilt_deg,
-            };
-            let chain_fluid = match base_kind {
-                PlannedMoveKind::Support => &support_fluid,
-                PlannedMoveKind::SupportInterface => &support_iface_fluid,
-                _ => &slot_fluid,
-            };
-            simplify_working_chain(&mut wc, 0.04 * chain_nozzle_diam);
-            smooth_chain_nozzle_orientations(
-                &mut wc,
-                mcfg.orientation_smoothing_window_mm,
-                chain_max_tilt_deg,
-                up_bed,
-            );
-            let nom_spd = if is_first_layer {
-                gcfg.first_layer_speed_mms
-            } else {
-                gcfg.outer_wall_speed_mms
-            };
-            compensate_wall_geometry(
-                &mut wc,
-                chain_nozzle_diam,
-                config.slicing.outer_wall_width.target_mm,
-                up_bed,
-                chain_fluid,
-                nom_spd,
-                gcfg.enable_flat_nozzle_comp,
-            );
-            chains.push(wc);
-        }
+                    PlannedMoveKind::SparseInfill => match config.slicing.infill_filament_mode {
+                        InfillFilamentMode::SingleTool(t_idx) => {
+                            resolved_slot = crate::color_optics::encode_direct_tool_slot(
+                                t_idx.min(config.tools.len().saturating_sub(1)),
+                            );
+                        }
+                        InfillFilamentMode::FilamentSlot(s_idx) => {
+                            if crate::color_optics::decode_direct_tool_slot(resolved_slot).is_none()
+                            {
+                                resolved_slot = s_idx;
+                            }
+                        }
+                        InfillFilamentMode::FollowObject
+                        | InfillFilamentMode::AutoPurgeIntoInfill => {}
+                    },
+                    _ => {}
+                }
 
-            let start_ref = curr_nozzle_bed.unwrap_or(bed_origin_offset);
-        let mut ordered_chains = order_layer_chains(
-            chains,
-            gcfg.wall_print_order,
-            start_ref,
-            gcfg.z_travel_penalty,
-            up_bed,
-        );
+                let mut wc = WorkingChain {
+                    pts,
+                    base_kind,
+                    wall_index: raw_path.wall_index,
+                    is_closed: raw_path.is_closed,
+                    filament_slot: resolved_slot,
+                };
+                let tm = lookup_tool_for_slot(wc.filament_slot, base_kind);
+                simplify_working_chain(&mut wc, 0.04 * tm.nozzle_diam_mm);
+                smooth_chain_nozzle_orientations(
+                    &mut wc,
+                    mcfg.orientation_smoothing_window_mm,
+                    tm.max_tilt_deg,
+                    up_bed,
+                );
+                let nom_spd = if is_first_layer {
+                    gcfg.first_layer_speed_mms
+                } else {
+                    gcfg.outer_wall_speed_mms
+                };
+                compensate_wall_geometry(
+                    &mut wc,
+                    tm.nozzle_diam_mm,
+                    config.slicing.outer_wall_width.target_mm,
+                    up_bed,
+                    &tm.fluid,
+                    nom_spd,
+                    gcfg.enable_flat_nozzle_comp,
+                );
+                chains.push(wc);
+            }
+            let approx_start_ref = if layer_ord == 0 {
+                bed_origin_offset
+            } else {
+                raw_toolpaths
+                    .layers
+                    .get(layer_ord - 1)
+                    .and_then(|prev_l| prev_l.paths.last())
+                    .and_then(|prev_p| prev_p.points.last())
+                    .map(|pt| {
+                        obj_world_tf.transform_point(Vec3::new(pt.x, pt.y, pt.z))
+                            + bed_origin_offset
+                    })
+                    .unwrap_or(bed_origin_offset)
+            };
+            order_layer_chains(
+                chains,
+                gcfg.wall_print_order,
+                approx_start_ref,
+                gcfg.z_travel_penalty,
+                up_bed,
+            )
+        };
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(num_layers.max(1));
+    let mut prepared_layer_chains: Vec<Vec<WorkingChain>> = if num_threads <= 1 || num_layers < 8 {
+        raw_toolpaths
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(idx, l)| prep_single_layer(idx, l))
+            .collect()
+    } else {
+        let chunk_size = num_layers.div_ceil(num_threads);
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(num_threads);
+            for (chunk_idx, chunk) in raw_toolpaths.layers.chunks(chunk_size).enumerate() {
+                let base_idx = chunk_idx * chunk_size;
+                let prep_ref = &prep_single_layer;
+                handles.push(s.spawn(move || {
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(rel, l)| prep_ref(base_idx + rel, l))
+                        .collect::<Vec<_>>()
+                }));
+            }
+            let mut all = Vec::with_capacity(num_layers);
+            for h in handles {
+                if let Ok(mut part) = h.join() {
+                    all.append(&mut part);
+                }
+            }
+            all
+        })
+    };
+
+    if let Some(cb) = progress_cb {
+        cb(0.22, &format!("Ordering & planning {num_layers} non-planar layers..."));
+    }
+
+    for (layer_ord, raw_layer) in raw_toolpaths.layers.iter().enumerate() {
+        let is_first_layer = layer_ord == 0;
+        if let Some(cb) = progress_cb {
+            if layer_ord % 4 == 0 || layer_ord + 1 == num_layers {
+                let frac = 0.22 + 0.42 * ((layer_ord + 1) as f32 / (num_layers.max(1) as f32));
+                cb(
+                    frac,
+                    &format!(
+                        "Planning G-code & purges (Layer {}/{num_layers})...",
+                        layer_ord + 1
+                    ),
+                );
+            }
+        }
+        let mut ordered_chains = if layer_ord < prepared_layer_chains.len() {
+            std::mem::take(&mut prepared_layer_chains[layer_ord])
+        } else {
+            Vec::new()
+        };
 
         // On Layer 0, compute the bed contact footprint and prepend outward concentric brim loops
         // if explicit brim or auto-brim is active.
@@ -4557,47 +4802,22 @@ pub fn plan_and_emit_gcode_for_object(
             &mut purge_tower,
         );
 
-        let mut layer_segments: Vec<PlannedSegment> = Vec::new();
+        let mut layer_segments: Vec<PlannedSegment> = Vec::with_capacity(ordered_chains.len() * 16);
 
         for chain in &mut ordered_chains {
             let chain_is_support = chain.base_kind.is_support();
-            let slot_tool = config.tool_for_filament_slot(chain.filament_slot);
-            let chain_tool_id = match chain.base_kind {
-                PlannedMoveKind::Support => support_tool_id,
-                PlannedMoveKind::SupportInterface => support_iface_tool_id,
-                _ => slot_tool.map(|t| t.id).unwrap_or(tool_id),
-            };
-            let chain_nozzle_diam = match chain.base_kind {
-                PlannedMoveKind::Support => support_nozzle_diam_mm,
-                PlannedMoveKind::SupportInterface => support_iface_nozzle_diam_mm,
-                _ => slot_tool
-                    .map(|t| t.nozzle_diameter_mm.max(0.1))
-                    .unwrap_or(nozzle_diam_mm),
-            };
-            let slot_tool_gcfg = tool_gcfg_for(slot_tool);
-            let slot_fluid = FluidDynamicsModel::from_config(
-                &slot_tool_gcfg,
-                slot_tool
-                    .map(|t| t.temperature_celsius)
-                    .unwrap_or(nozzle_temp_c),
-            );
-            let chain_gcfg = match chain.base_kind {
-                PlannedMoveKind::Support => &support_tool_gcfg,
-                PlannedMoveKind::SupportInterface => &support_iface_tool_gcfg,
-                _ => &slot_tool_gcfg,
-            };
-            let chain_fluid = match chain.base_kind {
-                PlannedMoveKind::Support => &support_fluid,
-                PlannedMoveKind::SupportInterface => &support_iface_fluid,
-                _ => &slot_fluid,
-            };
+            let tm = lookup_tool_for_slot(chain.filament_slot, chain.base_kind);
+            let chain_tool_id = tm.id;
+            let chain_nozzle_diam = tm.nozzle_diam_mm;
+            let chain_gcfg = &tm.gcfg;
+            let chain_fluid = &tm.fluid;
 
             let mut vertices = if matches!(
                 chain.base_kind,
                 PlannedMoveKind::Bridge | PlannedMoveKind::PurgeTower
             ) {
                 // Keep circular Bridge and PurgeTower extrusions as direct un-subdivided polylines
-                chain.pts.clone()
+                std::mem::take(&mut chain.pts)
             } else {
                 subdivide_long_segments(finalize_chain_seam_and_wipe(chain, &gcfg))
             };
@@ -4628,21 +4848,13 @@ pub fn plan_and_emit_gcode_for_object(
                     } else {
                         0.40
                     };
-                    let mut h_peak = h_prev
+                    let h_peak = h_prev
                         .max(h_next)
                         .max(height_map.max_printed_h().unwrap_or(h_prev.max(h_next)))
                         .max(corridor_obs_h.unwrap_or(h_prev.max(h_next)));
-                    let mut h_clear = (h_peak + hop_margin).max(h_prev + hop_margin).max(h_next + hop_margin);
-                    let mut p_lift = bed_basis.unproject_uvh(u_prev, v_prev, h_clear);
-                    let mut p_above = bed_basis.unproject_uvh(u_next, v_next, h_clear);
-                    if let Some(elev_obs_h) = height_map.max_corridor_obstacle_h(p_lift, p_above) {
-                        if elev_obs_h > h_peak {
-                            h_peak = elev_obs_h;
-                            h_clear = (h_peak + hop_margin).max(h_prev + hop_margin).max(h_next + hop_margin);
-                            p_lift = bed_basis.unproject_uvh(u_prev, v_prev, h_clear);
-                            p_above = bed_basis.unproject_uvh(u_next, v_next, h_clear);
-                        }
-                    }
+                    let h_clear = (h_peak + hop_margin).max(h_prev + hop_margin).max(h_next + hop_margin);
+                    let p_lift = bed_basis.unproject_uvh(u_prev, v_prev, h_clear);
+                    let p_above = bed_basis.unproject_uvh(u_next, v_next, h_clear);
 
                     // 1. Optional Hop Before Toolchange (emitted with outgoing `curr_planned_tool_id` before `T{id}`)
                     if gcfg.tool_change_hop_before {
@@ -4815,9 +5027,18 @@ pub fn plan_and_emit_gcode_for_object(
                 } else if travel_dist > 1.0e-3 {
                     let (_, _, h_prev) = bed_basis.project_uvh(prev_bed);
                     let (_, _, h_next) = bed_basis.project_uvh(chain_start_bed);
-                    let corridor_obs_h = height_map.max_corridor_obstacle_h(prev_bed, chain_start_bed);
+                    let min_endpoint_h = h_prev.min(h_next);
+                    // Only raycast the height map when `max_printed_h` could possibly exceed `min_endpoint_h - 0.15`
+                    let corridor_obs_h = if height_map
+                        .max_printed_h()
+                        .is_some_and(|max_h| max_h > min_endpoint_h - 0.15)
+                    {
+                        height_map.max_corridor_obstacle_h(prev_bed, chain_start_bed)
+                    } else {
+                        None
+                    };
                     let corridor_blocked = corridor_obs_h
-                        .is_some_and(|obs_h| obs_h > h_prev.min(h_next) - 0.15);
+                        .is_some_and(|obs_h| obs_h > min_endpoint_h - 0.15);
 
                     let needs_retract = travel_dist > min_retract_travel_mm
                         || support_boundary_crossing
@@ -4864,14 +5085,21 @@ pub fn plan_and_emit_gcode_for_object(
                         let mut p_lift = prev_bed + lift_dir * lift_dist;
                         let mut p_above = chain_start_bed + drop_dir * drop_dist;
 
-                        if let Some(elev_obs_h) = height_map.max_corridor_obstacle_h(p_lift, p_above) {
-                            if elev_obs_h > h_peak {
-                                h_peak = elev_obs_h;
-                                let h_clear = h_peak + hop_margin;
-                                lift_dist = ((h_clear - h_prev).max(hop_margin) / lift_cos).max(hop_margin);
-                                drop_dist = ((h_clear - h_next).max(hop_margin) / drop_cos).max(hop_margin);
-                                p_lift = prev_bed + lift_dir * lift_dist;
-                                p_above = chain_start_bed + drop_dir * drop_dist;
+                        // When `!corridor_blocked`, `lift_dir`/`drop_dir` may be tilted, shifting `(u, v)` slightly
+                        if !corridor_blocked
+                            && height_map
+                                .max_printed_h()
+                                .is_some_and(|max_h| max_h > h_peak)
+                        {
+                            if let Some(elev_obs_h) = height_map.max_corridor_obstacle_h(p_lift, p_above) {
+                                if elev_obs_h > h_peak {
+                                    h_peak = elev_obs_h;
+                                    let h_clear = h_peak + hop_margin;
+                                    lift_dist = ((h_clear - h_prev).max(hop_margin) / lift_cos).max(hop_margin);
+                                    drop_dist = ((h_clear - h_next).max(hop_margin) / drop_cos).max(hop_margin);
+                                    p_lift = prev_bed + lift_dir * lift_dist;
+                                    p_above = chain_start_bed + drop_dir * drop_dist;
+                                }
                             }
                         }
 
@@ -5553,26 +5781,71 @@ pub fn plan_and_emit_gcode_for_object(
             }
         }
 
-        // 4a. Apply automatic Lever-Arm & Curled-Corner Speed/Acceleration Governor before velocity lookahead
-        if let Some(ref fp) = footprint_profile {
-            apply_lever_arm_and_curl_slowdown(&mut layer_segments, layer_ord, fp, &gcfg);
-        }
-
-        // 4b. Solve 5-Axis B/C postures, rotary velocity/accel throttling, and Chained Velocity Lookahead
-        assign_five_axis_bc_postures_and_rotary_limits(
-            &mut layer_segments,
-            &mcfg,
-            max_tool_tilt_deg,
-            &mut curr_b_deg,
-            &mut curr_c_deg,
-        );
-        plan_velocity_lookahead(&mut layer_segments, &gcfg);
-
         planned_layers.push(PlannedLayerGcode {
             layer_index: raw_layer.layer_index,
             branch_id: raw_layer.branch_id,
             isovalue: raw_layer.isovalue,
             segments: layer_segments,
+        });
+    }
+
+    // 4a/4b. Run Lever-Arm & Curled-Corner Speed Governor, 5-Axis B/C postures, and Chained
+    //        Velocity Lookahead across all layers (parallelizing independent per-layer passes).
+    if let Some(cb) = progress_cb {
+        cb(0.66, "Solving kinematics & velocity lookahead...");
+    }
+    let num_planned_layers = planned_layers.len();
+    if let Some(ref fp) = footprint_profile {
+        if num_threads <= 1 || num_planned_layers < 8 {
+            for (layer_ord, layer) in planned_layers.iter_mut().enumerate() {
+                apply_lever_arm_and_curl_slowdown(&mut layer.segments, layer_ord, fp, &gcfg);
+            }
+        } else {
+            let chunk_size = num_planned_layers.div_ceil(num_threads);
+            std::thread::scope(|s| {
+                for (chunk_idx, chunk) in planned_layers.chunks_mut(chunk_size).enumerate() {
+                    let base_ord = chunk_idx * chunk_size;
+                    let gcfg_ref = &gcfg;
+                    s.spawn(move || {
+                        for (rel, layer) in chunk.iter_mut().enumerate() {
+                            apply_lever_arm_and_curl_slowdown(
+                                &mut layer.segments,
+                                base_ord + rel,
+                                fp,
+                                gcfg_ref,
+                            );
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    for layer in &mut planned_layers {
+        assign_five_axis_bc_postures_and_rotary_limits(
+            &mut layer.segments,
+            &mcfg,
+            max_tool_tilt_deg,
+            &mut curr_b_deg,
+            &mut curr_c_deg,
+        );
+    }
+
+    if num_threads <= 1 || num_planned_layers < 8 {
+        for layer in &mut planned_layers {
+            plan_velocity_lookahead(&mut layer.segments, &gcfg);
+        }
+    } else {
+        let chunk_size = num_planned_layers.div_ceil(num_threads);
+        std::thread::scope(|s| {
+            for chunk in planned_layers.chunks_mut(chunk_size) {
+                let gcfg_ref = &gcfg;
+                s.spawn(move || {
+                    for layer in chunk {
+                        plan_velocity_lookahead(&mut layer.segments, gcfg_ref);
+                    }
+                });
+            }
         });
     }
 
@@ -5672,34 +5945,18 @@ pub fn plan_and_emit_gcode_for_object(
     }
 
     // 6. Global Melt-Zone Transient Pressure Pass & Slicer-Side PA Subdivision
+    if let Some(cb) = progress_cb {
+        cb(0.74, "Solving melt-zone pressure & PA dynamics...");
+    }
     let mut pressure_tracker = MeltPressureTracker::new();
     let mut last_q_mm3s = 0.0f32;
     let mut last_pa_s = active_tool_gcfg.pa_low_flow_s;
 
     for layer in &mut planned_layers {
         for seg in &mut layer.segments {
-            let seg_tool = config.tools.iter().find(|t| t.id == seg.tool_id);
-            let seg_gcfg = if use_per_tool_filament {
-                seg_tool
-                    .map(|t| t.effective_gcode_config(&gcfg))
-                    .unwrap_or_else(|| {
-                        if seg.kind.is_support() {
-                            support_tool_gcfg.clone()
-                        } else {
-                            active_tool_gcfg.clone()
-                        }
-                    })
-            } else {
-                gcfg.clone()
-            };
-            let seg_temp_c = seg_tool.map(|t| t.temperature_celsius).unwrap_or(
-                if seg.kind.is_support() {
-                    support_nozzle_temp_c
-                } else {
-                    nozzle_temp_c
-                },
-            );
-            let seg_fluid = FluidDynamicsModel::from_config(&seg_gcfg, seg_temp_c);
+            let tm = lookup_tool_by_id(seg.tool_id, seg.kind.is_support());
+            let seg_gcfg = &tm.gcfg;
+            let seg_fluid = &tm.fluid;
             if seg.retract_before_mm > 0.0 {
                 seg.retract_before_mm = seg_fluid.adaptive_retract_length_mm(
                     last_q_mm3s,
@@ -5720,7 +5977,7 @@ pub fn plan_and_emit_gcode_for_object(
                     seg.duration_s,
                     pa_s,
                     seg.extrusion_multiplier,
-                    &seg_gcfg,
+                    seg_gcfg,
                 );
                 seg.delta_e_mm *= m_trans;
                 seg.extrusion_multiplier *= m_trans;
@@ -5792,12 +6049,16 @@ pub fn plan_and_emit_gcode_for_object(
     let exclude_object_polygon_bed =
         compute_exclude_object_polygon_2d(&planned_layers, bbox_min, bbox_max);
 
-    let mut gcode = String::with_capacity(64 * 1024);
+    let total_seg_count: usize = planned_layers.iter().map(|l| l.segments.len()).sum();
+    let mut gcode = String::with_capacity((total_seg_count * 44).max(64 * 1024));
     // Moonraker's `metadata.py` (`PrusaSlicer.check_identity`) requires a header comment
     // matching `r"PrusaSlicer\s(.*)\son"` (or `OrcaSlicer\s(.*)\son`) to enable full metadata
     // and embedded PNG thumbnail extraction.
     gcode.push_str("; generated by PrusaSlicer 2.8.0-Manifold2 on 2026-10-20 at 00:00:00 UTC\n");
     if gcfg.emit_thumbnails && !planned_layers.is_empty() {
+        if let Some(cb) = progress_cb {
+            cb(0.80, "Rendering G-code 3D preview thumbnails...");
+        }
         gcode.push_str(&render_toolpath_preview_thumbnails(
             &planned_layers,
             bbox_min,
@@ -5849,35 +6110,29 @@ pub fn plan_and_emit_gcode_for_object(
             }
         }
         for &aux_tool_id in &preheat_tool_ids {
-            let aux_temp_c = config
-                .tools
-                .iter()
-                .find(|t| t.id == aux_tool_id)
-                .map(|t| t.temperature_celsius)
-                .unwrap_or(if aux_tool_id == support_tool_id {
-                    support_nozzle_temp_c
-                } else {
-                    nozzle_temp_c
-                });
+            let aux_temp_c = lookup_tool_by_id(aux_tool_id, aux_tool_id == support_tool_id).temp_c;
             match gcfg.gcode_dialect {
                 GcodeDialect::Klipper => {
-                    gcode.push_str(&format!(
-                        "M104 S{aux_temp_c:.0} T{aux_tool_id} ; Preheat tool T{aux_tool_id}\n"
-                    ));
+                    let _ = writeln!(
+                        gcode,
+                        "M104 S{aux_temp_c:.0} T{aux_tool_id} ; Preheat tool T{aux_tool_id}"
+                    );
                 }
                 GcodeDialect::RepRapFirmware => {
-                    gcode.push_str(&format!(
-                        "M568 P{aux_tool_id} S{aux_temp_c:.0} R{aux_temp_c:.0} A2 ; Preheat tool T{aux_tool_id}\n"
-                    ));
+                    let _ = writeln!(
+                        gcode,
+                        "M568 P{aux_tool_id} S{aux_temp_c:.0} R{aux_temp_c:.0} A2 ; Preheat tool T{aux_tool_id}"
+                    );
                 }
             }
         }
     }
     let init_pa_s = active_tool_gcfg.pa_low_flow_s.max(0.0);
-    gcode.push_str(&format!(
-        "{} ; Initial Pressure Advance\n",
+    let _ = writeln!(
+        gcode,
+        "{} ; Initial Pressure Advance",
         format_pressure_advance_cmd(gcfg.gcode_dialect, tool_id, init_pa_s)
-    ));
+    );
 
     let is_five_axis = mcfg.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC;
     let use_g93 = is_five_axis && mcfg.use_inverse_time_feedrate_g93;
@@ -5895,9 +6150,74 @@ pub fn plan_and_emit_gcode_for_object(
     // never drifts from the exact analytical volume integral.
     let mut e_rounding_residual_mm = 0.0f64;
 
+    // Precompute per-layer fan PWM schedules in parallel across worker threads
+    let total_planned_layers = planned_layers.len().max(1);
+    let all_fan_schedules: Vec<Vec<u8>> = if num_threads <= 1 || planned_layers.len() < 8 {
+        planned_layers
+            .iter()
+            .enumerate()
+            .map(|(ord, l)| {
+                if l.segments.is_empty() {
+                    Vec::new()
+                } else {
+                    compute_layer_fan_pwm_schedule(l, ord, up_bed, &gcfg, &config.tools)
+                }
+            })
+            .collect()
+    } else {
+        let chunk_size = planned_layers.len().div_ceil(num_threads);
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(num_threads);
+            for (chunk_idx, chunk) in planned_layers.chunks(chunk_size).enumerate() {
+                let base_ord = chunk_idx * chunk_size;
+                let gcfg_ref = &gcfg;
+                let tools_ref = &config.tools;
+                handles.push(s.spawn(move || {
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(rel, l)| {
+                            if l.segments.is_empty() {
+                                Vec::new()
+                            } else {
+                                compute_layer_fan_pwm_schedule(
+                                    l,
+                                    base_ord + rel,
+                                    up_bed,
+                                    gcfg_ref,
+                                    tools_ref,
+                                )
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            let mut out = Vec::with_capacity(planned_layers.len());
+            for h in handles {
+                if let Ok(mut part) = h.join() {
+                    out.append(&mut part);
+                }
+            }
+            out
+        })
+    };
+
     for (layer_ord, layer) in planned_layers.iter().enumerate() {
         if layer.segments.is_empty() {
             continue;
+        }
+        if let Some(cb) = progress_cb {
+            if layer_ord % 8 == 0 || layer_ord + 1 == total_planned_layers {
+                let frac =
+                    0.85 + 0.14 * ((layer_ord + 1) as f32 / (total_planned_layers as f32));
+                cb(
+                    frac,
+                    &format!(
+                        "Formatting G-code & fan schedule ({}/{total_planned_layers} layers)...",
+                        layer_ord + 1
+                    ),
+                );
+            }
         }
         let mut layer_max_z = 0.0f32;
         let mut layer_sum_h = 0.0f32;
@@ -5915,34 +6235,31 @@ pub fn plan_and_emit_gcode_for_object(
             config.slicing.layer_height.target_mm
         };
 
-        gcode.push_str(&format!(
-            "\n; --- LAYER {} (Branch {}, Iso {:.4}) ---\n;LAYER_CHANGE\n;Z:{:.4}\n;HEIGHT:{:.4}\n",
+        let _ = writeln!(
+            gcode,
+            "\n; --- LAYER {} (Branch {}, Iso {:.4}) ---\n;LAYER_CHANGE\n;Z:{:.4}\n;HEIGHT:{:.4}",
             layer.layer_index, layer.branch_id, layer.isovalue, layer_max_z, layer_mean_h
-        ));
+        );
         if gcfg.emit_exclude_object {
             match gcfg.gcode_dialect {
                 GcodeDialect::Klipper => {
-                    gcode.push_str(&format!("EXCLUDE_OBJECT_START NAME={exclude_object_name}\n"));
+                    let _ = writeln!(gcode, "EXCLUDE_OBJECT_START NAME={exclude_object_name}");
                 }
                 GcodeDialect::RepRapFirmware => {
                     let obj_idx = object_id.saturating_sub(1);
-                    gcode.push_str(&format!("M486 S{obj_idx} A\"{exclude_object_name}\"\n"));
+                    let _ = writeln!(gcode, "M486 S{obj_idx} A\"{exclude_object_name}\"");
                 }
             }
         }
 
-        // Compute per-segment part cooling fan PWM schedule (`0..=255`) for this layer
-        let fan_pwm_schedule =
-            compute_layer_fan_pwm_schedule(layer, layer_ord, up_bed, &gcfg, &config.tools);
+        let fan_pwm_schedule = &all_fan_schedules[layer_ord];
         if let Some(&first_pwm) = fan_pwm_schedule.first() {
             if emitted_fan_pwm != Some(first_pwm) {
                 if first_pwm == 0 {
                     gcode.push_str("M107 ; Part cooling fan off\n");
                 } else {
                     let pct = (first_pwm as f32) / 2.55;
-                    gcode.push_str(&format!(
-                        "M106 S{first_pwm} ; Part cooling fan {pct:.0}%\n"
-                    ));
+                    let _ = writeln!(gcode, "M106 S{first_pwm} ; Part cooling fan {pct:.0}%");
                 }
                 emitted_fan_pwm = Some(first_pwm);
             }
@@ -5959,10 +6276,11 @@ pub fn plan_and_emit_gcode_for_object(
                         gcode.push_str("M107 ; Part cooling fan off\n");
                     } else {
                         let seg_fan_pct = (seg_fan_pwm as f32) / 2.55;
-                        gcode.push_str(&format!(
-                            "M106 S{seg_fan_pwm} ; {} cooling fan {seg_fan_pct:.0}%\n",
+                        let _ = writeln!(
+                            gcode,
+                            "M106 S{seg_fan_pwm} ; {} cooling fan {seg_fan_pct:.0}%",
                             seg.kind.label()
-                        ));
+                        );
                     }
                     emitted_fan_pwm = Some(seg_fan_pwm);
                 }
@@ -5976,7 +6294,7 @@ pub fn plan_and_emit_gcode_for_object(
                 }
                 let r_len = seg.retract_before_mm;
                 let r_feed = (gcfg.retract_speed_mms * 60.0).max(60.0);
-                gcode.push_str(&format!("G1 E-{r_len:.6} F{r_feed:.1} ; Retract\n"));
+                let _ = writeln!(gcode, "G1 E-{r_len:.6} F{r_feed:.1} ; Retract");
                 active_retract_mm = r_len;
                 accum_travel_time_s = 0.0;
                 emitted_feed_mm_min = r_feed;
@@ -5993,40 +6311,35 @@ pub fn plan_and_emit_gcode_for_object(
                     }
                     let r_len = gcfg.retract_length_mm;
                     let r_feed = (gcfg.retract_speed_mms * 60.0).max(60.0);
-                    gcode.push_str(&format!(
-                        "G1 E-{r_len:.6} F{r_feed:.1} ; Retract before toolchange\n"
-                    ));
+                    let _ = writeln!(
+                        gcode,
+                        "G1 E-{r_len:.6} F{r_feed:.1} ; Retract before toolchange"
+                    );
                     active_retract_mm = r_len;
                     accum_travel_time_s = 0.0;
                     retract_count += 1;
                     total_time_s_f64 += (r_len / gcfg.retract_speed_mms.max(1.0)) as f64;
                 }
-                let target_temp_c = config
-                    .tools
-                    .iter()
-                    .find(|t| t.id == seg.tool_id)
-                    .map(|t| t.temperature_celsius)
-                    .unwrap_or(if seg.tool_id == support_tool_id {
-                        support_nozzle_temp_c
-                    } else {
-                        nozzle_temp_c
-                    });
+                let target_temp_c =
+                    lookup_tool_by_id(seg.tool_id, seg.tool_id == support_tool_id).temp_c;
                 match gcfg.gcode_dialect {
                     GcodeDialect::Klipper => {
-                        gcode.push_str(&format!(
-                            "M104 S{target_temp_c:.0} T{}\nT{} ; Switch tool ({})\n",
+                        let _ = writeln!(
+                            gcode,
+                            "M104 S{target_temp_c:.0} T{}\nT{} ; Switch tool ({})",
                             seg.tool_id,
                             seg.tool_id,
                             seg.kind.label()
-                        ));
+                        );
                     }
                     GcodeDialect::RepRapFirmware => {
-                        gcode.push_str(&format!(
-                            "M568 P{} S{target_temp_c:.0} R{target_temp_c:.0} A2\nT{} ; Switch tool ({})\n",
+                        let _ = writeln!(
+                            gcode,
+                            "M568 P{} S{target_temp_c:.0} R{target_temp_c:.0} A2\nT{} ; Switch tool ({})",
                             seg.tool_id,
                             seg.tool_id,
                             seg.kind.label()
-                        ));
+                        );
                     }
                 }
                 emitted_tool_id = seg.tool_id;
@@ -6046,35 +6359,14 @@ pub fn plan_and_emit_gcode_for_object(
                     in_g93_mode = false;
                 }
                 // Unretract before resuming extrusion (with thermal ooze / swell relaxation)
-                let seg_tool = config.tools.iter().find(|t| t.id == seg.tool_id);
-                let seg_gcfg = if use_per_tool_filament {
-                    seg_tool
-                        .map(|t| t.effective_gcode_config(&gcfg))
-                        .unwrap_or_else(|| {
-                            if seg.kind.is_support() {
-                                support_tool_gcfg.clone()
-                            } else {
-                                active_tool_gcfg.clone()
-                            }
-                        })
-                } else {
-                    gcfg.clone()
-                };
-                let seg_temp_c = seg_tool.map(|t| t.temperature_celsius).unwrap_or(
-                    if seg.kind.is_support() {
-                        support_nozzle_temp_c
-                    } else {
-                        nozzle_temp_c
-                    },
-                );
-                let seg_fluid = FluidDynamicsModel::from_config(&seg_gcfg, seg_temp_c);
-                let u_len = seg_fluid.unretract_length_mm(
+                let tm = lookup_tool_by_id(seg.tool_id, seg.kind.is_support());
+                let u_len = tm.fluid.unretract_length_mm(
                     active_retract_mm,
                     accum_travel_time_s,
-                    &seg_gcfg,
+                    &tm.gcfg,
                 );
                 let u_feed = (gcfg.retract_speed_mms * 60.0).max(60.0);
-                gcode.push_str(&format!("G1 E{u_len:.6} F{u_feed:.1} ; Unretract\n"));
+                let _ = writeln!(gcode, "G1 E{u_len:.6} F{u_feed:.1} ; Unretract");
                 active_retract_mm = 0.0;
                 accum_travel_time_s = 0.0;
                 emitted_feed_mm_min = u_feed;
@@ -6084,18 +6376,24 @@ pub fn plan_and_emit_gcode_for_object(
             // Deadband-compacted `SET_VELOCITY_LIMIT ACCEL=...` / `M204 P... T...`
             let kind_changed = last_emitted_kind != Some(seg.kind);
             if kind_changed && seg.kind.is_extruding() {
-                gcode.push_str(&format!("; TYPE:{}\n", seg.kind.label()));
+                let _ = writeln!(gcode, "; TYPE:{}", seg.kind.label());
             }
             if kind_changed
                 || emitted_accel <= 0.0
                 || ((seg.accel_mms2 - emitted_accel).abs() / emitted_accel.max(1.0)) >= 0.15
             {
-                gcode.push_str(&format_accel_limit_cmd(
-                    gcfg.gcode_dialect,
-                    seg.accel_mms2,
-                    gcfg.travel_accel_mms2,
-                ));
-                gcode.push('\n');
+                match gcfg.gcode_dialect {
+                    GcodeDialect::Klipper => {
+                        let _ = writeln!(gcode, "SET_VELOCITY_LIMIT ACCEL={:.0}\n", seg.accel_mms2);
+                    }
+                    GcodeDialect::RepRapFirmware => {
+                        let _ = writeln!(
+                            gcode,
+                            "M204 P{:.0} T{:.0}\n",
+                            seg.accel_mms2, gcfg.travel_accel_mms2
+                        );
+                    }
+                }
                 emitted_accel = seg.accel_mms2;
             }
 
@@ -6103,12 +6401,9 @@ pub fn plan_and_emit_gcode_for_object(
                 extruding_move_count += 1;
                 total_filament_mm_f64 += seg.delta_e_mm as f64;
                 let seg_density_g_cm3 = if use_per_tool_filament {
-                    config
-                        .tools
-                        .iter()
-                        .find(|t| t.id == seg.tool_id)
-                        .map(|t| t.filament_density_g_cm3)
-                        .unwrap_or(active_tool_gcfg.filament_density_g_cm3)
+                    lookup_tool_by_id(seg.tool_id, seg.kind.is_support())
+                        .gcfg
+                        .filament_density_g_cm3
                 } else {
                     gcfg.filament_density_g_cm3
                 };
@@ -6142,12 +6437,22 @@ pub fn plan_and_emit_gcode_for_object(
                             / emitted_pa.max(0.005)
                             >= 0.08)
                 {
-                    gcode.push_str(&format_pressure_advance_cmd(
-                        gcfg.gcode_dialect,
-                        emitted_tool_id,
-                        seg.pressure_advance_s,
-                    ));
-                    gcode.push('\n');
+                    match gcfg.gcode_dialect {
+                        GcodeDialect::Klipper => {
+                            let _ = writeln!(
+                                gcode,
+                                "SET_PRESSURE_ADVANCE ADVANCE={:.5}\n",
+                                seg.pressure_advance_s
+                            );
+                        }
+                        GcodeDialect::RepRapFirmware => {
+                            let _ = writeln!(
+                                gcode,
+                                "M572 D{} S{:.4}\n",
+                                emitted_tool_id, seg.pressure_advance_s
+                            );
+                        }
+                    }
                     emitted_pa = seg.pressure_advance_s;
                 }
 
@@ -6162,8 +6467,9 @@ pub fn plan_and_emit_gcode_for_object(
                         in_g93_mode = true;
                     }
                     let inv_time_f = (60.0 / seg.duration_s.max(1.0e-4)).clamp(0.1, 600_000.0);
-                    gcode.push_str(&format!(
-                        "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6} F{:.2}\n",
+                    let _ = writeln!(
+                        gcode,
+                        "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6} F{:.2}",
                         seg.p1_bed.x,
                         seg.p1_bed.y,
                         seg.p1_bed.z,
@@ -6171,7 +6477,7 @@ pub fn plan_and_emit_gcode_for_object(
                         seg.c1_deg,
                         e_emitted,
                         inv_time_f
-                    ));
+                    );
                     emitted_feed_mm_min = -1.0;
                 } else {
                     if in_g93_mode {
@@ -6189,8 +6495,9 @@ pub fn plan_and_emit_gcode_for_object(
 
                     if is_five_axis {
                         if emit_f {
-                            gcode.push_str(&format!(
-                                "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6} F{:.1}\n",
+                            let _ = writeln!(
+                                gcode,
+                                "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6} F{:.1}",
                                 seg.p1_bed.x,
                                 seg.p1_bed.y,
                                 seg.p1_bed.z,
@@ -6198,30 +6505,33 @@ pub fn plan_and_emit_gcode_for_object(
                                 seg.c1_deg,
                                 e_emitted,
                                 feed_mm_min
-                            ));
+                            );
                             emitted_feed_mm_min = feed_mm_min;
                         } else {
-                            gcode.push_str(&format!(
-                                "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6}\n",
+                            let _ = writeln!(
+                                gcode,
+                                "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6}",
                                 seg.p1_bed.x,
                                 seg.p1_bed.y,
                                 seg.p1_bed.z,
                                 seg.b1_deg,
                                 seg.c1_deg,
                                 e_emitted
-                            ));
+                            );
                         }
                     } else if emit_f {
-                        gcode.push_str(&format!(
-                            "G1 X{:.4} Y{:.4} Z{:.4} E{:.6} F{:.1}\n",
+                        let _ = writeln!(
+                            gcode,
+                            "G1 X{:.4} Y{:.4} Z{:.4} E{:.6} F{:.1}",
                             seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, e_emitted, feed_mm_min
-                        ));
+                        );
                         emitted_feed_mm_min = feed_mm_min;
                     } else {
-                        gcode.push_str(&format!(
-                            "G1 X{:.4} Y{:.4} Z{:.4} E{:.6}\n",
+                        let _ = writeln!(
+                            gcode,
+                            "G1 X{:.4} Y{:.4} Z{:.4} E{:.6}",
                             seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, e_emitted
-                        ));
+                        );
                     }
                 }
             } else {
@@ -6232,15 +6542,16 @@ pub fn plan_and_emit_gcode_for_object(
                         in_g93_mode = true;
                     }
                     let inv_time_f = (60.0 / seg.duration_s.max(1.0e-4)).clamp(0.1, 600_000.0);
-                    gcode.push_str(&format!(
-                        "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} F{:.2}\n",
+                    let _ = writeln!(
+                        gcode,
+                        "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} F{:.2}",
                         seg.p1_bed.x,
                         seg.p1_bed.y,
                         seg.p1_bed.z,
                         seg.b1_deg,
                         seg.c1_deg,
                         inv_time_f
-                    ));
+                    );
                     emitted_feed_mm_min = -1.0;
                 } else {
                     if in_g93_mode {
@@ -6255,37 +6566,41 @@ pub fn plan_and_emit_gcode_for_object(
 
                     if is_five_axis {
                         if emit_f {
-                            gcode.push_str(&format!(
-                                "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} F{:.1}\n",
+                            let _ = writeln!(
+                                gcode,
+                                "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} F{:.1}",
                                 seg.p1_bed.x,
                                 seg.p1_bed.y,
                                 seg.p1_bed.z,
                                 seg.b1_deg,
                                 seg.c1_deg,
                                 feed_mm_min
-                            ));
+                            );
                             emitted_feed_mm_min = feed_mm_min;
                         } else {
-                            gcode.push_str(&format!(
-                                "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3}\n",
+                            let _ = writeln!(
+                                gcode,
+                                "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3}",
                                 seg.p1_bed.x,
                                 seg.p1_bed.y,
                                 seg.p1_bed.z,
                                 seg.b1_deg,
                                 seg.c1_deg
-                            ));
+                            );
                         }
                     } else if emit_f {
-                        gcode.push_str(&format!(
-                            "G0 X{:.4} Y{:.4} Z{:.4} F{:.1}\n",
+                        let _ = writeln!(
+                            gcode,
+                            "G0 X{:.4} Y{:.4} Z{:.4} F{:.1}",
                             seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, feed_mm_min
-                        ));
+                        );
                         emitted_feed_mm_min = feed_mm_min;
                     } else {
-                        gcode.push_str(&format!(
-                            "G0 X{:.4} Y{:.4} Z{:.4}\n",
+                        let _ = writeln!(
+                            gcode,
+                            "G0 X{:.4} Y{:.4} Z{:.4}",
                             seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z
-                        ));
+                        );
                     }
                 }
             }

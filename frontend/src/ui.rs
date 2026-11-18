@@ -2208,15 +2208,14 @@ pub fn ui_workspace_system(
                     );
                 }
 
-                if is_computing {
-                    let prog = ffi::get_field_compute_progress();
+                if let Some((frac, stage)) = vis_state.active_progress() {
                     ui.ctx().request_repaint();
                     ui.add(
-                        egui::ProgressBar::new(prog.fraction.clamp(0.0, 1.0))
-                            .desired_width(180.0)
+                        egui::ProgressBar::new(frac.clamp(0.0, 1.0))
+                            .desired_width(210.0)
                             .show_percentage()
                             .animate(true)
-                            .text(prog.stage),
+                            .text(stage),
                     );
                 } else if let Some(ref planned) = vis_state.cached_planned_gcode {
                     let total_sec = planned.total_time_s.round() as u64;
@@ -2572,14 +2571,6 @@ pub fn ui_workspace_system(
                                     &config,
                                     true,
                                 ) {
-                                    if let Some(mesh) = meshes.get_mut(&obj.mesh_handle) {
-                                        mesh.insert_attribute(
-                                            Mesh::ATTRIBUTE_COLOR,
-                                            crate::field_vis::default_cad_vertex_colors_for_object(
-                                                obj, &config,
-                                            ),
-                                        );
-                                    }
                                     vis_state.dirty_color_mixing = true;
                                     vis_state.dirty_surface_colors = true;
                                     vis_state.dirty_planned_gcode = true;
@@ -5743,14 +5734,13 @@ fn render_3mf_filament_slot_mapping_section(
     ui: &mut egui::Ui,
     config: &mut SlicerConfig,
     vis_state: &mut FieldVisualizationState,
-    plate: &mut BuildPlateState,
-    meshes: &mut Assets<Mesh>,
+    _plate: &mut BuildPlateState,
+    _meshes: &mut Assets<Mesh>,
     is_computing: bool,
     id_salt: &str,
 ) {
     let mut dirty_backend = false;
     let mut dirty_gcode = false;
-    let prev_surface_dirty = vis_state.dirty_surface_colors;
 
     render_3mf_filament_slot_mapping_section_config_only(
         ui,
@@ -5761,37 +5751,6 @@ fn render_3mf_filament_slot_mapping_section(
         id_salt,
     );
 
-    if vis_state.dirty_surface_colors && !prev_surface_dirty {
-        let slot_colors = config.imported_slot_colors_srgba();
-        for obj in &mut plate.objects {
-            if !obj.triangle_colors_rgba.is_empty()
-                && obj.vertex_filament_slots.is_empty()
-                && !slot_colors.is_empty()
-            {
-                let remapped = crate::color_optics::map_triangle_colors_to_slot_colors(
-                    &obj.triangle_colors_rgba,
-                    &slot_colors,
-                );
-                if remapped.len() == obj.indices.len() / 3 {
-                    ffi::set_object_triangle_filament_slots(obj.object_id, &remapped);
-                    obj.triangle_filament_slots = remapped;
-                }
-            }
-            if !obj.vertex_filament_slots.is_empty() || !obj.vertex_colors_rgba.is_empty() {
-                if let Some(mesh) = meshes.get_mut(&obj.mesh_handle) {
-                    mesh.insert_attribute(
-                        Mesh::ATTRIBUTE_COLOR,
-                        crate::field_vis::default_cad_vertex_colors(
-                            obj.vertices.len(),
-                            &obj.vertex_filament_slots,
-                            &obj.vertex_colors_rgba,
-                            config,
-                        ),
-                    );
-                }
-            }
-        }
-    }
     if dirty_backend && !is_computing {
         sync_config_to_backend(config);
     }
@@ -6130,7 +6089,8 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                         {
                             *dirty_backend = true;
                             *dirty_gcode = true;
-                            vis_state.dirty_toolpaths = true;
+                            vis_state.dirty_color_mixing = true;
+                            vis_state.dirty_toolpaths_mesh = true;
                         }
                         for (idx, t) in config.tools.iter().enumerate() {
                             if ui
@@ -6143,7 +6103,8 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                             {
                                 *dirty_backend = true;
                                 *dirty_gcode = true;
-                                vis_state.dirty_toolpaths = true;
+                                vis_state.dirty_color_mixing = true;
+                                vis_state.dirty_toolpaths_mesh = true;
                             }
                         }
                     });
@@ -6492,9 +6453,11 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                         ];
                         slot.color_hex =
                             format!("#{:02X}{:02X}{:02X}", c32.r(), c32.g(), c32.b());
+                        vis_state.dirty_triangle_slot_remap = true;
                         vis_state.dirty_surface_colors = true;
                         vis_state.dirty_color_mixing = true;
                         vis_state.dirty_toolpaths_mesh = true;
+                        *dirty_gcode = true;
                     }
 
                     ui.add(
@@ -11263,7 +11226,7 @@ fn render_selected_object_filament_and_color_controls(
     obj: &mut crate::scene::SceneObject,
     config: &mut SlicerConfig,
     vis_state: &mut FieldVisualizationState,
-    meshes: &mut Assets<Mesh>,
+    _meshes: &mut Assets<Mesh>,
 ) {
     let mut mode_or_color_changed = false;
 
@@ -11389,12 +11352,6 @@ fn render_selected_object_filament_and_color_controls(
     }
 
     if mode_or_color_changed {
-        if let Some(mesh) = meshes.get_mut(&obj.mesh_handle) {
-            mesh.insert_attribute(
-                Mesh::ATTRIBUTE_COLOR,
-                crate::field_vis::default_cad_vertex_colors_for_object(obj, config),
-            );
-        }
         vis_state.dirty_color_mixing = true;
         vis_state.dirty_surface_colors = true;
         vis_state.dirty_planned_gcode = true;
