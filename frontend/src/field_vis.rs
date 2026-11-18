@@ -425,6 +425,7 @@ pub struct FieldVisualizationState {
     pub show_gap_fill: bool,
     pub show_supports: bool,
     pub show_support_interface: bool,
+    pub show_purge_tower: bool,
     pub show_scarf_seams: bool,
     pub show_wipes: bool,
     pub show_travel_moves: bool,
@@ -550,6 +551,7 @@ impl Default for FieldVisualizationState {
             show_gap_fill: true,
             show_supports: true,
             show_support_interface: true,
+            show_purge_tower: true,
             show_scarf_seams: true,
             show_wipes: true,
             show_travel_moves: false,
@@ -881,6 +883,33 @@ pub fn build_mixed_toolpaths_for_object_with_mode(
         None
     };
 
+    let apply_infill_override = |tp: &mut ObjectToolpathsResult| {
+        match config.slicing.infill_filament_mode {
+            crate::config::InfillFilamentMode::SingleTool(t_idx) => {
+                let clamped = t_idx.min(config.tools.len().saturating_sub(1));
+                let direct_slot = crate::color_optics::encode_direct_tool_slot(clamped);
+                for layer in &mut tp.layers {
+                    for path in &mut layer.paths {
+                        if path.feature_kind == 4 {
+                            path.filament_slot = direct_slot;
+                        }
+                    }
+                }
+            }
+            crate::config::InfillFilamentMode::FilamentSlot(s_idx) => {
+                for layer in &mut tp.layers {
+                    for path in &mut layer.paths {
+                        if path.feature_kind == 4 {
+                            path.filament_slot = s_idx;
+                        }
+                    }
+                }
+            }
+            crate::config::InfillFilamentMode::FollowObject
+            | crate::config::InfillFilamentMode::AutoPurgeIntoInfill => {}
+        }
+    };
+
     match filament_mode {
         ObjectFilamentMode::SingleTool(tool_idx) => {
             let clamped_tool = tool_idx.min(config.tools.len().saturating_sub(1));
@@ -893,6 +922,21 @@ pub fn build_mixed_toolpaths_for_object_with_mode(
                     }
                 }
             }
+            apply_infill_override(&mut out);
+            if matches!(
+                config.slicing.infill_filament_mode,
+                crate::config::InfillFilamentMode::FilamentSlot(_)
+            ) && config.has_virtual_filament_slots()
+                && config.tools.len() >= 2
+            {
+                return crate::color_optics::apply_virtual_filament_dithering_to_toolpaths(
+                    &out,
+                    &config.filament_slots,
+                    config.tools.len(),
+                    config.slicing.color_mixing.min_short_extrusion_mm,
+                    support_tool,
+                );
+            }
             return out;
         }
         ObjectFilamentMode::FilamentSlot(slot_idx) => {
@@ -904,10 +948,12 @@ pub fn build_mixed_toolpaths_for_object_with_mode(
                     }
                 }
             }
+            apply_infill_override(&mut assigned);
             let is_virtual = config
                 .filament_slots
                 .get(slot_idx as usize)
-                .map_or(false, |s| s.is_virtual_mix());
+                .map_or(false, |s| s.is_virtual_mix())
+                || config.has_virtual_filament_slots();
             if is_virtual && config.tools.len() >= 2 {
                 return crate::color_optics::apply_virtual_filament_dithering_to_toolpaths(
                     &assigned,
@@ -920,24 +966,29 @@ pub fn build_mixed_toolpaths_for_object_with_mode(
             return assigned;
         }
         ObjectFilamentMode::DirectSlotsNoOptical => {
+            let mut assigned = raw_toolpaths.clone();
+            apply_infill_override(&mut assigned);
             if config.has_virtual_filament_slots() && config.tools.len() >= 2 {
                 return crate::color_optics::apply_virtual_filament_dithering_to_toolpaths(
-                    raw_toolpaths,
+                    &assigned,
                     &config.filament_slots,
                     config.tools.len(),
                     config.slicing.color_mixing.min_short_extrusion_mm,
                     support_tool,
                 );
             }
-            return raw_toolpaths.clone();
+            return assigned;
         }
         ObjectFilamentMode::ProjectDefault
         | ObjectFilamentMode::OpticalFrontLit
         | ObjectFilamentMode::OpticalBackLitLithophane => {}
     }
 
+    let mut base_tp = raw_toolpaths.clone();
+    apply_infill_override(&mut base_tp);
+
     if config.tools.len() < 2 {
-        return raw_toolpaths.clone();
+        return base_tp;
     }
 
     let want_optical = match filament_mode {
@@ -946,19 +997,19 @@ pub fn build_mixed_toolpaths_for_object_with_mode(
     };
     let has_virtual = config.has_virtual_filament_slots();
     if !has_virtual && !want_optical {
-        return raw_toolpaths.clone();
+        return base_tp;
     }
 
     let after_virtual = if has_virtual {
         crate::color_optics::apply_virtual_filament_dithering_to_toolpaths(
-            raw_toolpaths,
+            &base_tp,
             &config.filament_slots,
             config.tools.len(),
             config.slicing.color_mixing.min_short_extrusion_mm,
             support_tool,
         )
     } else {
-        raw_toolpaths.clone()
+        base_tp
     };
 
     if !want_optical {
@@ -1659,6 +1710,18 @@ pub fn sync_field_visualization_system(
         use std::hash::{Hash, Hasher};
         let mut sig_hasher = std::collections::hash_map::DefaultHasher::new();
         plate.active_plate_index.hash(&mut sig_hasher);
+        config.gcode.purge_mode.hash(&mut sig_hasher);
+        config.gcode.min_purge_volume_mm3.to_bits().hash(&mut sig_hasher);
+        config.gcode.purge_tower_auto_dimensions.hash(&mut sig_hasher);
+        config.gcode.purge_tower_width_mm.to_bits().hash(&mut sig_hasher);
+        config.gcode.purge_tower_depth_mm.to_bits().hash(&mut sig_hasher);
+        config.gcode.purge_tower_brim.hash(&mut sig_hasher);
+        config.gcode.purge_tower_auto_position.hash(&mut sig_hasher);
+        config.gcode.purge_tower_position_xy[0].to_bits().hash(&mut sig_hasher);
+        config.gcode.purge_tower_position_xy[1].to_bits().hash(&mut sig_hasher);
+        config.slicing.infill_filament_mode.hash(&mut sig_hasher);
+        config.slicing.support_tool_index.hash(&mut sig_hasher);
+        config.slicing.support_interface_tool_index.hash(&mut sig_hasher);
         for o in &plate.objects {
             if o.plate_index == plate.active_plate_index {
                 o.object_id.hash(&mut sig_hasher);
@@ -1693,6 +1756,8 @@ pub fn sync_field_visualization_system(
     if (!vis_state.plate_mixed_toolpaths.is_empty() || vis_state.cached_toolpaths.is_some())
         && (vis_state.dirty_planned_gcode || vis_state.cached_planned_gcode.is_none())
         && !vis_state.ui_pointer_down
+        && !plate.is_dragging_purge_tower
+        && !plate.is_dragging_object
     {
         vis_state.dirty_planned_gcode = false;
         let mut planned_objects: Vec<(String, crate::gcode::PlannedGcodeResult, Transform)> =
@@ -2043,6 +2108,7 @@ impl FieldVisualizationState {
             crate::gcode::PlannedMoveKind::GapFill => self.show_gap_fill,
             crate::gcode::PlannedMoveKind::Support => self.show_supports,
             crate::gcode::PlannedMoveKind::SupportInterface => self.show_support_interface,
+            crate::gcode::PlannedMoveKind::PurgeTower => self.show_purge_tower,
             crate::gcode::PlannedMoveKind::ScarfSeam => self.show_scarf_seams,
             crate::gcode::PlannedMoveKind::Wipe => self.show_wipes,
             crate::gcode::PlannedMoveKind::Travel => self.show_travel_moves,
@@ -3717,6 +3783,7 @@ fn compute_planned_segment_color(
         ToolpathColorMode::ByFeatureType => match seg.kind {
             crate::gcode::PlannedMoveKind::ScarfSeam => [0.76, 0.44, 0.98, 1.0], // Violet scarf seam
             crate::gcode::PlannedMoveKind::Wipe => [0.68, 0.76, 0.86, 1.0],      // Cool silver wipe
+            crate::gcode::PlannedMoveKind::PurgeTower => [0.96, 0.44, 0.64, 1.0], // Rose/coral purge tower
             _ => compute_toolpath_point_color(
                 seg.kind as u8,
                 seg.wall_index,
@@ -3729,7 +3796,10 @@ fn compute_planned_segment_color(
             ),
         },
         ToolpathColorMode::ByToolOrFilament | ToolpathColorMode::ByOpticalComposite => {
-            if seg.kind.is_support() {
+            if seg.kind.is_support()
+                && config.slicing.support_tool_index.is_none()
+                && config.slicing.support_interface_tool_index.is_none()
+            {
                 [0.22, 0.88, 0.62, 1.0]
             } else {
                 config.color_srgba_for_filament_slot(seg.filament_slot)

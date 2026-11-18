@@ -1077,6 +1077,140 @@ impl SupportStyle {
     }
 }
 
+/// Filament / tool assignment mode for Sparse Infill (`feature_kind == 4`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InfillFilamentMode {
+    /// Follow the object's or region's assigned filament (`None` override).
+    #[default]
+    FollowObject,
+    /// Auto / Purge into Infill: uses the currently active tool to avoid unnecessary
+    /// toolchanges just for infill, and when a toolchange occurs in `PurgeIntoInfill`
+    /// mode, routes the incoming tool through sparse infill first to absorb purge volume.
+    AutoPurgeIntoInfill,
+    /// Print sparse infill using a specific machine tool index (`0..tools.len()`).
+    SingleTool(usize),
+    /// Print sparse infill using a specific 3MF / Virtual Filament slot (`0..filament_slots.len()`).
+    FilamentSlot(u8),
+}
+
+impl InfillFilamentMode {
+    /// Human-readable label for dropdown menus.
+    pub fn label(&self, tools: &[ToolConfig], slots: &[ThreeMfFilamentSlot]) -> String {
+        match *self {
+            Self::FollowObject => "Follow Object / Region Filament".to_string(),
+            Self::AutoPurgeIntoInfill => "Auto (Current Tool / Purge into Infill)".to_string(),
+            Self::SingleTool(idx) => {
+                if let Some(t) = tools.get(idx) {
+                    format!("Tool T{} — {}", t.id, t.name)
+                } else {
+                    format!("Tool T{idx}")
+                }
+            }
+            Self::FilamentSlot(slot_idx) => {
+                if let Some(s) = slots.get(slot_idx as usize) {
+                    if s.is_virtual_mix() {
+                        format!(
+                            "Slot #{} — Virtual Mix ({})",
+                            slot_idx + 1,
+                            s.format_ratio_summary(tools)
+                        )
+                    } else {
+                        format!(
+                            "Slot #{} — {} ({})",
+                            slot_idx + 1,
+                            s.filament_type,
+                            s.color_hex
+                        )
+                    }
+                } else {
+                    format!("Filament Slot #{}", slot_idx + 1)
+                }
+            }
+        }
+    }
+
+    /// Compact label for narrow UI columns.
+    pub fn short_label(&self, tools: &[ToolConfig], slots: &[ThreeMfFilamentSlot]) -> String {
+        match *self {
+            Self::FollowObject => "Follow Object".to_string(),
+            Self::AutoPurgeIntoInfill => "Auto (Purge / Active Tool)".to_string(),
+            Self::SingleTool(idx) => {
+                let tid = tools.get(idx).map(|t| t.id).unwrap_or(idx as u32);
+                format!("Tool T{tid}")
+            }
+            Self::FilamentSlot(slot_idx) => {
+                if let Some(s) = slots.get(slot_idx as usize) {
+                    if s.is_virtual_mix() {
+                        format!("Slot #{} ({})", slot_idx + 1, s.format_ratio_summary(tools))
+                    } else {
+                        format!("Slot #{} ({})", slot_idx + 1, s.color_hex)
+                    }
+                } else {
+                    format!("Slot #{}", slot_idx + 1)
+                }
+            }
+        }
+    }
+}
+
+/// Multi-tool filament purge strategy after a toolchange (`T_old -> T_new`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PurgeMode {
+    /// No dedicated purge after toolchanges.
+    Disabled,
+    /// Purge the full `min_purge_volume_mm3` onto an external rectangular-prism purge tower
+    /// after every toolchange.
+    PurgeTowerOnly,
+    /// Purge into the part's Sparse Infill first; when available sparse infill on the layer
+    /// is less than `min_purge_volume_mm3`, deposit only the remaining deficit volume onto
+    /// the non-planar minimal purge tower.
+    #[default]
+    PurgeIntoInfillThenTower,
+    /// Purge into the part's Sparse Infill on the current layer without building an external
+    /// purge tower.
+    PurgeIntoInfillOnly,
+}
+
+impl PurgeMode {
+    pub const ALL: [Self; 4] = [
+        Self::Disabled,
+        Self::PurgeTowerOnly,
+        Self::PurgeIntoInfillThenTower,
+        Self::PurgeIntoInfillOnly,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "Disabled (No Toolchange Purge)",
+            Self::PurgeTowerOnly => "Purge Tower (Minimal Non-Planar Rectangular Prism)",
+            Self::PurgeIntoInfillThenTower => {
+                "Purge into Infill + Minimal Tower Fallback (Zero-Waste)"
+            }
+            Self::PurgeIntoInfillOnly => "Purge into Infill Only (No External Tower)",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Disabled => "Disabled",
+            Self::PurgeTowerOnly => "Purge Tower Only",
+            Self::PurgeIntoInfillThenTower => "Infill + Minimal Tower",
+            Self::PurgeIntoInfillOnly => "Purge into Infill Only",
+        }
+    }
+
+    pub const fn uses_infill_purge(self) -> bool {
+        matches!(
+            self,
+            Self::PurgeIntoInfillThenTower | Self::PurgeIntoInfillOnly
+        )
+    }
+
+    pub const fn uses_purge_tower(self) -> bool {
+        matches!(self, Self::PurgeTowerOnly | Self::PurgeIntoInfillThenTower)
+    }
+}
+
 /// Non-planar slicing process & shell/sparse toolpath generation configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -1107,6 +1241,8 @@ pub struct SlicingProcessConfig {
     pub sparse_infill_width: LineWidthConfig,
     /// Sparse infill pattern inside the interior core (`Monotonic`, `Cubic`, `Gyroid`, `SchwarzD`, `SchwarzP`, `Concentric`, `AllWalls`).
     pub sparse_infill_pattern: SparseInfillPattern,
+    /// Filament / tool assignment mode for Sparse Infill (`FollowObject`, `AutoPurgeIntoInfill`, `SingleTool`, `FilamentSlot`).
+    pub infill_filament_mode: InfillFilamentMode,
     /// Minimum continuous extrusion length (mm); defaults to $2 \times d_{\text{nozzle}}$.
     /// Individual segments of a continuous extrusion may be shorter than this.
     pub min_extrusion_length_mm: f32,
@@ -1121,10 +1257,13 @@ pub struct SlicingProcessConfig {
     /// Enable automatic support detection and support toolpath generation for regions unreachable
     /// by the constrained Eikonal order field.
     pub enable_support_generation: bool,
-    /// Optional dedicated tool index into `SlicerConfig::tools` used for support generation
+    /// Optional dedicated tool index into `SlicerConfig::tools` used for support base generation
     /// (`None` = use the active object tool `active_tool_index`). Allows printing supports and
     /// support interfaces with a different tool/nozzle and support material (e.g., breakaway or soluble).
     pub support_tool_index: Option<usize>,
+    /// Optional dedicated tool index into `SlicerConfig::tools` used specifically for dense support
+    /// interface roofs and floors (`None` = use `support_tool_index` if set, otherwise `active_tool_index`).
+    pub support_interface_tool_index: Option<usize>,
     /// Support structure style (`ColumnarGrid` vs. `NonPlanarTree`).
     pub support_style: SupportStyle,
     /// When true ("On Build Plate Only"), supports are never placed on upper model surfaces:
@@ -1212,12 +1351,14 @@ impl Default for SlicingProcessConfig {
             solid_infill_pattern: SolidInfillPattern::Monotonic,
             sparse_infill_width: LineWidthConfig::new(0.45, 0.30, 0.65),
             sparse_infill_pattern: SparseInfillPattern::Gyroid,
+            infill_filament_mode: InfillFilamentMode::FollowObject,
             min_extrusion_length_mm: 0.80,
             overhang_angle_threshold_deg: 45.0,
             max_bridge_length_mm: 40.0,
             wave_overhang_overlap_fraction: 0.08,
             enable_support_generation: true,
             support_tool_index: None,
+            support_interface_tool_index: None,
             support_style: SupportStyle::ColumnarGrid,
             support_on_bed_only: false,
             seed_order_field_from_supports: true,
@@ -1899,6 +2040,23 @@ pub struct GcodeProcessConfig {
     pub tool_change_hop_before: bool,
     /// After emitting `T{id}` toolchange, emit a travel move to the elevated approach position above the next chain start (same height as a hop) before descending to start extruding.
     pub tool_change_approach_after: bool,
+    /// Multi-tool filament purge strategy after a toolchange (`Disabled`, `PurgeTowerOnly`, `PurgeIntoInfillThenTower`, `PurgeIntoInfillOnly`).
+    pub purge_mode: PurgeMode,
+    /// Minimum polymer volume ($\text{mm}^3$) to purge after each toolchange `T_old -> T_new`.
+    pub min_purge_volume_mm3: f32,
+    /// When `true` (default), automatically chooses the rectangular prism purge tower width and depth from `min_purge_volume_mm3` and target layer height.
+    pub purge_tower_auto_dimensions: bool,
+    /// Rectangular prism purge tower width along the bed U/X axis (mm) when `purge_tower_auto_dimensions` is `false`.
+    pub purge_tower_width_mm: f32,
+    /// Rectangular prism purge tower depth along the bed V/Y axis (mm) when `purge_tower_auto_dimensions` is `false`.
+    pub purge_tower_depth_mm: f32,
+    /// Print an outward bed-adhesion anchor brim around the purge tower base on its first deposited layer.
+    pub purge_tower_brim: bool,
+    /// When `true` (default), automatically places the purge tower outside the objects' bounding box on the build plate.
+    /// When `false`, places the purge tower at `purge_tower_position_xy` in scene build-plate coordinates (mm).
+    pub purge_tower_auto_position: bool,
+    /// Center `(x_mm, y_mm)` of the rectangular-prism purge tower in scene build-plate coordinates (`(0, 0)` = bed center).
+    pub purge_tower_position_xy: [f32; 2],
 
     // --- Bed Adhesion Brim & Lever-Arm / Curled-Corner Speed Governor ---
     /// Automatically generate a first-layer brim around narrow-footprint / high-lever-ratio parts
@@ -2011,6 +2169,14 @@ impl Default for GcodeProcessConfig {
             tool_change_time_s: 15.0,
             tool_change_hop_before: true,
             tool_change_approach_after: true,
+            purge_mode: PurgeMode::Disabled,
+            min_purge_volume_mm3: 45.0,
+            purge_tower_auto_dimensions: true,
+            purge_tower_width_mm: 22.0,
+            purge_tower_depth_mm: 11.0,
+            purge_tower_brim: true,
+            purge_tower_auto_position: true,
+            purge_tower_position_xy: [0.0, 55.0],
             enable_auto_brim: true,
             brim_width_mm: 0.0,
             brim_gap_mm: 0.10,
@@ -2118,6 +2284,24 @@ impl GcodeProcessConfig {
             self.tool_change_time_s = 15.0;
         }
         self.tool_change_time_s = self.tool_change_time_s.clamp(0.0, 600.0);
+        if !self.min_purge_volume_mm3.is_finite() {
+            self.min_purge_volume_mm3 = 45.0;
+        }
+        self.min_purge_volume_mm3 = self.min_purge_volume_mm3.clamp(0.0, 500.0);
+        if !self.purge_tower_width_mm.is_finite() {
+            self.purge_tower_width_mm = 22.0;
+        }
+        self.purge_tower_width_mm = self.purge_tower_width_mm.clamp(8.0, 120.0);
+        if !self.purge_tower_depth_mm.is_finite() {
+            self.purge_tower_depth_mm = 11.0;
+        }
+        self.purge_tower_depth_mm = self.purge_tower_depth_mm.clamp(6.0, 120.0);
+        if !self.purge_tower_position_xy[0].is_finite() {
+            self.purge_tower_position_xy[0] = 0.0;
+        }
+        if !self.purge_tower_position_xy[1].is_finite() {
+            self.purge_tower_position_xy[1] = 55.0;
+        }
         self.brim_width_mm = self.brim_width_mm.clamp(0.0, 30.0);
         self.brim_gap_mm = self.brim_gap_mm.clamp(0.0, 1.0);
         self.lever_arm_reference_ratio = self.lever_arm_reference_ratio.clamp(0.5, 15.0);
@@ -2155,6 +2339,46 @@ impl GcodeProcessConfig {
         } else {
             self.min_travel_for_retract_mm
         }
+    }
+
+    /// Returns the effective `(width_mm, depth_mm)` footprint of the rectangular-prism purge tower.
+    /// When `purge_tower_auto_dimensions` is `true`, computes a horizontal rectangular footprint
+    /// whose single-layer capacity at `target_layer_height_mm` comfortably holds all toolchanges
+    /// on a layer horizontally side-by-side without stacking vertically.
+    pub fn effective_purge_tower_dimensions_mm(
+        &self,
+        target_layer_height_mm: f32,
+        nozzle_diam_mm: f32,
+    ) -> (f32, f32) {
+        self.effective_purge_tower_dimensions_for_swaps_mm(target_layer_height_mm, nozzle_diam_mm, 1)
+    }
+
+    /// Returns the effective `(width_mm, depth_mm)` footprint of the rectangular-prism purge tower
+    /// scaled horizontally to accommodate `swaps_per_layer` toolchanges on a single tower layer.
+    pub fn effective_purge_tower_dimensions_for_swaps_mm(
+        &self,
+        target_layer_height_mm: f32,
+        nozzle_diam_mm: f32,
+        swaps_per_layer: usize,
+    ) -> (f32, f32) {
+        if !self.purge_tower_auto_dimensions {
+            return (
+                self.purge_tower_width_mm.clamp(8.0, 160.0),
+                self.purge_tower_depth_mm.clamp(6.0, 120.0),
+            );
+        }
+        let d_noz = nozzle_diam_mm.max(0.20);
+        let h_ref = target_layer_height_mm.clamp(0.12, 0.65 * d_noz);
+        let swaps = swaps_per_layer.clamp(1, 16) as f32;
+        // Include a 1.35x packing margin so perimeter insets and scanline turnarounds never spill
+        // a single layer's purges onto a second vertical layer; grow width horizontally with swaps!
+        let single_vol = self.min_purge_volume_mm3.max(5.0) * 1.35;
+        let single_area = single_vol / (0.85 * h_ref);
+        let base_depth = (0.55 * single_area).sqrt().clamp(10.0, 45.0);
+        let base_width = (single_area / base_depth).max(16.0);
+        let total_width = (base_width * swaps.sqrt() * 1.15).clamp(16.0, 160.0);
+        let total_depth = (base_depth * swaps.powf(0.35)).clamp(10.0, 80.0);
+        (total_width, total_depth)
     }
 }
 
@@ -2838,7 +3062,7 @@ impl SlicerConfig {
         self.filament_slots = slots;
     }
 
-    /// Returns the resolved tool index into `self.tools` used for support structures
+    /// Returns the resolved tool index into `self.tools` used for support base structures
     /// (`slicing.support_tool_index` if set and valid, otherwise `active_tool_index`).
     pub fn support_tool_index_resolved(&self) -> usize {
         if self.tools.is_empty() {
@@ -2851,12 +3075,34 @@ impl SlicerConfig {
         }
     }
 
-    /// Returns the tool configuration used for support structures (`Support` and `SupportInterface`).
+    /// Returns the tool configuration used for support base structures (`Support`).
     pub fn support_tool(&self) -> Option<&ToolConfig> {
         if self.tools.is_empty() {
             None
         } else {
             self.tools.get(self.support_tool_index_resolved())
+        }
+    }
+
+    /// Returns the resolved tool index into `self.tools` used for dense support interface structures
+    /// (`slicing.support_interface_tool_index` if set, otherwise `support_tool_index_resolved()`).
+    pub fn support_interface_tool_index_resolved(&self) -> usize {
+        if self.tools.is_empty() {
+            return 0;
+        }
+        let max_idx = self.tools.len() - 1;
+        match self.slicing.support_interface_tool_index {
+            Some(idx) => idx.min(max_idx),
+            None => self.support_tool_index_resolved(),
+        }
+    }
+
+    /// Returns the tool configuration used for dense support interface structures (`SupportInterface`).
+    pub fn support_interface_tool(&self) -> Option<&ToolConfig> {
+        if self.tools.is_empty() {
+            None
+        } else {
+            self.tools.get(self.support_interface_tool_index_resolved())
         }
     }
 
@@ -2972,6 +3218,62 @@ impl SlicerConfig {
     /// to obtain printer G-code coordinates (where `(0, 0)` is at [`Self::gcode_origin_scene_pos`]).
     pub fn scene_to_gcode_offset(&self) -> Vec3 {
         -self.gcode_origin_scene_pos()
+    }
+
+    /// Resolves the purge tower's `(center_xy_scene, [width_mm, depth_mm])` in scene build-plate
+    /// coordinates (`(0, 0)` at bed center), given an optional `([min_x, min_y], [max_x, max_y])`
+    /// bounding box of printable objects on the plate and `swaps_per_layer`.
+    pub fn resolve_purge_tower_footprint_scene(
+        &self,
+        objects_aabb_xy: Option<([f32; 2], [f32; 2])>,
+        swaps_per_layer: usize,
+    ) -> ([f32; 2], [f32; 2]) {
+        let noz_d = self
+            .active_tool()
+            .map(|t| t.nozzle_diameter_mm)
+            .unwrap_or(0.40);
+        let (width_x, depth_y) = self.gcode.effective_purge_tower_dimensions_for_swaps_mm(
+            self.slicing.layer_height.target_mm,
+            noz_d,
+            swaps_per_layer,
+        );
+        let edge_margin = self.arrangement.bed_edge_margin_mm.max(4.0);
+        let half_bed_x = (0.5 * self.bed.width_x - edge_margin - 0.5 * width_x).max(0.0);
+        let half_bed_y = (0.5 * self.bed.depth_y - edge_margin - 0.5 * depth_y).max(0.0);
+
+        if !self.gcode.purge_tower_auto_position {
+            let cx = self.gcode.purge_tower_position_xy[0].clamp(-half_bed_x, half_bed_x);
+            let cy = self.gcode.purge_tower_position_xy[1].clamp(-half_bed_y, half_bed_y);
+            return ([cx, cy], [width_x, depth_y]);
+        }
+
+        let ([min_x, min_y], [max_x, max_y]) =
+            objects_aabb_xy.unwrap_or(([-20.0, -20.0], [20.0, 20.0]));
+        let clearance = self.arrangement.part_clearance_mm.max(8.0);
+        let obj_cx = 0.5 * (min_x + max_x);
+        let obj_cy = 0.5 * (min_y + max_y);
+
+        let candidates = [
+            // 1. Rear of objects (+Y)
+            [obj_cx, max_y + clearance + 0.5 * depth_y],
+            // 2. Front of objects (-Y)
+            [obj_cx, min_y - clearance - 0.5 * depth_y],
+            // 3. Right of objects (+X)
+            [max_x + clearance + 0.5 * width_x, obj_cy],
+            // 4. Left of objects (-X)
+            [min_x - clearance - 0.5 * width_x, obj_cy],
+        ];
+
+        let mut chosen = candidates[0];
+        for cand in candidates {
+            if cand[0].abs() <= half_bed_x && cand[1].abs() <= half_bed_y {
+                chosen = cand;
+                break;
+            }
+        }
+        let cx = chosen[0].clamp(-half_bed_x, half_bed_x);
+        let cy = chosen[1].clamp(-half_bed_y, half_bed_y);
+        ([cx, cy], [width_x, depth_y])
     }
 
     pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
@@ -3379,6 +3681,51 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         default_value: "0.08 (8%)",
         summary: "Lateral overlap with the adjacent existing extrusion as a fraction of standard line width.",
         details: "Wave overhang passes are ordered inside-out and maintain continuous contact at this overlap even when line width changes or the 3D centerline rotates around the existing extrusion, with extrusion volume scaled accordingly.",
+    },
+    ParameterDoc {
+        key: "slicing.infill_filament_mode",
+        category: "Shell & Toolpath Generation",
+        title: "Sparse Infill Filament / Tool Selection",
+        units: "enum",
+        default_value: "Follow Object / Region Filament",
+        summary: "Selects which extruder tool or filament slot prints Sparse Infill, or 'Auto (Purge into Infill)' to absorb toolchange purges and minimize swaps.",
+        details: "Can be set to Follow Object, Auto (uses whichever tool is currently active to avoid extra toolchanges, and routes incoming tools through sparse infill first to flush purge volume), a specific Machine Tool (T0..Tn), or a 3MF / Virtual Filament Slot.",
+    },
+    ParameterDoc {
+        key: "slicing.support_interface_tool_index",
+        category: "Support Generation",
+        title: "Support Interface Tool / Filament",
+        units: "tool",
+        default_value: "Follow Support Base Tool",
+        summary: "Selects a dedicated extruder tool/material specifically for dense support interface roofs and floors.",
+        details: "Allows printing bulk support base columns/trees with the primary model material while using soluble (PVA/HIPS) or breakaway (PETG/PLA) filament exclusively on the dense interface contact layers.",
+    },
+    ParameterDoc {
+        key: "gcode.purge_mode",
+        category: "Multi-Filament Purge & Prime Tower",
+        title: "Toolchange Purge Mode (Tower vs. Purge into Infill)",
+        units: "enum",
+        default_value: "Disabled",
+        summary: "Selects how residual filament in the nozzle melt zone is purged after a multi-colour toolchange (`T_old -> T_new`).",
+        details: "Supports 'Purge Tower' (rectangular prism sized for `min_purge_volume_mm3`), 'Purge into Infill + Minimal Tower Fallback' (flushes `T_new` inside the part's sparse infill first and only deposits any remaining deficit on the non-planar purge tower), and 'Purge into Infill Only'. Because Manifold2 supports 3D Z-travel over `PrintedHeightMap`, the purge tower only grows when a toolchange actually requires tower purging—wasting zero filament on layers without toolchanges!",
+    },
+    ParameterDoc {
+        key: "gcode.min_purge_volume_mm3",
+        category: "Multi-Filament Purge & Prime Tower",
+        title: "Minimum Toolchange Purge Volume",
+        units: "mm³",
+        default_value: "45.0 mm³",
+        summary: "Minimum polymer volume (mm³) to flush through the nozzle after each toolchange before printing visible exterior walls or shells.",
+        details: "In 'Purge into Infill + Minimal Tower Fallback' mode, available sparse infill on the current layer absorbs up to this volume first, and only the residual deficit `max(0, min_purge_volume_mm3 - V_infill)` is extruded onto the purge tower.",
+    },
+    ParameterDoc {
+        key: "gcode.purge_tower_auto_dimensions",
+        category: "Multi-Filament Purge & Prime Tower",
+        title: "Purge Tower Rectangular Prism Dimensions",
+        units: "mm",
+        default_value: "Auto (from Min Purge Volume)",
+        summary: "Automatically chooses the rectangular prism purge tower width and depth from `min_purge_volume_mm3` and target layer height, or uses custom dimensions.",
+        details: "Because non-planar Z-travel is allowed, partial residual purge volumes automatically scale layer thickness and serpentine pass length on top of the tower's current elevation without printing empty placeholder layers.",
     },
     ParameterDoc {
         key: "slicing.enable_support_generation",

@@ -4,8 +4,8 @@ use bevy::prelude::*;
 
 use crate::bridge::ffi::ObjectToolpathsResult;
 use crate::config::{
-    FiveAxisKinematicsMode, GcodeDialect, GcodeProcessConfig, MachineKinematicsConfig,
-    SlicerConfig, WallPrintOrder,
+    FiveAxisKinematicsMode, GcodeDialect, GcodeProcessConfig, InfillFilamentMode,
+    MachineKinematicsConfig, PurgeMode, SlicerConfig, WallPrintOrder,
 };
 
 /// Formats a firmware-specific dynamic Pressure Advance command for `dialect`.
@@ -49,6 +49,7 @@ pub enum PlannedMoveKind {
     Travel = 10,
     ZHop = 11,
     Wipe = 12,
+    PurgeTower = 13,
 }
 
 impl PlannedMoveKind {
@@ -63,6 +64,7 @@ impl PlannedMoveKind {
             6 => Self::WaveOverhang,
             7 => Self::Support,
             8 => Self::SupportInterface,
+            13 => Self::PurgeTower,
             _ => Self::SolidInfill,
         }
     }
@@ -80,6 +82,7 @@ impl PlannedMoveKind {
                 | Self::Support
                 | Self::SupportInterface
                 | Self::ScarfSeam
+                | Self::PurgeTower
         )
     }
 
@@ -109,6 +112,7 @@ impl PlannedMoveKind {
             Self::Travel => "Travel",
             Self::ZHop => "Z-Hop",
             Self::Wipe => "Wipe",
+            Self::PurgeTower => "Purge Tower",
         }
     }
 }
@@ -1091,14 +1095,30 @@ fn order_chain_band_single_slot(
     );
     let mut curr_pos = start_pos_bed;
 
-    // 0. Print Support Base and Support Interface chains first on each band so overhanging
-    //    walls, wave overhangs, and bridges have their support foundation in place.
+    // 0. Print Support Base before Support Interface on each band so overhanging
+    //    interfaces, walls, wave overhangs, and bridges have their support foundation in place,
+    //    and group by `filament_slot` within each tier to avoid unnecessary toolchanges.
     let mut used_supports = vec![false; supports.len()];
     for _ in 0..supports.len() {
+        let min_sup_tier = supports
+            .iter()
+            .enumerate()
+            .filter(|(i, sp)| !used_supports[*i] && !sp.pts.is_empty())
+            .map(|(_, sp)| {
+                let is_iface = u16::from(sp.base_kind == PlannedMoveKind::SupportInterface);
+                (is_iface << 8) | (sp.filament_slot as u16)
+            })
+            .min()
+            .unwrap_or(0);
         let mut best_i = 0usize;
         let mut best_d = f32::MAX;
         for (i, sp) in supports.iter().enumerate() {
             if used_supports[i] || sp.pts.is_empty() {
+                continue;
+            }
+            let tier = (u16::from(sp.base_kind == PlannedMoveKind::SupportInterface) << 8)
+                | (sp.filament_slot as u16);
+            if tier != min_sup_tier {
                 continue;
             }
             let d = weighted_dist_sq(curr_pos, sp.pts.first().unwrap().pos_bed)
@@ -2126,7 +2146,10 @@ pub fn compute_exclude_object_polygon_2d(
     let mut pts: Vec<[f32; 2]> = Vec::new();
     for layer in layers {
         for seg in &layer.segments {
-            if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
+            if seg.kind.is_extruding()
+                && seg.kind != PlannedMoveKind::PurgeTower
+                && seg.delta_e_mm > 1.0e-6
+            {
                 pts.push([seg.p0_bed.x, seg.p0_bed.y]);
                 pts.push([seg.p1_bed.x, seg.p1_bed.y]);
             }
@@ -2363,6 +2386,7 @@ pub fn render_toolpath_preview_thumbnails(
                 PlannedMoveKind::WaveOverhang => [0.88, 0.32, 0.86],
                 PlannedMoveKind::Support => [0.18, 0.82, 0.72],
                 PlannedMoveKind::SupportInterface => [0.10, 0.94, 0.88],
+                PlannedMoveKind::PurgeTower => [0.96, 0.44, 0.64],
                 _ => [0.85, 0.50, 0.18],
             };
 
@@ -3033,7 +3057,11 @@ fn apply_lever_arm_and_curl_slowdown(
     let mut part_ext_cnt = 0usize;
 
     for seg in layer_segments.iter() {
-        if seg.kind.is_extruding() && !seg.kind.is_support() && seg.delta_e_mm > 1.0e-6 {
+        if seg.kind.is_extruding()
+            && !seg.kind.is_support()
+            && seg.kind != PlannedMoveKind::PurgeTower
+            && seg.delta_e_mm > 1.0e-6
+        {
             let (u, v, _) = footprint.basis.project_uvh(0.5 * (seg.p0_bed + seg.p1_bed));
             u_min_layer = u_min_layer.min(u);
             u_max_layer = u_max_layer.max(u);
@@ -3442,6 +3470,745 @@ fn compute_layer_fan_pwm_schedule(
     pwm_schedule
 }
 
+/// Estimates the extruded polymer volume ($\text{mm}^3$) of a single segment `(a -> b)`.
+fn estimate_segment_polymer_volume_mm3(
+    a: &WorkingVertex,
+    b: &WorkingVertex,
+    is_first_layer: bool,
+    ext_mult: f32,
+) -> f32 {
+    let seg_len = (b.pos_bed - a.pos_bed).length();
+    let rate_mult = b.flow_rate_mult;
+    if seg_len <= 1.0e-5 || rate_mult <= 1.0e-4 {
+        return 0.0;
+    }
+    let w = (0.5 * (a.width_mm + b.width_mm)).max(0.08);
+    let h = (0.5 * (a.height_mm + b.height_mm)).max(0.02);
+    let w_eff = w.max(h);
+    let a_bead = if is_first_layer {
+        w_eff * h
+    } else {
+        h * (w_eff - h) + std::f32::consts::FRAC_PI_4 * h * h
+    };
+    seg_len * a_bead * rate_mult * ext_mult
+}
+
+/// Splits `chain` into `(head_chain, optional_tail_chain, head_volume_mm3)` so that `head_chain`
+/// has extruded polymer volume as close as possible to `target_vol_mm3`.
+fn split_working_chain_at_volume(
+    chain: &WorkingChain,
+    target_vol_mm3: f32,
+    is_first_layer: bool,
+    ext_mult: f32,
+) -> (WorkingChain, Option<WorkingChain>, f32) {
+    if chain.pts.len() < 2 || target_vol_mm3 <= 1.0e-4 {
+        return (chain.clone(), None, 0.0);
+    }
+    let total_vol: f32 = chain
+        .pts
+        .windows(2)
+        .map(|w| estimate_segment_polymer_volume_mm3(&w[0], &w[1], is_first_layer, ext_mult))
+        .sum();
+    if total_vol <= target_vol_mm3 + 0.35 {
+        return (chain.clone(), None, total_vol);
+    }
+
+    let mut accum_vol = 0.0f32;
+    for (seg_idx, w) in chain.pts.windows(2).enumerate() {
+        let a = &w[0];
+        let b = &w[1];
+        let seg_vol = estimate_segment_polymer_volume_mm3(a, b, is_first_layer, ext_mult);
+        if accum_vol + seg_vol >= target_vol_mm3 {
+            let need = (target_vol_mm3 - accum_vol).max(0.0);
+            let t = if seg_vol > 1.0e-5 {
+                (need / seg_vol).clamp(0.05, 0.95)
+            } else {
+                0.5
+            };
+            let mid_v = WorkingVertex {
+                pos_bed: a.pos_bed.lerp(b.pos_bed, t),
+                nozzle_bed: a.nozzle_bed.lerp(b.nozzle_bed, t).normalize_or_zero(),
+                width_mm: a.width_mm + t * (b.width_mm - a.width_mm),
+                height_mm: a.height_mm + t * (b.height_mm - a.height_mm),
+                flow_rate_mult: a.flow_rate_mult + t * (b.flow_rate_mult - a.flow_rate_mult),
+                kind_override: b.kind_override,
+                tool_iso_angle_deg: a.tool_iso_angle_deg
+                    + t * (b.tool_iso_angle_deg - a.tool_iso_angle_deg),
+                uses_surface_normal: a.uses_surface_normal && b.uses_surface_normal,
+            };
+
+            let mut head_pts = Vec::with_capacity(seg_idx + 2);
+            head_pts.extend_from_slice(&chain.pts[..=seg_idx]);
+            head_pts.push(mid_v.clone());
+
+            let mut tail_pts = Vec::with_capacity(chain.pts.len() - seg_idx);
+            tail_pts.push(mid_v);
+            tail_pts.extend_from_slice(&chain.pts[(seg_idx + 1)..]);
+
+            let head_chain = WorkingChain {
+                pts: head_pts,
+                base_kind: chain.base_kind,
+                wall_index: chain.wall_index,
+                filament_slot: chain.filament_slot,
+                is_closed: false,
+            };
+            let tail_chain = WorkingChain {
+                pts: tail_pts,
+                base_kind: chain.base_kind,
+                wall_index: chain.wall_index,
+                filament_slot: chain.filament_slot,
+                is_closed: false,
+            };
+            return (head_chain, Some(tail_chain), target_vol_mm3);
+        }
+        accum_vol += seg_vol;
+    }
+
+    (chain.clone(), None, total_vol)
+}
+
+/// Truncates a polyline of `WorkingVertex` items to exact Euclidean arc length `max_arc_len_mm`.
+fn truncate_vertices_to_arc_length(pts: Vec<WorkingVertex>, max_arc_len_mm: f32) -> Vec<WorkingVertex> {
+    if pts.len() < 2 || max_arc_len_mm <= 1.0e-4 {
+        return pts;
+    }
+    let mut out = Vec::with_capacity(pts.len());
+    out.push(pts[0].clone());
+    let mut accum_len = 0.0f32;
+    for w in pts.windows(2) {
+        let a = &w[0];
+        let b = &w[1];
+        let seg_len = (b.pos_bed - a.pos_bed).length();
+        if seg_len <= 1.0e-6 {
+            continue;
+        }
+        if accum_len + seg_len >= max_arc_len_mm {
+            let t = ((max_arc_len_mm - accum_len) / seg_len).clamp(0.02, 1.0);
+            out.push(WorkingVertex {
+                pos_bed: a.pos_bed.lerp(b.pos_bed, t),
+                nozzle_bed: a.nozzle_bed.lerp(b.nozzle_bed, t).normalize_or_zero(),
+                width_mm: a.width_mm + t * (b.width_mm - a.width_mm),
+                height_mm: a.height_mm + t * (b.height_mm - a.height_mm),
+                flow_rate_mult: b.flow_rate_mult,
+                kind_override: b.kind_override,
+                tool_iso_angle_deg: 0.0,
+                uses_surface_normal: false,
+            });
+            return out;
+        }
+        out.push(b.clone());
+        accum_len += seg_len;
+    }
+    out
+}
+
+/// Non-planar minimal rectangular-prism purge tower generator.
+///
+/// Because Manifold2 supports full 3D Z-travel (`up_bed = -gravity_direction_bed`) with obstacle
+/// clearance over [`PrintedHeightMap`], the purge tower tracks its own independent top elevation
+/// `current_h_mm` and only grows when a toolchange actually requires tower purging—wasting zero
+/// material on layers without toolchanges or when 100% of the purge is absorbed into Sparse Infill!
+struct NonPlanarPurgeTowerState {
+    basis: BedUpBasis,
+    center_u: f32,
+    center_v: f32,
+    width_u: f32,
+    depth_v: f32,
+    current_h_mm: f32,
+    /// Horizontal offset cursor `[0.0 .. usable_w]` within the current tower layer at `current_h_mm`.
+    /// Purges pack horizontally side-by-side across `width_u` before stepping `current_h_mm` up!
+    cursor_u_offset_mm: f32,
+    layers_deposited: usize,
+    include_brim: bool,
+    brim_emitted: bool,
+}
+
+impl NonPlanarPurgeTowerState {
+    fn from_raw_toolpaths(
+        raw_toolpaths: &ObjectToolpathsResult,
+        obj_world_tf: Transform,
+        bed_origin_offset: Vec3,
+        basis: BedUpBasis,
+        config: &SlicerConfig,
+        gcfg: &GcodeProcessConfig,
+        nozzle_diam_mm: f32,
+    ) -> Self {
+        let mut u_min = f32::MAX;
+        let mut u_max = f32::MIN;
+        let mut v_min = f32::MAX;
+        let mut v_max = f32::MIN;
+        let mut h_min = f32::MAX;
+
+        // Estimate toolchanges per layer and total toolchanges across the print so the tower
+        // expands horizontally across the build plate rather than stacking tall vertically!
+        let mut peak_swaps_per_layer = 1usize;
+        let mut total_estimated_swaps = 0usize;
+        for layer in &raw_toolpaths.layers {
+            let mut layer_tools: Vec<u32> = Vec::new();
+            for path in &layer.paths {
+                for pt in &path.points {
+                    let p_bed =
+                        obj_world_tf.transform_point(Vec3::new(pt.x, pt.y, pt.z)) + bed_origin_offset;
+                    let (u, v, h) = basis.project_uvh(p_bed);
+                    u_min = u_min.min(u);
+                    u_max = u_max.max(u);
+                    v_min = v_min.min(v);
+                    v_max = v_max.max(v);
+                    h_min = h_min.min(h);
+                }
+                let tid = match path.feature_kind {
+                    7 => config
+                        .support_tool()
+                        .map(|t| t.id)
+                        .unwrap_or(0),
+                    8 => config
+                        .support_interface_tool()
+                        .map(|t| t.id)
+                        .unwrap_or(0),
+                    _ => config.tool_id_for_filament_slot(path.filament_slot),
+                };
+                if !layer_tools.contains(&tid) {
+                    layer_tools.push(tid);
+                }
+            }
+            if layer_tools.len() >= 2 {
+                let swaps = layer_tools.len() - 1;
+                peak_swaps_per_layer = peak_swaps_per_layer.max(swaps);
+                total_estimated_swaps += swaps;
+            }
+        }
+        if !u_min.is_finite() || u_min > u_max {
+            let (u0, v0, h0) = basis.project_uvh(bed_origin_offset);
+            u_min = u0 - 10.0;
+            u_max = u0 + 10.0;
+            v_min = v0 - 10.0;
+            v_max = v0 + 10.0;
+            h_min = h0 + config.slicing.layer_height.first_layer_mm.max(0.20);
+        }
+
+        // Pack multiple purges horizontally side-by-side on each tower Z layer so the tower stays
+        // low-profile vertically and grows horizontally across the bed as needed.
+        let horiz_strips_per_layer = (peak_swaps_per_layer * 3)
+            .max((total_estimated_swaps / 6).max(3))
+            .min(total_estimated_swaps.max(2))
+            .clamp(2, 12);
+        let (width_u, depth_v) = gcfg.effective_purge_tower_dimensions_for_swaps_mm(
+            config.slicing.layer_height.target_mm,
+            nozzle_diam_mm,
+            horiz_strips_per_layer,
+        );
+        let clearance = config.arrangement.part_clearance_mm.max(8.0);
+        let edge_margin = config.arrangement.bed_edge_margin_mm.max(4.0);
+        let (orig_u, orig_v, _) = basis.project_uvh(bed_origin_offset);
+        let bed_u_min = orig_u - 0.5 * config.bed.width_x + edge_margin;
+        let bed_u_max = orig_u + 0.5 * config.bed.width_x - edge_margin;
+        let bed_v_min = orig_v - 0.5 * config.bed.depth_y + edge_margin;
+        let bed_v_max = orig_v + 0.5 * config.bed.depth_y - edge_margin;
+
+        let min_cu = bed_u_min + 0.5 * width_u;
+        let max_cu = (bed_u_max - 0.5 * width_u).max(min_cu);
+        let min_cv = bed_v_min + 0.5 * depth_v;
+        let max_cv = (bed_v_max - 0.5 * depth_v).max(min_cv);
+
+        let (center_u, center_v) = if !gcfg.purge_tower_auto_position {
+            let p_manual_bed = Vec3::new(
+                gcfg.purge_tower_position_xy[0],
+                gcfg.purge_tower_position_xy[1],
+                0.0,
+            ) + bed_origin_offset;
+            let (mu, mv, _) = basis.project_uvh(p_manual_bed);
+            (mu.clamp(min_cu, max_cu), mv.clamp(min_cv, max_cv))
+        } else {
+            let obj_cu = 0.5 * (u_min + u_max);
+            let obj_cv = 0.5 * (v_min + v_max);
+            let candidates = [
+                // 1. Rear of object (+V)
+                (obj_cu, v_max + clearance + 0.5 * depth_v),
+                // 2. Front of object (-V)
+                (obj_cu, v_min - clearance - 0.5 * depth_v),
+                // 3. Right of object (+U)
+                (u_max + clearance + 0.5 * width_u, obj_cv),
+                // 4. Left of object (-U)
+                (u_min - clearance - 0.5 * width_u, obj_cv),
+            ];
+
+            let mut chosen = candidates[0];
+            for &(cu, cv) in &candidates {
+                if cu - 0.5 * width_u >= bed_u_min
+                    && cu + 0.5 * width_u <= bed_u_max
+                    && cv - 0.5 * depth_v >= bed_v_min
+                    && cv + 0.5 * depth_v <= bed_v_max
+                {
+                    chosen = (cu, cv);
+                    break;
+                }
+            }
+            (chosen.0.clamp(min_cu, max_cu), chosen.1.clamp(min_cv, max_cv))
+        };
+        let start_h = h_min.max(config.slicing.layer_height.first_layer_mm.max(0.15));
+
+        Self {
+            basis,
+            center_u,
+            center_v,
+            width_u,
+            depth_v,
+            current_h_mm: start_h,
+            cursor_u_offset_mm: 0.0,
+            layers_deposited: 0,
+            include_brim: gcfg.purge_tower_brim,
+            brim_emitted: false,
+        }
+    }
+
+    /// Builds a horizontal strip `[u_start .. u_end] x [v0 .. v1]` of serpentine scanlines at `h_mm`
+    /// with bead width `w_mm` and thickness `h_pass_mm`, querying `config.query_nozzle_frame`
+    /// (`AGENTS.md` Rule 1) for every vertex.
+    fn build_horizontal_strip_vertices(
+        &self,
+        u_start: f32,
+        u_end: f32,
+        h_mm: f32,
+        w_mm: f32,
+        h_pass_mm: f32,
+        config: &SlicerConfig,
+    ) -> Vec<WorkingVertex> {
+        let u0 = u_start.min(u_end);
+        let u1 = u_end.max(u0 + 0.5 * w_mm);
+        let v0 = self.center_v - 0.5 * self.depth_v + 0.5 * w_mm;
+        let v1 = (self.center_v + 0.5 * self.depth_v - 0.5 * w_mm).max(v0 + w_mm);
+
+        let pitch = (0.88 * w_mm).max(0.25);
+        let span_u = (u1 - u0).max(0.1);
+        let n_lines = ((span_u / pitch).ceil() as usize).max(1);
+        let mut uv_pts: Vec<(f32, f32)> = Vec::with_capacity(2 * (n_lines + 1));
+
+        for i in 0..=n_lines {
+            let t = (i as f32) / (n_lines as f32);
+            let ux = u0 + t * span_u;
+            if i % 2 == 0 {
+                uv_pts.push((ux, v0));
+                uv_pts.push((ux, v1));
+            } else {
+                uv_pts.push((ux, v1));
+                uv_pts.push((ux, v0));
+            }
+        }
+
+        let mut verts: Vec<WorkingVertex> = Vec::with_capacity(uv_pts.len());
+        for (idx, &(u, v)) in uv_pts.iter().enumerate() {
+            let p_bed = self.basis.unproject_uvh(u, v, h_mm);
+            let next_uv = uv_pts.get(idx + 1).copied().unwrap_or(uv_pts[0]);
+            let p_next = self.basis.unproject_uvh(next_uv.0, next_uv.1, h_mm);
+            let travel_dir = (p_next - p_bed).try_normalize().unwrap_or(self.basis.tangent_u);
+            let nozzle_axis = config
+                .query_nozzle_frame(p_bed, travel_dir)
+                .nozzle_axis
+                .try_normalize()
+                .unwrap_or(self.basis.up_bed);
+            verts.push(WorkingVertex {
+                pos_bed: p_bed,
+                nozzle_bed: nozzle_axis,
+                width_mm: w_mm,
+                height_mm: h_pass_mm,
+                flow_rate_mult: 1.0,
+                kind_override: Some(PlannedMoveKind::PurgeTower),
+                tool_iso_angle_deg: 0.0,
+                uses_surface_normal: false,
+            });
+        }
+        verts
+    }
+
+    /// Generates `PlannedMoveKind::PurgeTower` chain(s) that pack `deficit_vol_mm3` ($\text{mm}^3$)
+    /// **horizontally side-by-side** across `self.width_u` at `self.current_h_mm`, only advancing
+    /// `self.current_h_mm` vertically when the horizontal width of the current tower layer is full!
+    fn generate_purge_chains(
+        &mut self,
+        deficit_vol_mm3: f32,
+        filament_slot: u8,
+        nozzle_diam_mm: f32,
+        ext_mult: f32,
+        is_first_object_layer: bool,
+        config: &SlicerConfig,
+    ) -> Vec<WorkingChain> {
+        if deficit_vol_mm3 <= 0.05 {
+            return Vec::new();
+        }
+        let mut out_chains: Vec<WorkingChain> = Vec::new();
+        let mut rem_vol = deficit_vol_mm3;
+        let w_nom = (1.15 * nozzle_diam_mm).max(0.40);
+        let h_target = config
+            .slicing
+            .layer_height
+            .target_mm
+            .clamp(0.12, 0.65 * nozzle_diam_mm.max(0.20));
+        let eff_ext_mult = ext_mult.max(0.2);
+
+        // On the very first purge tower deposition, optionally emit an outward 1-loop anchor brim
+        // around the rectangular prism base for bed adhesion (counting its volume toward the purge).
+        if !self.brim_emitted && self.include_brim {
+            self.brim_emitted = true;
+            let h_brim = config.slicing.layer_height.first_layer_mm.clamp(0.12, 0.32);
+            let pad = 1.25 * w_nom;
+            let bu0 = self.center_u - 0.5 * self.width_u - pad;
+            let bu1 = self.center_u + 0.5 * self.width_u + pad;
+            let bv0 = self.center_v - 0.5 * self.depth_v - pad;
+            let bv1 = self.center_v + 0.5 * self.depth_v + pad;
+            let brim_uv = [(bu0, bv0), (bu1, bv0), (bu1, bv1), (bu0, bv1), (bu0, bv0)];
+            let mut brim_pts = Vec::with_capacity(5);
+            for (idx, &(u, v)) in brim_uv.iter().enumerate() {
+                let p_bed = self.basis.unproject_uvh(u, v, self.current_h_mm);
+                let next_uv = brim_uv[(idx + 1) % brim_uv.len()];
+                let p_next = self.basis.unproject_uvh(next_uv.0, next_uv.1, self.current_h_mm);
+                let travel_dir = (p_next - p_bed).try_normalize().unwrap_or(self.basis.tangent_u);
+                let nozzle_axis = config
+                    .query_nozzle_frame(p_bed, travel_dir)
+                    .nozzle_axis
+                    .try_normalize()
+                    .unwrap_or(self.basis.up_bed);
+                brim_pts.push(WorkingVertex {
+                    pos_bed: p_bed,
+                    nozzle_bed: nozzle_axis,
+                    width_mm: w_nom,
+                    height_mm: h_brim,
+                    flow_rate_mult: 1.0,
+                    kind_override: Some(PlannedMoveKind::PurgeTower),
+                    tool_iso_angle_deg: 0.0,
+                    uses_surface_normal: false,
+                });
+            }
+            let brim_chain = WorkingChain {
+                pts: brim_pts,
+                base_kind: PlannedMoveKind::PurgeTower,
+                wall_index: 0,
+                filament_slot,
+                is_closed: false,
+            };
+            let brim_vol: f32 = brim_chain
+                .pts
+                .windows(2)
+                .map(|w| {
+                    estimate_segment_polymer_volume_mm3(
+                        &w[0],
+                        &w[1],
+                        is_first_object_layer,
+                        eff_ext_mult,
+                    )
+                })
+                .sum();
+            rem_vol = (rem_vol - brim_vol).max(0.0);
+            out_chains.push(brim_chain);
+        }
+
+        let usable_w = (self.width_u - w_nom).max(2.0 * w_nom);
+        let u_left = self.center_u - 0.5 * usable_w;
+        let u_right = self.center_u + 0.5 * usable_w;
+        let area_target = {
+            let w_eff = w_nom.max(h_target);
+            if is_first_object_layer && self.layers_deposited == 0 {
+                w_eff * h_target
+            } else {
+                h_target * (w_eff - h_target) + std::f32::consts::FRAC_PI_4 * h_target * h_target
+            }
+        };
+        let unit_vol_per_mm = (area_target * eff_ext_mult).max(1.0e-5);
+
+        let mut safety_iter = 0usize;
+        while rem_vol > 0.05 && safety_iter < 16 {
+            safety_iter += 1;
+            let mut avail_u = (usable_w - self.cursor_u_offset_mm).max(0.0);
+            if avail_u < 1.2 * w_nom {
+                self.current_h_mm += h_target;
+                self.cursor_u_offset_mm = 0.0;
+                self.layers_deposited += 1;
+                avail_u = usable_w;
+            }
+
+            let u_start = u_left + self.cursor_u_offset_mm;
+            let avail_pts = self.build_horizontal_strip_vertices(
+                u_start,
+                u_right,
+                self.current_h_mm,
+                w_nom,
+                h_target,
+                config,
+            );
+            let avail_len: f32 = avail_pts
+                .windows(2)
+                .map(|w| (w[1].pos_bed - w[0].pos_bed).length())
+                .sum();
+            if avail_len <= 1.0e-3 {
+                break;
+            }
+            let avail_vol = avail_len * unit_vol_per_mm;
+
+            if rem_vol >= avail_vol {
+                // Fill the remainder of the current horizontal layer and step up to the next Z layer
+                out_chains.push(WorkingChain {
+                    pts: avail_pts,
+                    base_kind: PlannedMoveKind::PurgeTower,
+                    wall_index: 0,
+                    filament_slot,
+                    is_closed: false,
+                });
+                self.current_h_mm += h_target;
+                self.cursor_u_offset_mm = 0.0;
+                self.layers_deposited += 1;
+                rem_vol -= avail_vol;
+            } else {
+                // Pack `rem_vol` horizontally starting at `u_start` without increasing `self.current_h_mm`!
+                let req_len = (rem_vol / unit_vol_per_mm).clamp(0.5, avail_len);
+                let frac_u = (req_len / avail_len).clamp(0.0, 1.0);
+                let strip_u = (avail_u * frac_u).max(w_nom).min(avail_u);
+                let truncated_pts = truncate_vertices_to_arc_length(avail_pts, req_len);
+                if truncated_pts.len() >= 2 {
+                    out_chains.push(WorkingChain {
+                        pts: truncated_pts,
+                        base_kind: PlannedMoveKind::PurgeTower,
+                        wall_index: 0,
+                        filament_slot,
+                        is_closed: false,
+                    });
+                }
+                self.cursor_u_offset_mm += strip_u + 0.85 * w_nom;
+                if self.cursor_u_offset_mm >= usable_w - 1.2 * w_nom {
+                    self.current_h_mm += h_target;
+                    self.cursor_u_offset_mm = 0.0;
+                    self.layers_deposited += 1;
+                }
+                rem_vol = 0.0;
+            }
+        }
+
+        out_chains
+    }
+}
+
+/// Schedules Sparse Infill tool assignment, Purge-into-Infill splitting, and Non-Planar Minimal
+/// Purge Tower chains across a single layer's `ordered_chains`.
+#[allow(clippy::too_many_arguments)]
+fn schedule_layer_infill_and_purge_chains(
+    ordered_chains: Vec<WorkingChain>,
+    is_first_layer: bool,
+    curr_planned_tool_id: u32,
+    default_tool_id: u32,
+    support_tool_id: u32,
+    support_iface_tool_id: u32,
+    config: &SlicerConfig,
+    gcfg: &GcodeProcessConfig,
+    purge_tower: &mut NonPlanarPurgeTowerState,
+) -> Vec<WorkingChain> {
+    if ordered_chains.is_empty() {
+        return ordered_chains;
+    }
+
+    let resolve_chain_tool_id = |ch: &WorkingChain| -> u32 {
+        match ch.base_kind {
+            PlannedMoveKind::Support => support_tool_id,
+            PlannedMoveKind::SupportInterface => support_iface_tool_id,
+            _ => config
+                .tool_for_filament_slot(ch.filament_slot)
+                .map(|t| t.id)
+                .unwrap_or(default_tool_id),
+        }
+    };
+    let tool_idx_for_id = |tid: u32| -> usize {
+        config
+            .tools
+            .iter()
+            .position(|t| t.id == tid)
+            .unwrap_or(config.active_tool_index.min(config.tools.len().saturating_sub(1)))
+    };
+
+    let infill_auto_or_purge_sink = config.slicing.infill_filament_mode
+        == InfillFilamentMode::AutoPurgeIntoInfill
+        || (gcfg.purge_mode.uses_infill_purge()
+            && config.slicing.infill_filament_mode == InfillFilamentMode::FollowObject);
+    let purge_active =
+        gcfg.purge_mode != PurgeMode::Disabled && gcfg.min_purge_volume_mm3 > 0.05;
+
+    if !infill_auto_or_purge_sink && !purge_active {
+        return ordered_chains;
+    }
+
+    let mut sparse_pool: std::collections::VecDeque<WorkingChain> =
+        std::collections::VecDeque::new();
+    let mut non_sparse: Vec<WorkingChain> = Vec::with_capacity(ordered_chains.len());
+
+    if infill_auto_or_purge_sink {
+        for ch in ordered_chains {
+            if ch.base_kind == PlannedMoveKind::SparseInfill {
+                sparse_pool.push_back(ch);
+            } else {
+                non_sparse.push(ch);
+            }
+        }
+    } else {
+        non_sparse = ordered_chains;
+    }
+
+    // If the entire layer consists only of Sparse Infill in auto mode, print it with the
+    // currently active tool (`curr_planned_tool_id`) so zero toolchanges occur.
+    if non_sparse.is_empty() {
+        let active_t_idx = tool_idx_for_id(curr_planned_tool_id);
+        let active_slot = crate::color_optics::encode_direct_tool_slot(active_t_idx);
+        return sparse_pool
+            .into_iter()
+            .map(|mut ch| {
+                ch.filament_slot = active_slot;
+                ch
+            })
+            .collect();
+    }
+
+    // Consolidate `non_sparse` chains on this layer by tool so non-planar 0.60 mm elevation bands
+    // never cause repeated back-and-forth toolchanges within the same slicing layer:
+    // 1. Support Base chains (preserving low-to-high order)
+    // 2. Support Interface chains (preserving low-to-high order)
+    // 3. Object chains grouped by `tool_id` (preserving low-to-high & wall order within each tool),
+    //    promoting the tool already active after supports (`active_after_supports`) to go first!
+    let mut sup_base_chains: Vec<WorkingChain> = Vec::new();
+    let mut sup_iface_chains: Vec<WorkingChain> = Vec::new();
+    let mut obj_tool_groups: Vec<(u32, Vec<WorkingChain>)> = Vec::new();
+
+    for ch in non_sparse {
+        match ch.base_kind {
+            PlannedMoveKind::Support => sup_base_chains.push(ch),
+            PlannedMoveKind::SupportInterface => sup_iface_chains.push(ch),
+            _ => {
+                let tid = resolve_chain_tool_id(&ch);
+                if let Some((_, grp)) = obj_tool_groups.iter_mut().find(|(g_tid, _)| *g_tid == tid) {
+                    grp.push(ch);
+                } else {
+                    obj_tool_groups.push((tid, vec![ch]));
+                }
+            }
+        }
+    }
+
+    let mut runs: Vec<(u32, Vec<WorkingChain>)> = Vec::new();
+    let mut active_after_supports = curr_planned_tool_id;
+    if !sup_base_chains.is_empty() {
+        active_after_supports = support_tool_id;
+        runs.push((support_tool_id, sup_base_chains));
+    }
+    if !sup_iface_chains.is_empty() {
+        active_after_supports = support_iface_tool_id;
+        if let Some((last_tid, last_vec)) = runs.last_mut() {
+            if *last_tid == support_iface_tool_id {
+                last_vec.append(&mut sup_iface_chains);
+            } else {
+                runs.push((support_iface_tool_id, sup_iface_chains));
+            }
+        } else {
+            runs.push((support_iface_tool_id, sup_iface_chains));
+        }
+    }
+
+    if let Some(pos) = obj_tool_groups
+        .iter()
+        .position(|(tid, _)| *tid == active_after_supports)
+    {
+        if pos > 0 {
+            let promoted = obj_tool_groups.remove(pos);
+            obj_tool_groups.insert(0, promoted);
+        }
+    }
+    for (tid, mut grp) in obj_tool_groups {
+        if let Some((last_tid, last_vec)) = runs.last_mut() {
+            if *last_tid == tid {
+                last_vec.append(&mut grp);
+                continue;
+            }
+        }
+        runs.push((tid, grp));
+    }
+
+    let mut final_chains: Vec<WorkingChain> = Vec::with_capacity(runs.len() * 4 + sparse_pool.len());
+    let mut sim_tool_id = curr_planned_tool_id;
+
+    for (run_tool_id, run_chains) in runs {
+        if run_tool_id != sim_tool_id {
+            let run_t_idx = tool_idx_for_id(run_tool_id);
+            let run_tool_cfg = config.tools.get(run_t_idx);
+            let run_nozzle_diam = run_tool_cfg
+                .map(|t| t.nozzle_diameter_mm.max(0.10))
+                .unwrap_or(0.40);
+            let run_ext_mult = run_tool_cfg
+                .map(|t| t.extrusion_multiplier)
+                .unwrap_or(gcfg.extrusion_multiplier)
+                * if is_first_layer {
+                    gcfg.first_layer_flow_multiplier
+                } else {
+                    1.0
+                };
+            let run_direct_slot = crate::color_optics::encode_direct_tool_slot(run_t_idx);
+
+            let req_purge_mm3 = if purge_active {
+                gcfg.min_purge_volume_mm3.max(0.0)
+            } else {
+                0.0
+            };
+            let mut purged_in_infill_mm3 = 0.0f32;
+            let mut infill_purge_chains: Vec<WorkingChain> = Vec::new();
+
+            // 1. Absorb as much of `req_purge_mm3` as possible into available Sparse Infill on this layer
+            if gcfg.purge_mode.uses_infill_purge() && req_purge_mm3 > 0.05 {
+                while purged_in_infill_mm3 + 0.05 < req_purge_mm3 && !sparse_pool.is_empty() {
+                    let mut sp_ch = sparse_pool.pop_front().unwrap();
+                    sp_ch.filament_slot = run_direct_slot;
+                    let needed = (req_purge_mm3 - purged_in_infill_mm3).max(0.0);
+                    let (head_ch, tail_opt, head_vol) = split_working_chain_at_volume(
+                        &sp_ch,
+                        needed,
+                        is_first_layer,
+                        run_ext_mult,
+                    );
+                    infill_purge_chains.push(head_ch);
+                    purged_in_infill_mm3 += head_vol;
+                    if let Some(tail_ch) = tail_opt {
+                        sparse_pool.push_front(tail_ch);
+                    }
+                }
+            }
+
+            // 2. If residual purge deficit remains, deposit only the deficit on the Non-Planar Minimal Purge Tower
+            let deficit_mm3 = (req_purge_mm3 - purged_in_infill_mm3).max(0.0);
+            if gcfg.purge_mode.uses_purge_tower() && deficit_mm3 > 0.05 {
+                let tower_chains = purge_tower.generate_purge_chains(
+                    deficit_mm3,
+                    run_direct_slot,
+                    run_nozzle_diam,
+                    run_ext_mult,
+                    is_first_layer,
+                    config,
+                );
+                final_chains.extend(tower_chains);
+            }
+
+            // 3. Emit the purge-absorbing Sparse Infill chains before visible walls of `run_tool_id`
+            final_chains.extend(infill_purge_chains);
+            sim_tool_id = run_tool_id;
+        }
+
+        final_chains.extend(run_chains);
+    }
+
+    // 4. Any remaining Sparse Infill chains in `sparse_pool` adopt the final active tool on this layer
+    //    so they print with zero extra toolchanges!
+    if !sparse_pool.is_empty() {
+        let final_t_idx = tool_idx_for_id(sim_tool_id);
+        let final_slot = crate::color_optics::encode_direct_tool_slot(final_t_idx);
+        for mut sp_ch in sparse_pool {
+            sp_ch.filament_slot = final_slot;
+            final_chains.push(sp_ch);
+        }
+    }
+
+    final_chains
+}
+
 /// Executes the complete Toolpath-to-Gcode planning & emission pipeline on `raw_toolpaths`.
 pub fn plan_and_emit_gcode(
     raw_toolpaths: &ObjectToolpathsResult,
@@ -3508,6 +4275,27 @@ pub fn plan_and_emit_gcode_for_object(
         })
         .unwrap_or(max_tool_tilt_deg);
 
+    let support_iface_tool = config.support_interface_tool();
+    let support_iface_tool_id = support_iface_tool.map(|t| t.id).unwrap_or(support_tool_id);
+    let support_iface_nozzle_diam_mm = support_iface_tool
+        .map(|t| t.nozzle_diameter_mm)
+        .unwrap_or(support_nozzle_diam_mm)
+        .max(0.10);
+    let support_iface_nozzle_temp_c = support_iface_tool
+        .map(|t| t.temperature_celsius)
+        .unwrap_or(support_nozzle_temp_c);
+    let support_iface_max_tool_tilt_deg = support_iface_tool
+        .map(|t| {
+            if t.has_rotational_axes {
+                t.max_angle_from_bed_normal_deg
+            } else if is_five_axis_bc {
+                max_bs_bound
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(support_max_tool_tilt_deg);
+
     // Query gravity direction in bed coordinates (AGENTS.md Rule 2: never hardcode -Z!)
     let gravity_bed = config.query_gravity_bed(Vec3::ZERO);
     let up_bed = (-gravity_bed).try_normalize().unwrap_or(Vec3::Z);
@@ -3518,6 +4306,15 @@ pub fn plan_and_emit_gcode_for_object(
     // Viewport scene places (0, 0) at the center of the build plate (`[-width_x/2 .. +width_x/2]`),
     // whereas rectangular printers expect G-code (0, 0) at the front-left corner (`[0 .. width_x]`).
     let bed_origin_offset = config.scene_to_gcode_offset();
+    let mut purge_tower = NonPlanarPurgeTowerState::from_raw_toolpaths(
+        raw_toolpaths,
+        obj_world_tf,
+        bed_origin_offset,
+        bed_basis,
+        config,
+        &gcfg,
+        nozzle_diam_mm,
+    );
 
     let inv_world_mat = obj_world_tf.compute_matrix().inverse();
     let to_local_pos =
@@ -3548,8 +4345,17 @@ pub fn plan_and_emit_gcode_for_object(
     } else {
         gcfg.clone()
     };
+    let support_iface_tool_gcfg = if use_per_tool_filament {
+        support_iface_tool
+            .map(|t| t.effective_gcode_config(&gcfg))
+            .unwrap_or_else(|| support_tool_gcfg.clone())
+    } else {
+        gcfg.clone()
+    };
     let fluid = FluidDynamicsModel::from_config(&active_tool_gcfg, nozzle_temp_c);
     let support_fluid = FluidDynamicsModel::from_config(&support_tool_gcfg, support_nozzle_temp_c);
+    let support_iface_fluid =
+        FluidDynamicsModel::from_config(&support_iface_tool_gcfg, support_iface_nozzle_temp_c);
     let min_retract_travel_mm = gcfg.effective_min_travel_for_retract();
 
     let mut planned_layers: Vec<PlannedLayerGcode> = Vec::with_capacity(raw_toolpaths.layers.len());
@@ -3604,14 +4410,48 @@ pub fn plan_and_emit_gcode_for_object(
                 })
                 .collect();
 
+            let mut resolved_slot = raw_path.filament_slot;
+            match base_kind {
+                PlannedMoveKind::Support => {
+                    if config.slicing.support_tool_index.is_some() {
+                        resolved_slot = crate::color_optics::encode_direct_tool_slot(
+                            config.support_tool_index_resolved(),
+                        );
+                    }
+                }
+                PlannedMoveKind::SupportInterface => {
+                    if config.slicing.support_interface_tool_index.is_some()
+                        || config.slicing.support_tool_index.is_some()
+                    {
+                        resolved_slot = crate::color_optics::encode_direct_tool_slot(
+                            config.support_interface_tool_index_resolved(),
+                        );
+                    }
+                }
+                PlannedMoveKind::SparseInfill => match config.slicing.infill_filament_mode {
+                    InfillFilamentMode::SingleTool(t_idx) => {
+                        resolved_slot = crate::color_optics::encode_direct_tool_slot(
+                            t_idx.min(config.tools.len().saturating_sub(1)),
+                        );
+                    }
+                    InfillFilamentMode::FilamentSlot(s_idx) => {
+                        if crate::color_optics::decode_direct_tool_slot(resolved_slot).is_none() {
+                            resolved_slot = s_idx;
+                        }
+                    }
+                    InfillFilamentMode::FollowObject | InfillFilamentMode::AutoPurgeIntoInfill => {}
+                },
+                _ => {}
+            }
+
             let mut wc = WorkingChain {
                 pts,
                 base_kind,
                 wall_index: raw_path.wall_index,
                 is_closed: raw_path.is_closed,
-                filament_slot: raw_path.filament_slot,
+                filament_slot: resolved_slot,
             };
-            let slot_tool = config.tool_for_filament_slot(raw_path.filament_slot);
+            let slot_tool = config.tool_for_filament_slot(wc.filament_slot);
             let slot_nozzle_diam_mm = slot_tool
                 .map(|t| t.nozzle_diameter_mm.max(0.1))
                 .unwrap_or(nozzle_diam_mm);
@@ -3631,20 +4471,20 @@ pub fn plan_and_emit_gcode_for_object(
                 .unwrap_or(max_tool_tilt_deg);
             let slot_tool_gcfg = tool_gcfg_for(slot_tool);
             let slot_fluid = FluidDynamicsModel::from_config(&slot_tool_gcfg, slot_nozzle_temp_c);
-            let chain_nozzle_diam = if base_kind.is_support() {
-                support_nozzle_diam_mm
-            } else {
-                slot_nozzle_diam_mm
+            let chain_nozzle_diam = match base_kind {
+                PlannedMoveKind::Support => support_nozzle_diam_mm,
+                PlannedMoveKind::SupportInterface => support_iface_nozzle_diam_mm,
+                _ => slot_nozzle_diam_mm,
             };
-            let chain_max_tilt_deg = if base_kind.is_support() {
-                support_max_tool_tilt_deg
-            } else {
-                slot_max_tilt_deg
+            let chain_max_tilt_deg = match base_kind {
+                PlannedMoveKind::Support => support_max_tool_tilt_deg,
+                PlannedMoveKind::SupportInterface => support_iface_max_tool_tilt_deg,
+                _ => slot_max_tilt_deg,
             };
-            let chain_fluid = if base_kind.is_support() {
-                &support_fluid
-            } else {
-                &slot_fluid
+            let chain_fluid = match base_kind {
+                PlannedMoveKind::Support => &support_fluid,
+                PlannedMoveKind::SupportInterface => &support_iface_fluid,
+                _ => &slot_fluid,
             };
             simplify_working_chain(&mut wc, 0.04 * chain_nozzle_diam);
             smooth_chain_nozzle_orientations(
@@ -3704,22 +4544,35 @@ pub fn plan_and_emit_gcode_for_object(
             footprint_profile = Some(fp);
         }
 
+        // Schedule Sparse Infill tool assignment, Purge-into-Infill splitting, and Non-Planar Minimal Purge Tower
+        ordered_chains = schedule_layer_infill_and_purge_chains(
+            ordered_chains,
+            is_first_layer,
+            curr_planned_tool_id,
+            tool_id,
+            support_tool_id,
+            support_iface_tool_id,
+            config,
+            &gcfg,
+            &mut purge_tower,
+        );
+
         let mut layer_segments: Vec<PlannedSegment> = Vec::new();
 
         for chain in &mut ordered_chains {
             let chain_is_support = chain.base_kind.is_support();
             let slot_tool = config.tool_for_filament_slot(chain.filament_slot);
-            let chain_tool_id = if chain_is_support {
-                support_tool_id
-            } else {
-                slot_tool.map(|t| t.id).unwrap_or(tool_id)
+            let chain_tool_id = match chain.base_kind {
+                PlannedMoveKind::Support => support_tool_id,
+                PlannedMoveKind::SupportInterface => support_iface_tool_id,
+                _ => slot_tool.map(|t| t.id).unwrap_or(tool_id),
             };
-            let chain_nozzle_diam = if chain_is_support {
-                support_nozzle_diam_mm
-            } else {
-                slot_tool
+            let chain_nozzle_diam = match chain.base_kind {
+                PlannedMoveKind::Support => support_nozzle_diam_mm,
+                PlannedMoveKind::SupportInterface => support_iface_nozzle_diam_mm,
+                _ => slot_tool
                     .map(|t| t.nozzle_diameter_mm.max(0.1))
-                    .unwrap_or(nozzle_diam_mm)
+                    .unwrap_or(nozzle_diam_mm),
             };
             let slot_tool_gcfg = tool_gcfg_for(slot_tool);
             let slot_fluid = FluidDynamicsModel::from_config(
@@ -3728,19 +4581,22 @@ pub fn plan_and_emit_gcode_for_object(
                     .map(|t| t.temperature_celsius)
                     .unwrap_or(nozzle_temp_c),
             );
-            let chain_gcfg = if chain_is_support {
-                &support_tool_gcfg
-            } else {
-                &slot_tool_gcfg
+            let chain_gcfg = match chain.base_kind {
+                PlannedMoveKind::Support => &support_tool_gcfg,
+                PlannedMoveKind::SupportInterface => &support_iface_tool_gcfg,
+                _ => &slot_tool_gcfg,
             };
-            let chain_fluid = if chain_is_support {
-                &support_fluid
-            } else {
-                &slot_fluid
+            let chain_fluid = match chain.base_kind {
+                PlannedMoveKind::Support => &support_fluid,
+                PlannedMoveKind::SupportInterface => &support_iface_fluid,
+                _ => &slot_fluid,
             };
 
-            let mut vertices = if chain.base_kind == PlannedMoveKind::Bridge {
-                // Keep circular Bridge extrusions as pure un-subdivided straight lines
+            let mut vertices = if matches!(
+                chain.base_kind,
+                PlannedMoveKind::Bridge | PlannedMoveKind::PurgeTower
+            ) {
+                // Keep circular Bridge and PurgeTower extrusions as direct un-subdivided polylines
                 chain.pts.clone()
             } else {
                 subdivide_long_segments(finalize_chain_seam_and_wipe(chain, &gcfg))
@@ -4416,6 +5272,10 @@ pub fn plan_and_emit_gcode_for_object(
                     PlannedMoveKind::SupportInterface => {
                         (gcfg.support_interface_speed_mms, gcfg.inner_wall_accel_mms2)
                     }
+                    PlannedMoveKind::PurgeTower => (
+                        gcfg.solid_infill_speed_mms.min(90.0),
+                        gcfg.infill_accel_mms2,
+                    ),
                     PlannedMoveKind::Wipe | PlannedMoveKind::Travel => {
                         (gcfg.travel_speed_mms * 0.6, gcfg.travel_accel_mms2)
                     }
@@ -7486,5 +8346,283 @@ mod tests {
         assert!(combined.gcode_text.contains("EXCLUDE_OBJECT_END NAME=Part_Left"));
         assert!(combined.gcode_text.contains("EXCLUDE_OBJECT_START NAME=Part_Right"));
         assert!(combined.gcode_text.contains("EXCLUDE_OBJECT_END NAME=Part_Right"));
+    }
+
+    #[test]
+    fn test_infill_support_filament_selection_and_minimal_purge_tower() {
+        use crate::config::{InfillFilamentMode, PurgeMode, ThreeMfFilamentSlot, ToolConfig};
+
+        let mut cfg = SlicerConfig::default();
+        cfg.gcode.emit_thumbnails = false;
+        cfg.tools = vec![
+            ToolConfig::standard_tool(0, "T0 - PLA White", 0.40, 210.0),
+            ToolConfig::standard_tool(1, "T1 - PLA Black", 0.40, 215.0),
+            ToolConfig::standard_tool(2, "T2 - PVA Soluble", 0.40, 195.0),
+        ];
+        cfg.filament_slots = vec![
+            ThreeMfFilamentSlot {
+                slot_index: 0,
+                name: "White".to_string(),
+                filament_type: "PLA".to_string(),
+                color_hex: "#FFFFFF".to_string(),
+                color_srgba: [1.0, 1.0, 1.0, 1.0],
+                tool_index: 0,
+                ..Default::default()
+            },
+            ThreeMfFilamentSlot {
+                slot_index: 1,
+                name: "Black".to_string(),
+                filament_type: "PLA".to_string(),
+                color_hex: "#111111".to_string(),
+                color_srgba: [0.1, 0.1, 0.1, 1.0],
+                tool_index: 1,
+                ..Default::default()
+            },
+        ];
+
+        // Configure Support Base -> T0, Support Interface -> T2 (soluble), Sparse Infill -> Auto Purge
+        cfg.slicing.support_tool_index = Some(0);
+        cfg.slicing.support_interface_tool_index = Some(2);
+        cfg.slicing.infill_filament_mode = InfillFilamentMode::AutoPurgeIntoInfill;
+        cfg.gcode.purge_mode = PurgeMode::PurgeIntoInfillThenTower;
+        cfg.gcode.min_purge_volume_mm3 = 20.0;
+        cfg.gcode.purge_tower_brim = false;
+
+        // Build a 3-layer multi-colour test object:
+        // - Layer 0 (z = 0.2): T0 outer wall, T1 outer wall, and a long Sparse Infill chain (~36 mm³ > 20 mm³ min purge)
+        //   => 100% of T0->T1 purge is absorbed into Sparse Infill, ZERO PurgeTower moves on Layer 0!
+        // - Layer 1 (z = 0.4): Only T1 outer wall + Support Base (T0) + Support Interface (T2), NO Sparse Infill
+        //   => Toolchanges require the Non-Planar Minimal Purge Tower!
+        // - Layer 2 (z = 0.6): Only T2 outer wall (no toolchange from end of Layer 1 if continued, or single tool)
+        let raw = crate::bridge::ffi::ObjectToolpathsResult {
+            valid: true,
+            total_path_count: 6,
+            outer_wall_count: 4,
+            inner_wall_count: 0,
+            solid_infill_count: 0,
+            sparse_infill_count: 1,
+            bridge_count: 0,
+            wave_overhang_count: 0,
+            support_count: 1,
+            support_interface_count: 1,
+            layers: vec![
+                LayerToolpaths {
+                    layer_index: 0,
+                    branch_id: 0,
+                    isovalue: 0.2,
+                    paths: vec![
+                        ExtrusionPath {
+                            feature_kind: 0, // OuterWall (Slot 0 -> T0)
+                            wall_index: 0,
+                            is_closed: false,
+                            filament_slot: 0,
+                            total_length_mm: 20.0,
+                            mean_width_mm: 0.42,
+                            points: vec![
+                                make_pt(-10.0, -10.0, 0.2, 0.42, 0.20),
+                                make_pt(10.0, -10.0, 0.2, 0.42, 0.20),
+                            ],
+                        },
+                        ExtrusionPath {
+                            feature_kind: 0, // OuterWall (Slot 1 -> T1)
+                            wall_index: 0,
+                            is_closed: false,
+                            filament_slot: 1,
+                            total_length_mm: 20.0,
+                            mean_width_mm: 0.42,
+                            points: vec![
+                                make_pt(-10.0, 10.0, 0.2, 0.42, 0.20),
+                                make_pt(10.0, 10.0, 0.2, 0.42, 0.20),
+                            ],
+                        },
+                        ExtrusionPath {
+                            feature_kind: 4, // SparseInfill (~400 mm length * 0.45 * 0.20 = 36 mm³ > 20 mm³)
+                            wall_index: 0,
+                            is_closed: false,
+                            filament_slot: 0,
+                            total_length_mm: 400.0,
+                            mean_width_mm: 0.45,
+                            points: vec![
+                                make_pt(-8.0, 0.0, 0.2, 0.45, 0.20),
+                                make_pt(392.0, 0.0, 0.2, 0.45, 0.20),
+                            ],
+                        },
+                    ],
+                },
+                LayerToolpaths {
+                    layer_index: 1,
+                    branch_id: 0,
+                    isovalue: 0.4,
+                    paths: vec![
+                        ExtrusionPath {
+                            feature_kind: 7, // Support Base -> T0
+                            wall_index: 0,
+                            is_closed: false,
+                            filament_slot: 0,
+                            total_length_mm: 15.0,
+                            mean_width_mm: 0.40,
+                            points: vec![
+                                make_pt(-15.0, -15.0, 0.4, 0.40, 0.20),
+                                make_pt(0.0, -15.0, 0.4, 0.40, 0.20),
+                            ],
+                        },
+                        ExtrusionPath {
+                            feature_kind: 8, // Support Interface -> T2
+                            wall_index: 0,
+                            is_closed: false,
+                            filament_slot: 0,
+                            total_length_mm: 15.0,
+                            mean_width_mm: 0.40,
+                            points: vec![
+                                make_pt(-15.0, -12.0, 0.4, 0.40, 0.20),
+                                make_pt(0.0, -12.0, 0.4, 0.40, 0.20),
+                            ],
+                        },
+                        ExtrusionPath {
+                            feature_kind: 0, // OuterWall (Slot 1 -> T1), only 5 mm³ of Sparse Infill (< 20 mm³)
+                            wall_index: 0,
+                            is_closed: false,
+                            filament_slot: 1,
+                            total_length_mm: 20.0,
+                            mean_width_mm: 0.42,
+                            points: vec![
+                                make_pt(-10.0, 10.0, 0.4, 0.42, 0.20),
+                                make_pt(10.0, 10.0, 0.4, 0.42, 0.20),
+                            ],
+                        },
+                    ],
+                },
+                LayerToolpaths {
+                    layer_index: 2,
+                    branch_id: 0,
+                    isovalue: 0.6,
+                    paths: vec![ExtrusionPath {
+                        feature_kind: 0, // Same tool T1 as end of Layer 1 -> NO toolchange on Layer 2!
+                        wall_index: 0,
+                        is_closed: false,
+                        filament_slot: 1,
+                        total_length_mm: 20.0,
+                        mean_width_mm: 0.42,
+                        points: vec![
+                            make_pt(-10.0, 10.0, 0.6, 0.42, 0.20),
+                            make_pt(10.0, 10.0, 0.6, 0.42, 0.20),
+                        ],
+                    }],
+                },
+            ],
+        };
+
+        let planned =
+            plan_and_emit_gcode_for_object("PurgeTest", 1, &raw, Transform::IDENTITY, &cfg);
+        assert_eq!(planned.layers.len(), 3);
+
+        // 1. On Layer 0, SparseInfill (~36 mm³) exceeds min_purge_volume_mm3 (20 mm³),
+        //    so 100% of the T0->T1 purge is absorbed into SparseInfill (split into a T1 purge head
+        //    printed BEFORE T1's OuterWall, and a T1 tail printed at the end of Layer 0),
+        //    and ZERO PurgeTower segments are emitted on Layer 0!
+        let l0_tower_segs = planned.layers[0]
+            .segments
+            .iter()
+            .filter(|s| s.kind == PlannedMoveKind::PurgeTower)
+            .count();
+        assert_eq!(
+            l0_tower_segs, 0,
+            "Expected 0 PurgeTower segments on Layer 0 when SparseInfill >= min_purge_volume_mm3"
+        );
+        let first_t1_sparse_idx = planned.layers[0]
+            .segments
+            .iter()
+            .position(|s| s.kind == PlannedMoveKind::SparseInfill && s.tool_id == 1)
+            .expect("Expected SparseInfill purge segment with T1 on Layer 0");
+        let first_t1_wall_idx = planned.layers[0]
+            .segments
+            .iter()
+            .position(|s| s.kind == PlannedMoveKind::OuterWall && s.tool_id == 1)
+            .expect("Expected OuterWall segment with T1 on Layer 0");
+        assert!(
+            first_t1_sparse_idx < first_t1_wall_idx,
+            "Expected T1 to purge into SparseInfill BEFORE printing T1's visible OuterWall!"
+        );
+
+        // 2. On Layer 1, Support Base must use T0, Support Interface must use T2, and because
+        //    there is no SparseInfill on Layer 1, toolchanges must emit PurgeTower segments!
+        let has_sup_base_t0 = planned.layers[1]
+            .segments
+            .iter()
+            .any(|s| s.kind == PlannedMoveKind::Support && s.tool_id == 0);
+        let has_sup_intf_t2 = planned.layers[1]
+            .segments
+            .iter()
+            .any(|s| s.kind == PlannedMoveKind::SupportInterface && s.tool_id == 2);
+        let l1_tower_segs = planned.layers[1]
+            .segments
+            .iter()
+            .filter(|s| s.kind == PlannedMoveKind::PurgeTower && s.delta_e_mm > 0.0)
+            .count();
+        assert!(has_sup_base_t0, "Expected Support Base to use T0");
+        assert!(has_sup_intf_t2, "Expected Support Interface to use T2");
+        assert!(
+            l1_tower_segs > 0,
+            "Expected Non-Planar Minimal Purge Tower segments on Layer 1 when SparseInfill is absent"
+        );
+
+        // 3. On Layer 2, no toolchange occurs (stays on T1), so ZERO PurgeTower segments are emitted!
+        let l2_tower_segs = planned.layers[2]
+            .segments
+            .iter()
+            .filter(|s| s.kind == PlannedMoveKind::PurgeTower)
+            .count();
+        assert_eq!(
+            l2_tower_segs, 0,
+            "Expected 0 PurgeTower segments on Layer 2 when no toolchange occurs (non-planar zero-waste tower)"
+        );
+
+        // 4. Verify Horizontal Growth: all 3 toolchanges on Layer 1 (`T1 -> T0 -> T2 -> T1`) must
+        //    pack horizontally side-by-side at the SAME initial tower Z height (`z == 0.20 mm`)
+        //    rather than stacking vertically!
+        for seg in planned.layers[1]
+            .segments
+            .iter()
+            .filter(|s| s.kind == PlannedMoveKind::PurgeTower && s.delta_e_mm > 0.0)
+        {
+            assert!(
+                (seg.p0_bed.z - 0.20).abs() < 1.0e-3 && (seg.p1_bed.z - 0.20).abs() < 1.0e-3,
+                "Expected horizontal strip packing to keep Layer 1 purges at z=0.20 mm, got z=({:.3}, {:.3})",
+                seg.p0_bed.z,
+                seg.p1_bed.z
+            );
+        }
+
+        // 5. Verify manual pre-slicing purge tower placement (`purge_tower_auto_position = false`)
+        let mut cfg_manual = cfg.clone();
+        cfg_manual.gcode.purge_tower_auto_position = false;
+        cfg_manual.gcode.purge_tower_position_xy = [50.0, -40.0];
+        let planned_manual = plan_and_emit_gcode_for_object(
+            "PurgeManualPos",
+            1,
+            &raw,
+            Transform::IDENTITY,
+            &cfg_manual,
+        );
+        let manual_tower_segs: Vec<&PlannedSegment> = planned_manual.layers[1]
+            .segments
+            .iter()
+            .filter(|s| s.kind == PlannedMoveKind::PurgeTower && s.delta_e_mm > 0.0)
+            .collect();
+        assert!(!manual_tower_segs.is_empty());
+        let mean_local_x: f32 = manual_tower_segs
+            .iter()
+            .map(|s| 0.5 * (s.p0_local.x + s.p1_local.x))
+            .sum::<f32>()
+            / (manual_tower_segs.len() as f32);
+        let mean_local_y: f32 = manual_tower_segs
+            .iter()
+            .map(|s| 0.5 * (s.p0_local.y + s.p1_local.y))
+            .sum::<f32>()
+            / (manual_tower_segs.len() as f32);
+        assert!(
+            (mean_local_x - 50.0).abs() < 25.0 && (mean_local_y - (-40.0)).abs() < 20.0,
+            "Expected manual purge tower near (50, -40), got ({mean_local_x:.1}, {mean_local_y:.1})"
+        );
     }
 }

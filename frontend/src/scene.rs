@@ -522,6 +522,8 @@ pub struct BuildPlateState {
     pub ui_hovered_point_hint_id: Option<u32>,
     pub is_dragging_point_hint_dir: bool,
     pub is_dragging_object: bool,
+    pub hovered_purge_tower: bool,
+    pub is_dragging_purge_tower: bool,
     pub drag_offset_xy: Vec2,
     pub clone_copies_count: u32,
     /// Whether to display `exclude_object` name labels on the build plate in the 3D viewport.
@@ -555,6 +557,8 @@ impl Default for BuildPlateState {
             ui_hovered_point_hint_id: None,
             is_dragging_point_hint_dir: false,
             is_dragging_object: false,
+            hovered_purge_tower: false,
+            is_dragging_purge_tower: false,
             drag_offset_xy: Vec2::ZERO,
             clone_copies_count: 1,
             show_object_labels: true,
@@ -1499,9 +1503,15 @@ pub fn viewport_interaction_system(
         plate.hovered_hull_face = None;
         plate.hovered_surface_patch = None;
         plate.hovered_point_preview = None;
+        plate.hovered_purge_tower = false;
         if mouse_buttons.just_released(MouseButton::Left) {
             plate.is_dragging_object = false;
             plate.is_dragging_point_hint_dir = false;
+            if plate.is_dragging_purge_tower {
+                plate.is_dragging_purge_tower = false;
+                vis_state.dirty_planned_gcode = true;
+                vis_state.dirty_toolpaths_mesh = true;
+            }
         }
         return;
     }
@@ -1517,10 +1527,85 @@ pub fn viewport_interaction_system(
         .cursor_position()
         .and_then(|pos| camera.viewport_to_world(cam_global, pos));
 
-    // 1. Update hover states for `PlaceOnFace`, `SurfaceHint*`, and `PointHint`
+    // Compute current Prime / Purge Tower footprint `([cx, cy], [tw, td])` on the active plate
+    let tower_active = config.gcode.purge_mode.uses_purge_tower() && vis_state.show_purge_tower;
+    let current_tower_footprint = if tower_active {
+        let mut min_x = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut min_y = f32::MAX;
+        let mut max_y = f32::MIN;
+        for obj in plate
+            .objects
+            .iter()
+            .filter(|o| o.printable && o.plate_index == plate.active_plate_index)
+        {
+            if let Ok(obj_tf) = object_transforms.get(obj.entity) {
+                let (bmin, bmax) = obj.compute_world_aabb(obj_tf);
+                min_x = min_x.min(bmin.x);
+                max_x = max_x.max(bmax.x);
+                min_y = min_y.min(bmin.y);
+                max_y = max_y.max(bmax.y);
+            }
+        }
+        let aabb_opt = if min_x <= max_x && min_y <= max_y {
+            Some(([min_x, min_y], [max_x, max_y]))
+        } else {
+            None
+        };
+        let est_strips = (config.tools.len().saturating_sub(1).max(1) * 3).clamp(3, 12);
+        Some(config.resolve_purge_tower_footprint_scene(aabb_opt, est_strips))
+    } else {
+        None
+    };
+
+    // 1. Update hover states for `PlaceOnFace`, `SurfaceHint*`, `PointHint`, and the Prime / Purge Tower
     plate.hovered_hull_face = None;
     plate.hovered_surface_patch = None;
     plate.hovered_point_preview = None;
+    plate.hovered_purge_tower = false;
+
+    if let (Some(ray), Some(([tcx, tcy], [tw, td]))) = (cursor_ray, current_tower_footprint) {
+        if matches!(plate.tool_mode, ToolMode::Select | ToolMode::MoveOnBed) {
+            let pad = if config.gcode.purge_tower_brim { 1.5 } else { 0.8 };
+            let box_min = Vec3::new(tcx - 0.5 * tw - pad, tcy - 0.5 * td - pad, -0.2);
+            let box_max = Vec3::new(tcx + 0.5 * tw + pad, tcy + 0.5 * td + pad, 2.5);
+            let mut tower_hit_dist = if ray_intersects_aabb(ray, box_min, box_max) {
+                Some(ray.origin.distance(Vec3::new(tcx, tcy, 0.8)))
+            } else {
+                None
+            };
+            if tower_hit_dist.is_none() {
+                if let Some(plane_pt) = intersect_ray_z_plane(ray, 0.0) {
+                    if (plane_pt.x - tcx).abs() <= 0.5 * tw + pad
+                        && (plane_pt.y - tcy).abs() <= 0.5 * td + pad
+                    {
+                        tower_hit_dist = Some(ray.origin.distance(plane_pt));
+                    }
+                }
+            }
+            if let Some(t_dist) = tower_hit_dist {
+                // Only hover the purge tower if no visible object mesh is closer along the ray
+                let active_idx = plate.active_plate_index;
+                let mut closer_obj = false;
+                for obj in &plate.objects {
+                    if !obj.visible || obj.plate_index != active_idx {
+                        continue;
+                    }
+                    if let Ok(obj_tf) = object_transforms.get(obj.entity) {
+                        if let Some(od) = obj.raycast_mesh(obj_tf, ray) {
+                            if od < t_dist {
+                                closer_obj = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !closer_obj {
+                    plate.hovered_purge_tower = true;
+                }
+            }
+        }
+    }
 
     if let (Some(ray), Some(sel_id)) = (cursor_ray, plate.selected_object_id) {
         let active_idx = plate.active_plate_index;
@@ -1740,6 +1825,23 @@ pub fn viewport_interaction_system(
             _ => {}
         }
 
+        // Check if the user clicked on the Prime / Purge Tower to drag it on the build plate
+        if plate.hovered_purge_tower {
+            if let (Some(ray), Some(([tcx, tcy], _))) = (cursor_ray, current_tower_footprint) {
+                if let Some(plane_pt) = intersect_ray_z_plane(ray, 0.0) {
+                    plate.is_dragging_purge_tower = true;
+                    plate.drag_offset_xy = Vec2::new(tcx, tcy) - plane_pt.xy();
+                    config.gcode.purge_tower_auto_position = false;
+                    config.gcode.purge_tower_position_xy = [tcx, tcy];
+                    plate.status_message = format!(
+                        "Dragging Prime / Purge Tower ({tcx:.1}, {tcy:.1} mm) — release to update toolpaths."
+                    );
+                    mouse_motion.clear();
+                    return;
+                }
+            }
+        }
+
         // Raycast against all visible objects on the active plate to select the closest hit
         if let Some(ray) = cursor_ray {
             let active_idx = plate.active_plate_index;
@@ -1778,6 +1880,15 @@ pub fn viewport_interaction_system(
     if mouse_buttons.just_released(MouseButton::Left) {
         plate.is_dragging_object = false;
         plate.is_dragging_point_hint_dir = false;
+        if plate.is_dragging_purge_tower {
+            plate.is_dragging_purge_tower = false;
+            vis_state.dirty_planned_gcode = true;
+            vis_state.dirty_toolpaths_mesh = true;
+            plate.status_message = format!(
+                "Placed Prime / Purge Tower at ({:.1}, {:.1} mm).",
+                config.gcode.purge_tower_position_xy[0], config.gcode.purge_tower_position_xy[1]
+            );
+        }
     }
 
     let mut delta_drag = Vec2::ZERO;
@@ -1788,6 +1899,52 @@ pub fn viewport_interaction_system(
     let mut scroll = 0.0_f32;
     for ev in mouse_wheel.read() {
         scroll += ev.y;
+    }
+
+    // 3a-0. Active dragging of the Prime / Purge Tower across the build plate (`z = 0.0`)
+    if plate.is_dragging_purge_tower && mouse_buttons.pressed(MouseButton::Left) {
+        if let Some(ray) = cursor_ray {
+            if let Some(plane_pt) = intersect_ray_z_plane(ray, 0.0) {
+                let (_, [tw, td]) =
+                    current_tower_footprint.unwrap_or(([0.0, 0.0], [24.0, 12.0]));
+                let edge_margin = config.arrangement.bed_edge_margin_mm.max(4.0);
+                let half_bed_x =
+                    (0.5 * config.bed.width_x - edge_margin - 0.5 * tw).max(0.0);
+                let half_bed_y =
+                    (0.5 * config.bed.depth_y - edge_margin - 0.5 * td).max(0.0);
+                let target_xy = plane_pt.xy() + plate.drag_offset_xy;
+                let nx = target_xy.x.clamp(-half_bed_x, half_bed_x);
+                let ny = target_xy.y.clamp(-half_bed_y, half_bed_y);
+                let old_xy = config.gcode.purge_tower_position_xy;
+                config.gcode.purge_tower_auto_position = false;
+                config.gcode.purge_tower_position_xy = [nx, ny];
+                plate.status_message =
+                    format!("Prime / Purge Tower Position: X = {nx:.1} mm, Y = {ny:.1} mm");
+
+                // Also translate any already-planned PurgeTower segments live in 3D while dragging!
+                let dx = nx - old_xy[0];
+                let dy = ny - old_xy[1];
+                if (dx.abs() > 1.0e-3 || dy.abs() > 1.0e-3)
+                    && vis_state.cached_planned_gcode.is_some()
+                {
+                    let delta_v = Vec3::new(dx, dy, 0.0);
+                    if let Some(ref mut planned) = vis_state.cached_planned_gcode {
+                        for layer in &mut planned.layers {
+                            for seg in &mut layer.segments {
+                                if seg.kind == crate::gcode::PlannedMoveKind::PurgeTower {
+                                    seg.p0_local += delta_v;
+                                    seg.p1_local += delta_v;
+                                    seg.p0_bed += delta_v;
+                                    seg.p1_bed += delta_v;
+                                }
+                            }
+                        }
+                    }
+                    vis_state.dirty_toolpaths_mesh = true;
+                }
+            }
+        }
+        return;
     }
 
     // 3a. Interactive aiming of the selected 3D point hint's normal direction vector
@@ -2367,6 +2524,106 @@ pub fn draw_viewport_gizmos_system(
                 outline_color,
             );
         }
+    }
+
+    // Draw pre-slicing & live Purge Tower footprint preview on the build plate when a tower mode is active
+    if config.gcode.purge_mode.uses_purge_tower() && vis_state.show_purge_tower {
+        let mut min_x = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut min_y = f32::MAX;
+        let mut max_y = f32::MIN;
+        for obj in plate
+            .objects
+            .iter()
+            .filter(|o| o.printable && o.plate_index == plate.active_plate_index)
+        {
+            if let Ok(obj_tf) = object_transforms.get(obj.entity) {
+                let (bmin, bmax) = obj.compute_world_aabb(obj_tf);
+                min_x = min_x.min(bmin.x);
+                max_x = max_x.max(bmax.x);
+                min_y = min_y.min(bmin.y);
+                max_y = max_y.max(bmax.y);
+            }
+        }
+        let aabb_opt = if min_x <= max_x && min_y <= max_y {
+            Some(([min_x, min_y], [max_x, max_y]))
+        } else {
+            None
+        };
+        let est_strips = (config.tools.len().saturating_sub(1).max(1) * 3).clamp(3, 12);
+        let ([cx, cy], [tw, td]) = config.resolve_purge_tower_footprint_scene(aabb_opt, est_strips);
+        let x0 = cx - 0.5 * tw;
+        let x1 = cx + 0.5 * tw;
+        let y0 = cy - 0.5 * td;
+        let y1 = cy + 0.5 * td;
+        let z_bed = 0.04;
+        let is_active_tower = plate.hovered_purge_tower || plate.is_dragging_purge_tower;
+        let tower_col = if is_active_tower {
+            Color::srgb(1.0, 0.88, 0.22)
+        } else {
+            Color::srgba(0.96, 0.44, 0.64, 0.92)
+        };
+        let tower_dim = if is_active_tower {
+            Color::srgba(1.0, 0.88, 0.22, 0.65)
+        } else {
+            Color::srgba(0.96, 0.44, 0.64, 0.42)
+        };
+
+        // Base footprint rectangle
+        gizmos.linestrip(
+            [
+                Vec3::new(x0, y0, z_bed),
+                Vec3::new(x1, y0, z_bed),
+                Vec3::new(x1, y1, z_bed),
+                Vec3::new(x0, y1, z_bed),
+                Vec3::new(x0, y0, z_bed),
+            ],
+            tower_col,
+        );
+        // Center drag handle crosshair
+        let handle_r = (0.18 * td.min(tw)).clamp(2.0, 5.0);
+        gizmos.line(
+            Vec3::new(cx - handle_r, cy, z_bed + 0.02),
+            Vec3::new(cx + handle_r, cy, z_bed + 0.02),
+            tower_col,
+        );
+        gizmos.line(
+            Vec3::new(cx, cy - handle_r, z_bed + 0.02),
+            Vec3::new(cx, cy + handle_r, z_bed + 0.02),
+            tower_col,
+        );
+        // Optional anchor brim outline
+        if config.gcode.purge_tower_brim {
+            let b_pad = 0.65;
+            gizmos.linestrip(
+                [
+                    Vec3::new(x0 - b_pad, y0 - b_pad, z_bed),
+                    Vec3::new(x1 + b_pad, y0 - b_pad, z_bed),
+                    Vec3::new(x1 + b_pad, y1 + b_pad, z_bed),
+                    Vec3::new(x0 - b_pad, y1 + b_pad, z_bed),
+                    Vec3::new(x0 - b_pad, y0 - b_pad, z_bed),
+                ],
+                tower_dim,
+            );
+        }
+        // Horizontal strip dividers & center reticle so user can see horizontal growth direction
+        let n_div = 4usize;
+        for k in 1..n_div {
+            let tx = x0 + (k as f32 / n_div as f32) * (x1 - x0);
+            gizmos.line(
+                Vec3::new(tx, y0, z_bed),
+                Vec3::new(tx, y1, z_bed),
+                tower_dim,
+            );
+        }
+        // Subtle 3D wireframe box preview before toolpaths are shown
+        let z_top = 1.60;
+        draw_aabb_wireframe(
+            &mut gizmos,
+            Vec3::new(x0, y0, z_bed),
+            Vec3::new(x1, y1, z_top),
+            tower_dim,
+        );
     }
 
     // Selected object gizmos & overlays

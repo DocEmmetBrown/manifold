@@ -12,9 +12,9 @@ use crate::calibration::{
 };
 use crate::config::{
     lookup_parameter_doc, BedShape, BrickLayerMode, ClearancePointXZ, ClearanceProfileMode,
-    FiveAxisKinematicsMode, GcodeDialect, ObjectFilamentMode, OrderFieldMode, PointNormalHint,
-    SlicerConfig, SolidInfillPattern, SparseInfillPattern, SupportStyle, SurfaceHintMode,
-    ToolConfig, WallPrintOrder,
+    FiveAxisKinematicsMode, GcodeDialect, InfillFilamentMode, ObjectFilamentMode, OrderFieldMode,
+    PointNormalHint, PurgeMode, SlicerConfig, SolidInfillPattern, SparseInfillPattern,
+    SupportStyle, SurfaceHintMode, ToolConfig, WallPrintOrder,
 };
 use crate::field_vis::{
     high_contrast_parameter_ramp, sample_slice_colormap_rgba, FieldColormap,
@@ -266,6 +266,7 @@ fn render_interactive_toolpath_line_types_legend(
                     vis_state.show_gap_fill = true;
                     vis_state.show_supports = true;
                     vis_state.show_support_interface = true;
+                    vis_state.show_purge_tower = true;
                     vis_state.show_scarf_seams = true;
                     vis_state.show_wipes = true;
                     vis_state.show_travel_moves = true;
@@ -286,6 +287,7 @@ fn render_interactive_toolpath_line_types_legend(
                     vis_state.show_gap_fill = true;
                     vis_state.show_supports = true;
                     vis_state.show_support_interface = true;
+                    vis_state.show_purge_tower = true;
                     vis_state.show_scarf_seams = true;
                     vis_state.show_wipes = true;
                     vis_state.show_travel_moves = false;
@@ -302,6 +304,7 @@ fn render_interactive_toolpath_line_types_legend(
                     vis_state.show_gap_fill = false;
                     vis_state.show_supports = false;
                     vis_state.show_support_interface = false;
+                    vis_state.show_purge_tower = false;
                     vis_state.show_scarf_seams = false;
                     vis_state.show_wipes = false;
                     vis_state.show_travel_moves = false;
@@ -416,6 +419,15 @@ fn render_interactive_toolpath_line_types_legend(
                         "Wipe",
                         None,
                     );
+                    mesh_dirty |= draw_line_type_toggle_cell(
+                        ui,
+                        &mut vis_state.show_purge_tower,
+                        [0.96, 0.44, 0.64, 1.0],
+                        "Purge Tower",
+                        None,
+                    );
+                    ui.end_row();
+
                     let _ = draw_line_type_toggle_cell(
                         ui,
                         &mut vis_state.show_travel_moves,
@@ -423,8 +435,6 @@ fn render_interactive_toolpath_line_types_legend(
                         "Travel",
                         None,
                     );
-                    ui.end_row();
-
                     let _ = draw_line_type_toggle_cell(
                         ui,
                         &mut vis_state.show_z_hops,
@@ -432,6 +442,8 @@ fn render_interactive_toolpath_line_types_legend(
                         "Z-Hop",
                         None,
                     );
+                    ui.end_row();
+
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         ui.checkbox(&mut vis_state.show_toolpath_centerlines, "");
@@ -5232,6 +5244,116 @@ fn render_tool_config_tab(
                 .changed();
             param_help_button(ui, "gcode.tool_change_approach_after");
         });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Purge Mode:");
+            let combo_w = (ui.available_width() - 32.0).clamp(115.0, 220.0);
+            egui::ComboBox::from_id_source("printer_tab_purge_mode_combo")
+                .selected_text(gc.purge_mode.short_label())
+                .width(combo_w)
+                .show_ui(ui, |ui| {
+                    for mode in PurgeMode::ALL {
+                        dirty_gcode |= ui
+                            .selectable_value(&mut gc.purge_mode, mode, mode.label())
+                            .changed();
+                    }
+                });
+            param_help_button(ui, "gcode.purge_mode");
+        });
+        if gc.purge_mode != PurgeMode::Disabled {
+            ui.horizontal_wrapped(|ui| {
+                dirty_gcode |= ui
+                    .add(
+                        egui::DragValue::new(&mut gc.min_purge_volume_mm3)
+                            .speed(1.0)
+                            .range(1.0..=500.0)
+                            .prefix("Min Purge Vol: ")
+                            .suffix(" mm³"),
+                    )
+                    .on_hover_text(
+                        "Minimum polymer volume (mm³) to purge after each toolchange before printing exterior walls",
+                    )
+                    .changed();
+                param_help_button(ui, "gcode.min_purge_volume_mm3");
+                if gc.purge_mode.uses_purge_tower() {
+                    dirty_gcode |= ui
+                        .checkbox(&mut gc.purge_tower_auto_dimensions, "Auto Tower Size")
+                        .on_hover_text(
+                            "Automatically choose rectangular prism width & depth from Min Purge Volume and layer height",
+                        )
+                        .changed();
+                    dirty_gcode |= ui
+                        .checkbox(&mut gc.purge_tower_brim, "Tower Brim")
+                        .changed();
+                }
+            });
+            if gc.purge_mode.uses_purge_tower() && !gc.purge_tower_auto_dimensions {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Tower Prism (W × D):");
+                    dirty_gcode |= ui
+                        .add(
+                            egui::DragValue::new(&mut gc.purge_tower_width_mm)
+                                .speed(0.5)
+                                .range(8.0..=160.0)
+                                .prefix("W: ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                    dirty_gcode |= ui
+                        .add(
+                            egui::DragValue::new(&mut gc.purge_tower_depth_mm)
+                                .speed(0.5)
+                                .range(6.0..=120.0)
+                                .prefix("D: ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                    param_help_button(ui, "gcode.purge_tower_auto_dimensions");
+                });
+            }
+            if gc.purge_mode.uses_purge_tower() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Tower Pos:");
+                    dirty_gcode |= ui
+                        .checkbox(&mut gc.purge_tower_auto_position, "Auto")
+                        .on_hover_text(
+                            "Automatically place the purge tower outside the objects' bounding box on the build plate",
+                        )
+                        .changed();
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut gc.purge_tower_position_xy[0])
+                                .speed(0.5)
+                                .range(-250.0..=250.0)
+                                .prefix("X: ")
+                                .suffix(" mm"),
+                        )
+                        .on_hover_text(
+                            "Purge tower center X on build plate (0 = bed center). Dragging switches to manual placement.",
+                        )
+                        .changed()
+                    {
+                        gc.purge_tower_auto_position = false;
+                        dirty_gcode = true;
+                    }
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut gc.purge_tower_position_xy[1])
+                                .speed(0.5)
+                                .range(-250.0..=250.0)
+                                .prefix("Y: ")
+                                .suffix(" mm"),
+                        )
+                        .on_hover_text(
+                            "Purge tower center Y on build plate (0 = bed center). Dragging switches to manual placement.",
+                        )
+                        .changed()
+                    {
+                        gc.purge_tower_auto_position = false;
+                        dirty_gcode = true;
+                    }
+                });
+            }
+        }
     });
 
     ui.add_space(4.0);
@@ -5913,6 +6035,329 @@ fn render_3mf_filament_slot_mapping_section_config_only(
                     .changed();
                 param_help_button(ui, "gcode.tool_change_approach_after");
             });
+
+            // --- Infill / Support Filament Selection & Toolchange Purge Controls ---
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Infill Filament:").strong());
+                let cur_infill_lbl = config
+                    .slicing
+                    .infill_filament_mode
+                    .short_label(&config.tools, &config.filament_slots);
+                let combo_w = (ui.available_width() - 32.0).clamp(110.0, 215.0);
+                let mut infill_changed = false;
+                egui::ComboBox::from_id_source((id_salt, "infill_filament_mode_combo"))
+                    .selected_text(cur_infill_lbl)
+                    .width(combo_w)
+                    .show_ui(ui, |ui| {
+                        infill_changed |= ui
+                            .selectable_value(
+                                &mut config.slicing.infill_filament_mode,
+                                InfillFilamentMode::FollowObject,
+                                "Follow Object / Region Filament",
+                            )
+                            .changed();
+                        infill_changed |= ui
+                            .selectable_value(
+                                &mut config.slicing.infill_filament_mode,
+                                InfillFilamentMode::AutoPurgeIntoInfill,
+                                "Auto (Current Tool / Purge into Infill)",
+                            )
+                            .changed();
+                        ui.separator();
+                        for (t_idx, t) in config.tools.iter().enumerate() {
+                            infill_changed |= ui
+                                .selectable_value(
+                                    &mut config.slicing.infill_filament_mode,
+                                    InfillFilamentMode::SingleTool(t_idx),
+                                    format!("Tool T{} — {} ({})", t.id, t.name, t.filament_color_hex),
+                                )
+                                .changed();
+                        }
+                        if !config.filament_slots.is_empty() {
+                            ui.separator();
+                            for (s_idx, _) in config.filament_slots.iter().enumerate() {
+                                let s_u8 = s_idx.min(126) as u8;
+                                let s_lbl = InfillFilamentMode::FilamentSlot(s_u8)
+                                    .label(&config.tools, &config.filament_slots);
+                                infill_changed |= ui
+                                    .selectable_value(
+                                        &mut config.slicing.infill_filament_mode,
+                                        InfillFilamentMode::FilamentSlot(s_u8),
+                                        s_lbl,
+                                    )
+                                    .changed();
+                            }
+                        }
+                    });
+                if infill_changed {
+                    vis_state.dirty_color_mixing = true;
+                    vis_state.dirty_toolpaths_mesh = true;
+                    *dirty_gcode = true;
+                }
+                param_help_button(ui, "slicing.infill_filament_mode");
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Support Base / Intf:").strong());
+                let sup_base_lbl = match config.slicing.support_tool_index {
+                    None => "Active Tool".to_string(),
+                    Some(idx) => config
+                        .tools
+                        .get(idx)
+                        .map(|t| format!("T{} ({})", t.id, t.filament_type))
+                        .unwrap_or_else(|| format!("T{idx}")),
+                };
+                let sup_intf_lbl = match config.slicing.support_interface_tool_index {
+                    None => "Same as Base".to_string(),
+                    Some(idx) => config
+                        .tools
+                        .get(idx)
+                        .map(|t| format!("T{} ({})", t.id, t.filament_type))
+                        .unwrap_or_else(|| format!("T{idx}")),
+                };
+                egui::ComboBox::from_id_source((id_salt, "sup_base_tool_combo"))
+                    .selected_text(format!("Base: {sup_base_lbl}"))
+                    .width(96.0)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(
+                                &mut config.slicing.support_tool_index,
+                                None,
+                                "Active Object Tool",
+                            )
+                            .changed()
+                        {
+                            *dirty_backend = true;
+                            *dirty_gcode = true;
+                            vis_state.dirty_toolpaths = true;
+                        }
+                        for (idx, t) in config.tools.iter().enumerate() {
+                            if ui
+                                .selectable_value(
+                                    &mut config.slicing.support_tool_index,
+                                    Some(idx),
+                                    format!("T{} — {} ({})", t.id, t.name, t.filament_color_hex),
+                                )
+                                .changed()
+                            {
+                                *dirty_backend = true;
+                                *dirty_gcode = true;
+                                vis_state.dirty_toolpaths = true;
+                            }
+                        }
+                    });
+                egui::ComboBox::from_id_source((id_salt, "sup_intf_tool_combo"))
+                    .selected_text(format!("Intf: {sup_intf_lbl}"))
+                    .width(96.0)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(
+                                &mut config.slicing.support_interface_tool_index,
+                                None,
+                                "Follow Support Base Tool",
+                            )
+                            .changed()
+                        {
+                            *dirty_gcode = true;
+                            vis_state.dirty_toolpaths_mesh = true;
+                        }
+                        for (idx, t) in config.tools.iter().enumerate() {
+                            if ui
+                                .selectable_value(
+                                    &mut config.slicing.support_interface_tool_index,
+                                    Some(idx),
+                                    format!("T{} — {} ({})", t.id, t.name, t.filament_color_hex),
+                                )
+                                .changed()
+                            {
+                                *dirty_gcode = true;
+                                vis_state.dirty_toolpaths_mesh = true;
+                            }
+                        }
+                    });
+                param_help_button(ui, "slicing.support_interface_tool_index");
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Purge Mode:").strong());
+                let combo_w = (ui.available_width() - 32.0).clamp(110.0, 215.0);
+                let mut purge_mode_changed = false;
+                egui::ComboBox::from_id_source((id_salt, "purge_mode_combo"))
+                    .selected_text(config.gcode.purge_mode.short_label())
+                    .width(combo_w)
+                    .show_ui(ui, |ui| {
+                        for mode in PurgeMode::ALL {
+                            purge_mode_changed |= ui
+                                .selectable_value(&mut config.gcode.purge_mode, mode, mode.label())
+                                .changed();
+                        }
+                    });
+                if purge_mode_changed {
+                    if config.gcode.purge_mode.uses_infill_purge()
+                        && config.slicing.infill_filament_mode == InfillFilamentMode::FollowObject
+                    {
+                        config.slicing.infill_filament_mode =
+                            InfillFilamentMode::AutoPurgeIntoInfill;
+                    }
+                    *dirty_gcode = true;
+                    vis_state.dirty_toolpaths_mesh = true;
+                }
+                param_help_button(ui, "gcode.purge_mode");
+            });
+
+            if config.gcode.purge_mode != PurgeMode::Disabled {
+                let est_strips =
+                    (config.tools.len().saturating_sub(1).max(1) * 3).clamp(3, 12);
+                let ([resolved_cx, resolved_cy], [eff_w, eff_d]) =
+                    config.resolve_purge_tower_footprint_scene(None, est_strips);
+                ui.horizontal_wrapped(|ui| {
+                    *dirty_gcode |= ui
+                        .add(
+                            egui::DragValue::new(&mut config.gcode.min_purge_volume_mm3)
+                                .speed(1.0)
+                                .range(1.0..=500.0)
+                                .prefix("Min Purge: ")
+                                .suffix(" mm³"),
+                        )
+                        .on_hover_text(
+                            "Minimum polymer volume (mm³) to purge after each toolchange",
+                        )
+                        .changed();
+                    param_help_button(ui, "gcode.min_purge_volume_mm3");
+                    if config.gcode.purge_mode.uses_purge_tower() {
+                        *dirty_gcode |= ui
+                            .checkbox(&mut config.gcode.purge_tower_auto_dimensions, "Auto Size")
+                            .on_hover_text(format!(
+                                "Automatically size horizontal rectangular footprint ({eff_w:.1} × {eff_d:.1} mm) so purges pack side-by-side horizontally"
+                            ))
+                            .changed();
+                        *dirty_gcode |= ui
+                            .checkbox(&mut config.gcode.purge_tower_brim, "Brim")
+                            .changed();
+                    }
+                });
+                if config.gcode.purge_mode.uses_purge_tower() {
+                    if config.gcode.purge_tower_auto_dimensions {
+                        ui.small(
+                            egui::RichText::new(format!(
+                                "Horizontal Tower Footprint: {eff_w:.1} × {eff_d:.1} mm (packs side-by-side horizontally)"
+                            ))
+                            .color(egui::Color32::from_rgb(150, 210, 245)),
+                        );
+                    } else {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Tower Prism (W × D):");
+                            *dirty_gcode |= ui
+                                .add(
+                                    egui::DragValue::new(&mut config.gcode.purge_tower_width_mm)
+                                        .speed(0.5)
+                                        .range(8.0..=160.0)
+                                        .prefix("W: ")
+                                        .suffix(" mm"),
+                                )
+                                .changed();
+                            *dirty_gcode |= ui
+                                .add(
+                                    egui::DragValue::new(&mut config.gcode.purge_tower_depth_mm)
+                                        .speed(0.5)
+                                        .range(6.0..=120.0)
+                                        .prefix("D: ")
+                                        .suffix(" mm"),
+                                )
+                                .changed();
+                            param_help_button(ui, "gcode.purge_tower_auto_dimensions");
+                        });
+                    }
+
+                    // Pre-slicing & live build-plate placement controls
+                    let mut pos_x = if config.gcode.purge_tower_auto_position {
+                        resolved_cx
+                    } else {
+                        config.gcode.purge_tower_position_xy[0]
+                    };
+                    let mut pos_y = if config.gcode.purge_tower_auto_position {
+                        resolved_cy
+                    } else {
+                        config.gcode.purge_tower_position_xy[1]
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Tower Pos:");
+                        if ui
+                            .checkbox(&mut config.gcode.purge_tower_auto_position, "Auto")
+                            .on_hover_text(
+                                "Automatically position the purge tower outside the objects' bounding box on the build plate",
+                            )
+                            .changed()
+                        {
+                            *dirty_gcode = true;
+                            vis_state.dirty_toolpaths_mesh = true;
+                        }
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut pos_x)
+                                    .speed(0.5)
+                                    .range(-250.0..=250.0)
+                                    .prefix("X: ")
+                                    .suffix(" mm"),
+                            )
+                            .on_hover_text(
+                                "Purge tower X coordinate on the build plate (0 = bed center). Dragging switches to manual placement.",
+                            )
+                            .changed()
+                        {
+                            config.gcode.purge_tower_auto_position = false;
+                            config.gcode.purge_tower_position_xy[0] = pos_x;
+                            config.gcode.purge_tower_position_xy[1] = pos_y;
+                            *dirty_gcode = true;
+                            vis_state.dirty_toolpaths_mesh = true;
+                        }
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut pos_y)
+                                    .speed(0.5)
+                                    .range(-250.0..=250.0)
+                                    .prefix("Y: ")
+                                    .suffix(" mm"),
+                            )
+                            .on_hover_text(
+                                "Purge tower Y coordinate on the build plate (0 = bed center). Dragging switches to manual placement.",
+                            )
+                            .changed()
+                        {
+                            config.gcode.purge_tower_auto_position = false;
+                            config.gcode.purge_tower_position_xy[0] = pos_x;
+                            config.gcode.purge_tower_position_xy[1] = pos_y;
+                            *dirty_gcode = true;
+                            vis_state.dirty_toolpaths_mesh = true;
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small("Place:");
+                        let hx = (0.5 * config.bed.width_x - 0.5 * eff_w - 6.0).max(10.0);
+                        let hy = (0.5 * config.bed.depth_y - 0.5 * eff_d - 6.0).max(10.0);
+                        for (lbl, px, py) in [
+                            ("Rear", 0.0, (0.65 * hy).min(hy)),
+                            ("Front", 0.0, (-0.65 * hy).max(-hy)),
+                            ("Right", (0.65 * hx).min(hx), 0.0),
+                            ("Left", (-0.65 * hx).max(-hx), 0.0),
+                        ] {
+                            if ui
+                                .small_button(lbl)
+                                .on_hover_text(format!(
+                                    "Place purge tower at {lbl} of build plate ({px:.1}, {py:.1} mm)"
+                                ))
+                                .clicked()
+                            {
+                                config.gcode.purge_tower_auto_position = false;
+                                config.gcode.purge_tower_position_xy = [px, py];
+                                *dirty_gcode = true;
+                                vis_state.dirty_toolpaths_mesh = true;
+                            }
+                        }
+                    });
+                }
+            }
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .checkbox(
@@ -7496,6 +7941,66 @@ fn render_process_config_tab(
             param_help_button(ui, "slicing.infill_angle_deg");
         });
 
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Sparse Infill Filament:");
+            let cur_infill_lbl = config
+                .slicing
+                .infill_filament_mode
+                .short_label(&config.tools, &config.filament_slots);
+            let combo_w = (ui.available_width() - 32.0).clamp(105.0, 205.0);
+            let mut infill_mode_changed = false;
+            egui::ComboBox::from_id_source("process_sparse_infill_filament_combo")
+                .selected_text(cur_infill_lbl)
+                .width(combo_w)
+                .show_ui(ui, |ui| {
+                    infill_mode_changed |= ui
+                        .selectable_value(
+                            &mut config.slicing.infill_filament_mode,
+                            InfillFilamentMode::FollowObject,
+                            "Follow Object / Region Filament",
+                        )
+                        .changed();
+                    infill_mode_changed |= ui
+                        .selectable_value(
+                            &mut config.slicing.infill_filament_mode,
+                            InfillFilamentMode::AutoPurgeIntoInfill,
+                            "Auto (Current Tool / Purge into Infill)",
+                        )
+                        .changed();
+                    ui.separator();
+                    for (t_idx, t) in config.tools.iter().enumerate() {
+                        infill_mode_changed |= ui
+                            .selectable_value(
+                                &mut config.slicing.infill_filament_mode,
+                                InfillFilamentMode::SingleTool(t_idx),
+                                format!("Tool T{} — {} ({})", t.id, t.name, t.filament_color_hex),
+                            )
+                            .changed();
+                    }
+                    if !config.filament_slots.is_empty() {
+                        ui.separator();
+                        for (s_idx, _) in config.filament_slots.iter().enumerate() {
+                            let s_u8 = s_idx.min(126) as u8;
+                            let s_lbl = InfillFilamentMode::FilamentSlot(s_u8)
+                                .label(&config.tools, &config.filament_slots);
+                            infill_mode_changed |= ui
+                                .selectable_value(
+                                    &mut config.slicing.infill_filament_mode,
+                                    InfillFilamentMode::FilamentSlot(s_u8),
+                                    s_lbl,
+                                )
+                                .changed();
+                        }
+                    }
+                });
+            if infill_mode_changed {
+                vis_state.dirty_color_mixing = true;
+                vis_state.dirty_toolpaths_mesh = true;
+                gc_changed = true;
+            }
+            param_help_button(ui, "slicing.infill_filament_mode");
+        });
+
         if tp_cfg_changed {
             config.slicing.sanitize();
             if !is_computing {
@@ -7673,6 +8178,58 @@ fn render_process_config_tab(
                     tp_cfg_changed = true;
                 }
                 param_help_button(ui, "slicing.support_tool_index");
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Support Interface Tool:").strong());
+                let selected_intf_label = match config.slicing.support_interface_tool_index {
+                    None => "Follow Support Base Tool".to_string(),
+                    Some(idx) => config
+                        .tools
+                        .get(idx)
+                        .map(|t| {
+                            format!(
+                                "{} ({:.2}mm, {:.0}°C)",
+                                t.name, t.nozzle_diameter_mm, t.temperature_celsius
+                            )
+                        })
+                        .unwrap_or_else(|| format!("Tool #{idx}")),
+                };
+                let combo_w = (ui.available_width() - 32.0).clamp(105.0, 210.0);
+                egui::ComboBox::from_id_source("support_interface_tool_selector_combo")
+                    .selected_text(selected_intf_label)
+                    .width(combo_w)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(
+                                &mut config.slicing.support_interface_tool_index,
+                                None,
+                                "Follow Support Base Tool",
+                            )
+                            .changed()
+                        {
+                            vis_state.dirty_planned_gcode = true;
+                            vis_state.dirty_toolpaths_mesh = true;
+                        }
+                        for (idx, tool) in config.tools.iter().enumerate() {
+                            let lbl = format!(
+                                "{} ({:.2}mm, {:.0}°C)",
+                                tool.name, tool.nozzle_diameter_mm, tool.temperature_celsius
+                            );
+                            if ui
+                                .selectable_value(
+                                    &mut config.slicing.support_interface_tool_index,
+                                    Some(idx),
+                                    lbl,
+                                )
+                                .changed()
+                            {
+                                vis_state.dirty_planned_gcode = true;
+                                vis_state.dirty_toolpaths_mesh = true;
+                            }
+                        }
+                    });
+                param_help_button(ui, "slicing.support_interface_tool_index");
             });
 
             if let Some(sup_idx) = config.slicing.support_tool_index {

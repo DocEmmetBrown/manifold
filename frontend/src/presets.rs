@@ -809,6 +809,8 @@ pub struct ProcessPreset {
     pub solid_infill_pattern: SolidInfillPattern,
     pub sparse_infill_width: LineWidthConfig,
     pub sparse_infill_pattern: SparseInfillPattern,
+    #[serde(default)]
+    pub infill_filament_mode: crate::config::InfillFilamentMode,
     pub infill_density_percent: f32,
     pub infill_angle_deg: f32,
     pub min_extrusion_length_mm: f32,
@@ -821,6 +823,8 @@ pub struct ProcessPreset {
     // Supports (Unreachable Order-Field Regions & Long Bridges)
     pub enable_support_generation: bool,
     pub support_tool_index: Option<usize>,
+    #[serde(default)]
+    pub support_interface_tool_index: Option<usize>,
     pub support_style: SupportStyle,
     pub support_on_bed_only: bool,
     pub seed_order_field_from_supports: bool,
@@ -911,6 +915,7 @@ impl ProcessPreset {
             solid_infill_pattern: cfg.slicing.solid_infill_pattern,
             sparse_infill_width: cfg.slicing.sparse_infill_width,
             sparse_infill_pattern: cfg.slicing.sparse_infill_pattern,
+            infill_filament_mode: cfg.slicing.infill_filament_mode,
             infill_density_percent: cfg.slicing.infill_density_percent,
             infill_angle_deg: cfg.slicing.infill_angle_deg,
             min_extrusion_length_mm: cfg.slicing.min_extrusion_length_mm,
@@ -919,6 +924,7 @@ impl ProcessPreset {
             wave_overhang_overlap_fraction: cfg.slicing.wave_overhang_overlap_fraction,
             enable_support_generation: cfg.slicing.enable_support_generation,
             support_tool_index: cfg.slicing.support_tool_index,
+            support_interface_tool_index: cfg.slicing.support_interface_tool_index,
             support_style: cfg.slicing.support_style,
             support_on_bed_only: cfg.slicing.support_on_bed_only,
             seed_order_field_from_supports: cfg.slicing.seed_order_field_from_supports,
@@ -992,6 +998,7 @@ impl ProcessPreset {
         cfg.slicing.solid_infill_pattern = self.solid_infill_pattern;
         cfg.slicing.sparse_infill_width = self.sparse_infill_width;
         cfg.slicing.sparse_infill_pattern = self.sparse_infill_pattern;
+        cfg.slicing.infill_filament_mode = self.infill_filament_mode;
         cfg.slicing.infill_density_percent = self.infill_density_percent;
         cfg.slicing.infill_angle_deg = self.infill_angle_deg;
         cfg.slicing.min_extrusion_length_mm = self.min_extrusion_length_mm;
@@ -1000,6 +1007,7 @@ impl ProcessPreset {
         cfg.slicing.wave_overhang_overlap_fraction = self.wave_overhang_overlap_fraction;
         cfg.slicing.enable_support_generation = self.enable_support_generation;
         cfg.slicing.support_tool_index = self.support_tool_index;
+        cfg.slicing.support_interface_tool_index = self.support_interface_tool_index;
         cfg.slicing.support_style = self.support_style;
         cfg.slicing.support_on_bed_only = self.support_on_bed_only;
         cfg.slicing.seed_order_field_from_supports = self.seed_order_field_from_supports;
@@ -1109,6 +1117,7 @@ impl ProcessPreset {
             && self.solid_infill_pattern == cfg.slicing.solid_infill_pattern
             && approx_eq_line_width(self.sparse_infill_width, cfg.slicing.sparse_infill_width)
             && self.sparse_infill_pattern == cfg.slicing.sparse_infill_pattern
+            && self.infill_filament_mode == cfg.slicing.infill_filament_mode
             && approx_eq(
                 self.infill_density_percent,
                 cfg.slicing.infill_density_percent,
@@ -1129,6 +1138,7 @@ impl ProcessPreset {
             )
             && self.enable_support_generation == cfg.slicing.enable_support_generation
             && self.support_tool_index == cfg.slicing.support_tool_index
+            && self.support_interface_tool_index == cfg.slicing.support_interface_tool_index
             && self.support_style == cfg.slicing.support_style
             && self.support_on_bed_only == cfg.slicing.support_on_bed_only
             && self.seed_order_field_from_supports == cfg.slicing.seed_order_field_from_supports
@@ -1921,6 +1931,7 @@ mod tests {
             selected_process: "0.20mm Standard Non-Planar".to_string(),
             left_tab: LeftPanelTab::ProjectSetup,
             config_subtab: PresetCategory::Process,
+            show_left_panel: true,
             show_view_panel: true,
             save_as_open_for: None,
             save_as_name_buf: String::new(),
