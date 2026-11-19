@@ -1274,6 +1274,24 @@ impl PresetLibrary {
         let p_corexy =
             PrinterPreset::from_config("256³ CoreXY (Standard Klipper)", &base_cfg, true);
 
+        let make_voron = |name: &str, wx: f32, dy: f32, hz: f32| -> PrinterPreset {
+            let mut p = PrinterPreset::from_config(name, &base_cfg, true);
+            p.bed_shape = BedShape::Rectangular;
+            p.width_x = wx;
+            p.depth_y = dy;
+            p.height_z = hz;
+            p.gcode_origin_at_bed_center = false;
+            p
+        };
+
+        let p_v0 = make_voron("Voron 0", 120.0, 120.0, 120.0);
+        let p_trident_250 = make_voron("Voron Trident 250", 250.0, 250.0, 250.0);
+        let p_trident_300 = make_voron("Voron Trident 300", 300.0, 300.0, 250.0);
+        let p_trident_350 = make_voron("Voron Trident 350", 350.0, 350.0, 250.0);
+        let p_v24_250 = make_voron("Voron 2.4 250", 250.0, 250.0, 220.0);
+        let p_v24_300 = make_voron("Voron 2.4 300", 300.0, 300.0, 280.0);
+        let p_v24_350 = make_voron("Voron 2.4 350", 350.0, 350.0, 330.0);
+
         let mut p_5axis =
             PrinterPreset::from_config("5-Axis Tilting Build Plate (250×210)", &base_cfg, true);
         p_5axis.width_x = 250.0;
@@ -1346,7 +1364,19 @@ impl PresetLibrary {
         p_6axis.infill_accel_mms2 = 3500.0;
         p_6axis.travel_accel_mms2 = 5000.0;
 
-        vec![p_corexy, p_5axis, p_rrf_5axis_bc, p_6axis]
+        vec![
+            p_corexy,
+            p_v0,
+            p_trident_250,
+            p_trident_300,
+            p_trident_350,
+            p_v24_250,
+            p_v24_300,
+            p_v24_350,
+            p_5axis,
+            p_rrf_5axis_bc,
+            p_6axis,
+        ]
     }
 
     pub fn builtin_tools() -> Vec<ToolPreset> {
@@ -1972,6 +2002,29 @@ mod tests {
         assert!(lib.select_and_apply(PresetCategory::Process, "0.12mm Fine Conformal", &mut cfg));
         assert!((cfg.slicing.layer_height.target_mm - 0.12).abs() < 1.0e-4);
         assert!(!lib.is_category_modified(PresetCategory::Process, &cfg));
+
+        // Switching to the standard Voron printer presets applies their exact build volumes
+        let voron_expected = [
+            ("Voron 0", 120.0, 120.0, 120.0),
+            ("Voron Trident 250", 250.0, 250.0, 250.0),
+            ("Voron Trident 300", 300.0, 300.0, 250.0),
+            ("Voron Trident 350", 350.0, 350.0, 250.0),
+            ("Voron 2.4 250", 250.0, 250.0, 220.0),
+            ("Voron 2.4 300", 300.0, 300.0, 280.0),
+            ("Voron 2.4 350", 350.0, 350.0, 330.0),
+        ];
+        for (name, wx, dy, hz) in voron_expected {
+            assert!(
+                lib.select_and_apply(PresetCategory::Printer, name, &mut cfg),
+                "Missing built-in printer preset {name}"
+            );
+            assert_eq!(cfg.bed.shape, BedShape::Rectangular);
+            assert!((cfg.bed.width_x - wx).abs() < 1.0e-4);
+            assert!((cfg.bed.depth_y - dy).abs() < 1.0e-4);
+            assert!((cfg.bed.height_z - hz).abs() < 1.0e-4);
+            assert!(!cfg.gcode.gcode_origin_at_bed_center);
+            assert!(!lib.is_category_modified(PresetCategory::Printer, &cfg));
+        }
     }
 
     #[test]
