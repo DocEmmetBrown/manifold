@@ -1834,6 +1834,12 @@ fn combine_planned_objects_into_plate_gcode(
                     out.push('\n');
                 }
             }
+            crate::config::GcodeDialect::Prusa => {
+                out.push_str(&format!(
+                    "M486 T{} ; Prusa Buddy object cancellation count\n",
+                    planned_objects.len()
+                ));
+            }
             crate::config::GcodeDialect::RepRapFirmware => {
                 out.push_str(&format!(
                     "M486 T{} ; RepRapFirmware object cancellation count\n",
@@ -1872,7 +1878,8 @@ fn combine_planned_objects_into_plate_gcode(
         if let Some(start_pos) = p.gcode_text.find("\n; --- LAYER ") {
             let body_slice = &p.gcode_text[start_pos..];
             let end_pos = body_slice
-                .find("\n; --- Manifold2 Non-Planar Print End ---")
+                .find("\n; --- END_OF_PRINT_LAYERS ---")
+                .or_else(|| body_slice.find("\n; --- Manifold2 Non-Planar Print End ---"))
                 .or_else(|| body_slice.find("\n; --- Manifold2 5-Axis RRF (XYZ + BC) Print End ---"))
                 .or_else(|| body_slice.find("\n; --- Moonraker / PrusaSlicer Metadata Footer ---"))
                 .unwrap_or(body_slice.len());

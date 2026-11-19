@@ -4901,7 +4901,7 @@ fn render_printer_config_tab(
     .default_open(false)
     .show(ui, |ui| {
         let gc = &mut config.gcode;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Firmware Dialect:");
             for dialect in GcodeDialect::ALL {
                 dirty_gcode |= ui
@@ -4911,9 +4911,10 @@ fn render_printer_config_tab(
             }
             param_help_button(ui, "gcode.gcode_dialect");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let exclude_label = match gc.gcode_dialect {
                 GcodeDialect::Klipper => "Emit Klipper EXCLUDE_OBJECT commands",
+                GcodeDialect::Prusa => "Emit Prusa M486 Cancel-Object Labels",
                 GcodeDialect::RepRapFirmware => "Emit RepRapFirmware M486 Object Cancellation",
             };
             dirty_gcode |= ui
@@ -4921,19 +4922,20 @@ fn render_printer_config_tab(
                 .changed();
             param_help_button(ui, "gcode.emit_exclude_object");
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            let thumb_label = match gc.gcode_dialect {
+                GcodeDialect::Prusa => "Embed Prusa / Buddy PNG Thumbnails (32x32 & 300x300)",
+                _ => "Embed Moonraker PNG Thumbnails (32x32 & 300x300)",
+            };
             dirty_gcode |= ui
-                .checkbox(
-                    &mut gc.emit_thumbnails,
-                    "Embed Moonraker PNG Thumbnails (32x32 & 300x300)",
-                )
+                .checkbox(&mut gc.emit_thumbnails, thumb_label)
                 .changed();
             param_help_button(ui, "gcode.emit_thumbnails");
         });
         ui.separator();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.small(
-                "Placeholders: {tool_id}, {nozzle_temp}, {bed_temp}, {nozzle_diameter}, {bbox_min_x..z}, {bbox_max_x..z}, {bbox_center_x..y}, {layer_count}",
+                "Placeholders: {tool_id}, {nozzle_temp}, {bed_temp}, {nozzle_diameter}, {bbox_min_x..z}, {bbox_max_x..z}, {bbox_width_x}, {bbox_depth_y}, {bbox_center_x..y}, {layer_count}",
             );
             param_help_button(ui, "gcode.templates");
         });

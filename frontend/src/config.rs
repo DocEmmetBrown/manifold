@@ -1652,16 +1652,19 @@ pub enum GcodeDialect {
     /// Klipper (`SET_PRESSURE_ADVANCE`, `SET_VELOCITY_LIMIT`, `EXCLUDE_OBJECT_*`).
     #[default]
     Klipper,
-    /// RepRapFirmware / Duet (`M572`, `M204`, `M486`, 5-axis RTCP `XYZBC`).
+    /// Prusa Buddy / Marlin 2 (`M572 S...`, `M204 P... T...`, `M486`, `M104`/`M109`, `M555`/`G29`).
+    Prusa,
+    /// RepRapFirmware / Duet (`M572 D... S...`, `M204`, `M486`, `M568`/`M116`, 5-axis RTCP `XYZBC`).
     RepRapFirmware,
 }
 
 impl GcodeDialect {
-    pub const ALL: [Self; 2] = [Self::Klipper, Self::RepRapFirmware];
+    pub const ALL: [Self; 3] = [Self::Klipper, Self::Prusa, Self::RepRapFirmware];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Klipper => "Klipper",
+            Self::Prusa => "Prusa (Buddy / Marlin 2)",
             Self::RepRapFirmware => "RepRapFirmware (RRF / Duet)",
         }
     }
@@ -1669,6 +1672,7 @@ impl GcodeDialect {
     pub const fn short_label(self) -> &'static str {
         match self {
             Self::Klipper => "Klipper",
+            Self::Prusa => "Prusa",
             Self::RepRapFirmware => "RRF / Duet",
         }
     }
@@ -4349,7 +4353,7 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         units: "G-code",
         default_value: "Standard Klipper M140/M104/G28/M190/M109",
         summary: "Customizable start and end G-code blocks with `{bed_temp}`, `{nozzle_temp}`, `{tool_id}`, and bounding-box placeholders.",
-        details: "Supports `{tool_id}`, `{nozzle_temp}`, `{bed_temp}`, `{nozzle_diameter}`, `{bbox_min_x..z}`, `{bbox_max_x..z}`, `{bbox_center_x..y}`, and `{layer_count}`.",
+        details: "Supports `{tool_id}`, `{nozzle_temp}`, `{bed_temp}`, `{nozzle_diameter}`, `{bbox_min_x..z}`, `{bbox_max_x..z}`, `{bbox_width_x}`, `{bbox_depth_y}`, `{bbox_center_x..y}`, and `{layer_count}`.",
     },
 
     // --- Machine Tools & Multi-Axis Kinematics ---
@@ -4401,11 +4405,11 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
     ParameterDoc {
         key: "gcode.gcode_dialect",
         category: "Machine Tools & Multi-Axis Kinematics",
-        title: "Firmware G-code Dialect (Klipper / RepRapFirmware)",
+        title: "Firmware G-code Dialect (Klipper / Prusa / RepRapFirmware)",
         units: "mode",
         default_value: "Klipper",
-        summary: "Selects firmware-specific commands for dynamic Pressure Advance, acceleration limits, and object cancellation.",
-        details: "Klipper emits `SET_PRESSURE_ADVANCE ADVANCE=...`, `SET_VELOCITY_LIMIT ACCEL=...`, and `EXCLUDE_OBJECT_*`. RepRapFirmware (RRF / Duet) emits `M572 D{tool} S{pa}`, `M204 P{print_accel} T{travel_accel}`, and `M486` object markers.",
+        summary: "Selects firmware-specific commands for dynamic Pressure Advance, acceleration limits, tool heating, and object cancellation.",
+        details: "Klipper emits `SET_PRESSURE_ADVANCE ADVANCE=...`, `SET_VELOCITY_LIMIT ACCEL=...`, and `EXCLUDE_OBJECT_*`. Prusa (Buddy / Marlin 2) emits `M572 S{pa}`, `M204 P{print_accel} T{travel_accel}`, `M104`/`M109` tool temperatures, and `M486` cancel-object blocks. RepRapFirmware (RRF / Duet) emits `M572 D{tool} S{pa}`, `M204 P{print_accel} T{travel_accel}`, `M568`/`M116`, and `M486`.",
     },
     ParameterDoc {
         key: "machine.kinematics_mode",

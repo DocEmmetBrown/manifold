@@ -14,6 +14,7 @@ use crate::config::{
 pub fn format_pressure_advance_cmd(dialect: GcodeDialect, tool_id: u32, pa_s: f32) -> String {
     match dialect {
         GcodeDialect::Klipper => format!("SET_PRESSURE_ADVANCE ADVANCE={pa_s:.5}\n"),
+        GcodeDialect::Prusa => format!("M572 S{pa_s:.4}\n"),
         GcodeDialect::RepRapFirmware => format!("M572 D{tool_id} S{pa_s:.4}\n"),
     }
 }
@@ -27,7 +28,7 @@ pub fn format_accel_limit_cmd(
 ) -> String {
     match dialect {
         GcodeDialect::Klipper => format!("SET_VELOCITY_LIMIT ACCEL={print_accel_mms2:.0}\n"),
-        GcodeDialect::RepRapFirmware => {
+        GcodeDialect::Prusa | GcodeDialect::RepRapFirmware => {
             format!("M204 P{print_accel_mms2:.0} T{travel_accel_mms2:.0}\n")
         }
     }
@@ -2109,6 +2110,8 @@ pub fn expand_gcode_template(
     layer_count: usize,
 ) -> String {
     let center = 0.5 * (bbox_min + bbox_max);
+    let width_x = (bbox_max.x - bbox_min.x).max(1.0);
+    let depth_y = (bbox_max.y - bbox_min.y).max(1.0);
     template
         .replace("{tool_id}", &format!("{tool_id}"))
         .replace("{nozzle_temp}", &format!("{nozzle_temp_c:.0}"))
@@ -2120,6 +2123,8 @@ pub fn expand_gcode_template(
         .replace("{bbox_max_y}", &format!("{:.2}", bbox_max.y))
         .replace("{bbox_min_z}", &format!("{:.2}", bbox_min.z))
         .replace("{bbox_max_z}", &format!("{:.2}", bbox_max.z))
+        .replace("{bbox_width_x}", &format!("{width_x:.2}"))
+        .replace("{bbox_depth_y}", &format!("{depth_y:.2}"))
         .replace("{bbox_center_x}", &format!("{:.2}", center.x))
         .replace("{bbox_center_y}", &format!("{:.2}", center.y))
         .replace("{layer_count}", &format!("{layer_count}"))
@@ -6076,6 +6081,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                 ));
                 gcode.push('\n');
             }
+            GcodeDialect::Prusa => {
+                gcode.push_str("M486 T1 ; Prusa Buddy object cancellation count\n");
+            }
             GcodeDialect::RepRapFirmware => {
                 gcode.push_str("M486 T1 ; RepRapFirmware object cancellation count\n");
             }
@@ -6112,7 +6120,7 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
         for &aux_tool_id in &preheat_tool_ids {
             let aux_temp_c = lookup_tool_by_id(aux_tool_id, aux_tool_id == support_tool_id).temp_c;
             match gcfg.gcode_dialect {
-                GcodeDialect::Klipper => {
+                GcodeDialect::Klipper | GcodeDialect::Prusa => {
                     let _ = writeln!(
                         gcode,
                         "M104 S{aux_temp_c:.0} T{aux_tool_id} ; Preheat tool T{aux_tool_id}"
@@ -6245,6 +6253,13 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                 GcodeDialect::Klipper => {
                     let _ = writeln!(gcode, "EXCLUDE_OBJECT_START NAME={exclude_object_name}");
                 }
+                GcodeDialect::Prusa => {
+                    let obj_idx = object_id.saturating_sub(1);
+                    let _ = writeln!(
+                        gcode,
+                        "; printing object {exclude_object_name} id:{obj_idx} copy 0\nM486 S{obj_idx}"
+                    );
+                }
                 GcodeDialect::RepRapFirmware => {
                     let obj_idx = object_id.saturating_sub(1);
                     let _ = writeln!(gcode, "M486 S{obj_idx} A\"{exclude_object_name}\"");
@@ -6323,7 +6338,7 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                 let target_temp_c =
                     lookup_tool_by_id(seg.tool_id, seg.tool_id == support_tool_id).temp_c;
                 match gcfg.gcode_dialect {
-                    GcodeDialect::Klipper => {
+                    GcodeDialect::Klipper | GcodeDialect::Prusa => {
                         let _ = writeln!(
                             gcode,
                             "M104 S{target_temp_c:.0} T{}\nT{} ; Switch tool ({})",
@@ -6386,7 +6401,7 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                     GcodeDialect::Klipper => {
                         let _ = writeln!(gcode, "SET_VELOCITY_LIMIT ACCEL={:.0}\n", seg.accel_mms2);
                     }
-                    GcodeDialect::RepRapFirmware => {
+                    GcodeDialect::Prusa | GcodeDialect::RepRapFirmware => {
                         let _ = writeln!(
                             gcode,
                             "M204 P{:.0} T{:.0}\n",
@@ -6444,6 +6459,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                                 "SET_PRESSURE_ADVANCE ADVANCE={:.5}\n",
                                 seg.pressure_advance_s
                             );
+                        }
+                        GcodeDialect::Prusa => {
+                            let _ = writeln!(gcode, "M572 S{:.4}\n", seg.pressure_advance_s);
                         }
                         GcodeDialect::RepRapFirmware => {
                             let _ = writeln!(
@@ -6613,6 +6631,13 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                 GcodeDialect::Klipper => {
                     gcode.push_str(&format!("EXCLUDE_OBJECT_END NAME={exclude_object_name}\n"));
                 }
+                GcodeDialect::Prusa => {
+                    let obj_idx = object_id.saturating_sub(1);
+                    let _ = writeln!(
+                        gcode,
+                        "M486 S-1\n; stop printing object {exclude_object_name} id:{obj_idx} copy 0"
+                    );
+                }
                 GcodeDialect::RepRapFirmware => {
                     gcode.push_str("M486 S-1\n");
                 }
@@ -6624,7 +6649,7 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
         gcode.push_str("G94 ; Restore standard mm/min feedrate mode\n");
     }
 
-    gcode.push('\n');
+    gcode.push_str("\n; --- END_OF_PRINT_LAYERS ---\n");
     let end_expanded = expand_gcode_template(
         &gcfg.end_gcode_template,
         tool_id,
@@ -6982,6 +7007,12 @@ pub fn combine_planned_objects_into_plate_result(
                     out.push('\n');
                 }
             }
+            crate::config::GcodeDialect::Prusa => {
+                out.push_str(&format!(
+                    "M486 T{} ; Prusa Buddy object cancellation count\n",
+                    planned_objects.len()
+                ));
+            }
             crate::config::GcodeDialect::RepRapFirmware => {
                 out.push_str(&format!(
                     "M486 T{} ; RepRapFirmware object cancellation count\n",
@@ -7019,7 +7050,8 @@ pub fn combine_planned_objects_into_plate_result(
         if let Some(start_pos) = p.gcode_text.find("\n; --- LAYER ") {
             let body_slice = &p.gcode_text[start_pos..];
             let end_pos = body_slice
-                .find("\n; --- Manifold2 Non-Planar Print End ---")
+                .find("\n; --- END_OF_PRINT_LAYERS ---")
+                .or_else(|| body_slice.find("\n; --- Manifold2 Non-Planar Print End ---"))
                 .or_else(|| body_slice.find("\n; --- Manifold2 5-Axis RRF (XYZ + BC) Print End ---"))
                 .or_else(|| body_slice.find("\n; --- Moonraker / PrusaSlicer Metadata Footer ---"))
                 .unwrap_or(body_slice.len());
@@ -8939,5 +8971,123 @@ mod tests {
             (mean_local_x - 50.0).abs() < 25.0 && (mean_local_y - (-40.0)).abs() < 20.0,
             "Expected manual purge tower near (50, -40), got ({mean_local_x:.1}, {mean_local_y:.1})"
         );
+    }
+
+    #[test]
+    fn test_prusa_core_one_indx_gcode_dialect_emission() {
+        use crate::bridge::ffi::{ExtrusionPath, LayerToolpaths, ToolpathPoint};
+        use crate::presets::{PresetCategory, PresetLibrary};
+
+        let mut cfg = SlicerConfig::default();
+        let mut lib = PresetLibrary {
+            printers: PresetLibrary::builtin_printers(),
+            tools: PresetLibrary::builtin_tools(),
+            filaments: PresetLibrary::builtin_filaments(),
+            processes: PresetLibrary::builtin_processes(),
+            selected_printer: "256³ CoreXY (Standard Klipper)".to_string(),
+            selected_tool: "0.4mm Standard 5/6-Axis Conical".to_string(),
+            selected_filament: "Generic PLA".to_string(),
+            selected_process: "0.20mm Standard Non-Planar".to_string(),
+            left_tab: crate::presets::LeftPanelTab::ProjectSetup,
+            config_subtab: PresetCategory::Printer,
+            show_left_panel: true,
+            show_view_panel: true,
+            save_as_open_for: None,
+            save_as_name_buf: String::new(),
+        };
+
+        assert!(lib.select_and_apply(
+            PresetCategory::Printer,
+            "Prusa CORE One INDX (4-Tool)",
+            &mut cfg
+        ));
+        assert_eq!(cfg.gcode.gcode_dialect, GcodeDialect::Prusa);
+        assert_eq!(cfg.tools.len(), 4);
+        cfg.filament_slots = vec![
+            crate::config::ThreeMfFilamentSlot::default_for_slot(0, 0),
+            crate::config::ThreeMfFilamentSlot::default_for_slot(1, 1),
+        ];
+
+        let make_line = |slot: u8, y_mm: f32| ExtrusionPath {
+            feature_kind: 0,
+            wall_index: 0,
+            filament_slot: slot,
+            is_closed: false,
+            total_length_mm: 20.0,
+            mean_width_mm: 0.40,
+            points: vec![
+                ToolpathPoint {
+                    x: -10.0,
+                    y: y_mm,
+                    z: 0.20,
+                    nx: 0.0,
+                    ny: 0.0,
+                    nz: 1.0,
+                    width_mm: 0.40,
+                    height_mm: 0.20,
+                    tool_iso_angle_deg: 0.0,
+                    uses_surface_normal: false,
+                },
+                ToolpathPoint {
+                    x: 10.0,
+                    y: y_mm,
+                    z: 0.20,
+                    nx: 0.0,
+                    ny: 0.0,
+                    nz: 1.0,
+                    width_mm: 0.40,
+                    height_mm: 0.20,
+                    tool_iso_angle_deg: 0.0,
+                    uses_surface_normal: false,
+                },
+            ],
+        };
+
+        let raw = ObjectToolpathsResult {
+            valid: true,
+            total_path_count: 2,
+            outer_wall_count: 2,
+            inner_wall_count: 0,
+            solid_infill_count: 0,
+            sparse_infill_count: 0,
+            bridge_count: 0,
+            wave_overhang_count: 0,
+            support_count: 0,
+            support_interface_count: 0,
+            layers: vec![LayerToolpaths {
+                layer_index: 0,
+                branch_id: 0,
+                isovalue: 0.20,
+                paths: vec![make_line(0, -5.0), make_line(1, 5.0)],
+            }],
+        };
+
+        let res = plan_and_emit_gcode_for_object(
+            "PrusaIndxBracket",
+            1,
+            &raw,
+            Transform::IDENTITY,
+            &cfg,
+        );
+        let g = &res.gcode_text;
+        assert!(g.contains("M862.3 P \"COREONE\""));
+        assert!(g.contains("M555 X"));
+        assert!(g.contains("G29 ; Print-area mesh bed leveling"));
+        assert!(g.contains("M486 T1 ; Prusa Buddy object cancellation count"));
+        assert!(g.contains("; printing object PrusaIndxBracket id:0 copy 0\nM486 S0"));
+        assert!(g.contains("M486 S-1\n; stop printing object PrusaIndxBracket id:0 copy 0"));
+        assert!(g.contains("M572 S"), "Expected Prusa M572 S<pa> Pressure Advance");
+        assert!(
+            !g.contains("M572 D"),
+            "Prusa Buddy M572 should not emit RepRapFirmware D<tool> parameter"
+        );
+        assert!(
+            !g.contains("SET_PRESSURE_ADVANCE"),
+            "Prusa dialect should not emit Klipper SET_PRESSURE_ADVANCE"
+        );
+        assert!(g.contains("M204 P"), "Expected Prusa M204 P<accel> T<travel>");
+        assert!(g.contains("M104 S215 T1 ; Preheat tool T1"));
+        assert!(g.contains("T1 ; Switch tool"));
+        assert!(g.contains("M104 S0 T3 ; Turn off INDX tool T3"));
     }
 }

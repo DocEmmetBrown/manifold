@@ -1149,6 +1149,9 @@ fn finalize_calibration_gcode_result(
                 ));
                 gcode.push('\n');
             }
+            GcodeDialect::Prusa => {
+                gcode.push_str("M486 T1 ; Prusa Buddy object cancellation count\n");
+            }
             GcodeDialect::RepRapFirmware => {
                 gcode.push_str("M486 T1 ; RepRapFirmware object cancellation count\n");
             }
@@ -1171,7 +1174,7 @@ fn finalize_calibration_gcode_result(
     }
     if !gcfg.start_gcode_template.contains("{tool_id}") {
         match gcfg.gcode_dialect {
-            GcodeDialect::Klipper => {
+            GcodeDialect::Klipper | GcodeDialect::Prusa => {
                 gcode.push_str(&format!(
                     "M104 S{:.0} T{} ; Set calibration tool temperature\nT{} ; Select calibration tool ({})\nM109 S{:.0} T{} ; Wait for calibration tool temperature\n",
                     basis.nozzle_temp_c,
@@ -1234,6 +1237,11 @@ fn finalize_calibration_gcode_result(
             match gcfg.gcode_dialect {
                 GcodeDialect::Klipper => {
                     gcode.push_str(&format!("EXCLUDE_OBJECT_START NAME={exclude_object_name}\n"));
+                }
+                GcodeDialect::Prusa => {
+                    gcode.push_str(&format!(
+                        "; printing object {exclude_object_name} id:0 copy 0\nM486 S0\n"
+                    ));
                 }
                 GcodeDialect::RepRapFirmware => {
                     gcode.push_str(&format!("M486 S0 A\"{exclude_object_name}\"\n"));
@@ -1406,6 +1414,11 @@ fn finalize_calibration_gcode_result(
             match gcfg.gcode_dialect {
                 GcodeDialect::Klipper => {
                     gcode.push_str(&format!("EXCLUDE_OBJECT_END NAME={exclude_object_name}\n"));
+                }
+                GcodeDialect::Prusa => {
+                    gcode.push_str(&format!(
+                        "M486 S-1\n; stop printing object {exclude_object_name} id:0 copy 0\n"
+                    ));
                 }
                 GcodeDialect::RepRapFirmware => {
                     gcode.push_str("M486 S-1\n");

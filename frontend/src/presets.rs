@@ -138,6 +138,9 @@ pub struct PrinterPreset {
     pub emit_thumbnails: bool,
     pub start_gcode_template: String,
     pub end_gcode_template: String,
+    /// Optional default extruder/toolhead count when selecting this printer preset (e.g. `Some(4)` or `Some(8)` for Bondtech INDX).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tool_count: Option<usize>,
 
     // Network Printing (Moonraker / Klipper)
     pub network: MoonrakerNetworkConfig,
@@ -197,6 +200,7 @@ impl PrinterPreset {
             emit_thumbnails: cfg.gcode.emit_thumbnails,
             start_gcode_template: cfg.gcode.start_gcode_template.clone(),
             end_gcode_template: cfg.gcode.end_gcode_template.clone(),
+            default_tool_count: None,
             network: cfg.network.clone(),
         }
     }
@@ -242,6 +246,33 @@ impl PrinterPreset {
         cfg.gcode.emit_thumbnails = self.emit_thumbnails;
         cfg.gcode.start_gcode_template = self.start_gcode_template.clone();
         cfg.gcode.end_gcode_template = self.end_gcode_template.clone();
+        if let Some(target_tools) = self.default_tool_count {
+            let target_tools = target_tools.clamp(1, 16);
+            let template_tool = cfg.active_tool().cloned().unwrap_or_default();
+            if target_tools > 1
+                && cfg.tools.len() == 2
+                && cfg.tools[1].name == "T1 - 0.6mm High-Flow"
+            {
+                cfg.tools.truncate(1);
+            }
+            if cfg.tools.len() > target_tools {
+                cfg.tools.truncate(target_tools);
+            }
+            while cfg.tools.len() < target_tools {
+                let idx = cfg.tools.len();
+                let mut t = template_tool.clone();
+                t.id = idx as u32;
+                let (hex, srgba) = crate::config::DEFAULT_FILAMENT_SLOT_PALETTE
+                    [idx % crate::config::DEFAULT_FILAMENT_SLOT_PALETTE.len()];
+                t.filament_color_hex = hex.to_string();
+                t.filament_color_srgba = srgba;
+                t.name = format!("T{idx} - {:.1}mm INDX", t.nozzle_diameter_mm);
+                cfg.tools.push(t);
+            }
+            if cfg.active_tool_index >= cfg.tools.len() {
+                cfg.active_tool_index = 0;
+            }
+        }
         cfg.network = self.network.clone();
         cfg.machine.sanitize();
         cfg.gcode.sanitize();
@@ -1292,6 +1323,165 @@ impl PresetLibrary {
         let p_v24_300 = make_voron("Voron 2.4 300", 300.0, 300.0, 280.0);
         let p_v24_350 = make_voron("Voron 2.4 350", 350.0, 350.0, 330.0);
 
+        let make_prusa_core_one = |name: &str,
+                                   model_tag: &str,
+                                   wx: f32,
+                                   dy: f32,
+                                   hz: f32,
+                                   park_x: f32,
+                                   park_y: f32,
+                                   tool_count: Option<usize>|
+         -> PrinterPreset {
+            let mut p = PrinterPreset::from_config(name, &base_cfg, true);
+            p.bed_shape = BedShape::Rectangular;
+            p.width_x = wx;
+            p.depth_y = dy;
+            p.height_z = hz;
+            p.gcode_origin_at_bed_center = false;
+            p.gcode_dialect = GcodeDialect::Prusa;
+            p.emit_exclude_object = true;
+            p.emit_thumbnails = true;
+            p.default_tool_count = tool_count;
+            p.travel_speed_mms = 350.0;
+            p.z_hop_speed_mms = 15.0;
+            p.outer_wall_accel_mms2 = 4000.0;
+            p.inner_wall_accel_mms2 = 6000.0;
+            p.infill_accel_mms2 = 10000.0;
+            p.travel_accel_mms2 = 10000.0;
+            p.square_corner_velocity_mms = 9.0;
+
+            let is_indx = tool_count.unwrap_or(1) > 1;
+            p.start_gcode_template = if is_indx {
+                format!(
+                    concat!(
+                        "; --- Manifold2 Prusa {name} (Buddy / Bondtech INDX) Print Start ---\n",
+                        "M862.3 P \"{model_tag}\" ; Printer model check\n",
+                        "M862.1 P{{nozzle_diameter}} ; Nozzle diameter check\n",
+                        "G90 ; Absolute positioning\n",
+                        "M83 ; Relative extrusion\n",
+                        "M140 S{{bed_temp}} ; Set bed temperature\n",
+                        "M104 S170 T{{tool_id}} ; No-ooze probing preheat on initial INDX tool\n",
+                        "G28 ; Home all axes\n",
+                        "T{{tool_id}} ; Pick up initial INDX toolhead\n",
+                        "M190 S{{bed_temp}} ; Wait for bed temperature\n",
+                        "M555 X{{bbox_min_x}} Y{{bbox_min_y}} W{{bbox_width_x}} H{{bbox_depth_y}} ; Set print area\n",
+                        "G29 ; Print-area mesh bed leveling\n",
+                        "M109 S{{nozzle_temp}} T{{tool_id}} ; Heat active INDX induction nozzle\n",
+                        "G92 E0 ; Reset extruder"
+                    ),
+                    name = name,
+                    model_tag = model_tag
+                )
+            } else {
+                format!(
+                    concat!(
+                        "; --- Manifold2 Prusa {name} (Buddy) Print Start ---\n",
+                        "M862.3 P \"{model_tag}\" ; Printer model check\n",
+                        "M862.1 P{{nozzle_diameter}} ; Nozzle diameter check\n",
+                        "G90 ; Absolute positioning\n",
+                        "M83 ; Relative extrusion\n",
+                        "M140 S{{bed_temp}} ; Set bed temperature\n",
+                        "M104 S170 ; No-ooze probing preheat\n",
+                        "G28 ; Home all axes\n",
+                        "M190 S{{bed_temp}} ; Wait for bed temperature\n",
+                        "M555 X{{bbox_min_x}} Y{{bbox_min_y}} W{{bbox_width_x}} H{{bbox_depth_y}} ; Set print area\n",
+                        "G29 ; Print-area mesh bed leveling\n",
+                        "M109 S{{nozzle_temp}} T{{tool_id}} ; Wait for nozzle print temperature\n",
+                        "G92 E0 ; Reset extruder"
+                    ),
+                    name = name,
+                    model_tag = model_tag
+                )
+            };
+
+            let turn_off_tools = if let Some(n) = tool_count.filter(|&n| n > 1) {
+                let mut cmds = String::new();
+                for tid in 0..n {
+                    cmds.push_str(&format!("M104 S0 T{tid} ; Turn off INDX tool T{tid}\n"));
+                }
+                cmds
+            } else {
+                "M104 S0 ; Turn off nozzle heater\n".to_string()
+            };
+            p.end_gcode_template = format!(
+                concat!(
+                    "; --- Manifold2 Prusa {name} Print End ---\n",
+                    "M400 ; Wait for moves to finish\n",
+                    "{turn_off_tools}",
+                    "M140 S0 ; Turn off heated bed\n",
+                    "M107 ; Turn off part cooling fan\n",
+                    "G1 X{park_x:.0} Y{park_y:.0} F10200 ; Park carriage\n",
+                    "M84 X Y E ; Disable XY & E steppers"
+                ),
+                name = name,
+                turn_off_tools = turn_off_tools,
+                park_x = park_x,
+                park_y = park_y
+            );
+            p
+        };
+
+        let p_core_one = make_prusa_core_one(
+            "Prusa CORE One",
+            "COREONE",
+            250.0,
+            220.0,
+            270.0,
+            242.0,
+            211.0,
+            Some(1),
+        );
+        let p_core_one_l = make_prusa_core_one(
+            "Prusa CORE One L",
+            "COREONEL",
+            300.0,
+            300.0,
+            330.0,
+            290.0,
+            290.0,
+            Some(1),
+        );
+        let p_core_one_indx_4 = make_prusa_core_one(
+            "Prusa CORE One INDX (4-Tool)",
+            "COREONE",
+            248.0,
+            205.0,
+            270.0,
+            240.0,
+            200.0,
+            Some(4),
+        );
+        let p_core_one_indx_8 = make_prusa_core_one(
+            "Prusa CORE One INDX (8-Tool)",
+            "COREONE",
+            248.0,
+            205.0,
+            270.0,
+            240.0,
+            200.0,
+            Some(8),
+        );
+        let p_core_one_l_indx_4 = make_prusa_core_one(
+            "Prusa CORE One L INDX (4-Tool)",
+            "COREONEL",
+            298.0,
+            275.0,
+            330.0,
+            290.0,
+            270.0,
+            Some(4),
+        );
+        let p_core_one_l_indx_8 = make_prusa_core_one(
+            "Prusa CORE One L INDX (8-Tool)",
+            "COREONEL",
+            298.0,
+            275.0,
+            330.0,
+            290.0,
+            270.0,
+            Some(8),
+        );
+
         let mut p_5axis =
             PrinterPreset::from_config("5-Axis Tilting Build Plate (250×210)", &base_cfg, true);
         p_5axis.width_x = 250.0;
@@ -1373,6 +1563,12 @@ impl PresetLibrary {
             p_v24_250,
             p_v24_300,
             p_v24_350,
+            p_core_one,
+            p_core_one_l,
+            p_core_one_indx_4,
+            p_core_one_indx_8,
+            p_core_one_l_indx_4,
+            p_core_one_l_indx_8,
             p_5axis,
             p_rrf_5axis_bc,
             p_6axis,
@@ -1417,7 +1613,28 @@ impl PresetLibrary {
         t_rect.rect_half_angle_y_deg = 24.0;
         t_rect.rect_height_mm = 45.0;
 
-        vec![t_04, t_06, t_025, t_rect]
+        let mut t_nextruder =
+            ToolPreset::from_config("0.4mm Prusa Nextruder High-Flow", &base_cfg, true);
+        t_nextruder.nozzle_diameter_mm = 0.40;
+        t_nextruder.has_rotational_axes = false;
+        t_nextruder.max_volumetric_flow_mm3s = 26.0;
+        t_nextruder.retract_length_mm = 0.70;
+        t_nextruder.retract_speed_mms = 35.0;
+        t_nextruder.z_hop_mm = 0.20;
+
+        let mut t_indx =
+            ToolPreset::from_config("0.4mm Bondtech INDX Toolchanger", &base_cfg, true);
+        t_indx.nozzle_diameter_mm = 0.40;
+        t_indx.has_rotational_axes = false;
+        t_indx.max_volumetric_flow_mm3s = 24.0;
+        t_indx.retract_length_mm = 0.60;
+        t_indx.retract_speed_mms = 40.0;
+        t_indx.z_hop_mm = 0.20;
+        t_indx.tool_change_time_s = 12.0;
+        t_indx.tool_change_hop_before = true;
+        t_indx.tool_change_approach_after = true;
+
+        vec![t_04, t_06, t_025, t_rect, t_nextruder, t_indx]
     }
 
     pub fn builtin_filaments() -> Vec<FilamentPreset> {
@@ -2025,6 +2242,40 @@ mod tests {
             assert!(!cfg.gcode.gcode_origin_at_bed_center);
             assert!(!lib.is_category_modified(PresetCategory::Printer, &cfg));
         }
+
+        // Switching to the Prusa CORE One & INDX printer presets applies Prusa dialect, build volumes, and tool counts
+        let prusa_expected: [(&str, f32, f32, f32, usize); 6] = [
+            ("Prusa CORE One", 250.0, 220.0, 270.0, 1),
+            ("Prusa CORE One L", 300.0, 300.0, 330.0, 1),
+            ("Prusa CORE One INDX (4-Tool)", 248.0, 205.0, 270.0, 4),
+            ("Prusa CORE One INDX (8-Tool)", 248.0, 205.0, 270.0, 8),
+            ("Prusa CORE One L INDX (4-Tool)", 298.0, 275.0, 330.0, 4),
+            ("Prusa CORE One L INDX (8-Tool)", 298.0, 275.0, 330.0, 8),
+        ];
+        for (name, wx, dy, hz, expected_tools) in prusa_expected {
+            assert!(
+                lib.select_and_apply(PresetCategory::Printer, name, &mut cfg),
+                "Missing built-in printer preset {name}"
+            );
+            assert_eq!(cfg.bed.shape, BedShape::Rectangular);
+            assert_eq!(cfg.gcode.gcode_dialect, GcodeDialect::Prusa);
+            assert!((cfg.bed.width_x - wx).abs() < 1.0e-4);
+            assert!((cfg.bed.depth_y - dy).abs() < 1.0e-4);
+            assert!((cfg.bed.height_z - hz).abs() < 1.0e-4);
+            assert!(!cfg.gcode.gcode_origin_at_bed_center);
+            assert!(cfg.gcode.start_gcode_template.contains("M555"));
+            assert!(cfg.gcode.start_gcode_template.contains("G29"));
+            assert_eq!(cfg.tools.len(), expected_tools);
+            assert!(!lib.is_category_modified(PresetCategory::Printer, &cfg));
+        }
+
+        assert!(lib.select_and_apply(
+            PresetCategory::Tool,
+            "0.4mm Bondtech INDX Toolchanger",
+            &mut cfg
+        ));
+        assert!((cfg.gcode.tool_change_time_s - 12.0).abs() < 1.0e-4);
+        assert!(!lib.is_category_modified(PresetCategory::Tool, &cfg));
     }
 
     #[test]
