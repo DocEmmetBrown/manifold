@@ -2399,10 +2399,29 @@ pub enum PrinterNetworkProtocol {
 impl PrinterNetworkProtocol {
     pub const ALL: [Self; 2] = [Self::Moonraker, Self::PrusaLink];
 
+    /// Returns the default network protocol for a printer given its firmware dialect and preset name:
+    /// - `PrusaLink` for Prusa printers / `GcodeDialect::Prusa`
+    /// - `Moonraker` for Voron / Klipper printers
+    pub fn default_for_printer(dialect: GcodeDialect, printer_name: &str) -> Self {
+        let lower_name = printer_name.to_ascii_lowercase();
+        if dialect == GcodeDialect::Prusa || lower_name.contains("prusa") {
+            Self::PrusaLink
+        } else {
+            Self::Moonraker
+        }
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Moonraker => "Moonraker (Klipper)",
-            Self::PrusaLink => "PrusaLink (Prusa Buddy / API v1)",
+            Self::Moonraker => "Klipper (Moonraker HTTP/HTTPS)",
+            Self::PrusaLink => "Prusa (PrusaLink API v1 / Buddy)",
+        }
+    }
+
+    pub const fn choice_label(self) -> &'static str {
+        match self {
+            Self::Moonraker => "Klipper (Moonraker)",
+            Self::PrusaLink => "Prusa (PrusaLink)",
         }
     }
 
@@ -3333,7 +3352,23 @@ impl SlicerConfig {
     }
 
     pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(s)
+        let mut cfg: Self = toml::from_str(s)?;
+        let has_explicit_protocol = toml::from_str::<toml::Value>(s)
+            .ok()
+            .and_then(|v| v.get("network").and_then(|n| n.get("protocol")).cloned())
+            .is_some();
+        if !has_explicit_protocol {
+            cfg.network.protocol = PrinterNetworkProtocol::default_for_printer(
+                cfg.gcode.gcode_dialect,
+                &cfg.printer_preset_name,
+            );
+            if cfg.network.protocol == PrinterNetworkProtocol::PrusaLink
+                && cfg.network.username.trim().is_empty()
+            {
+                cfg.network.username = "maker".to_string();
+            }
+        }
+        Ok(cfg)
     }
 }
 

@@ -1315,6 +1315,9 @@ impl PresetLibrary {
             p.depth_y = dy;
             p.height_z = hz;
             p.gcode_origin_at_bed_center = false;
+            p.gcode_dialect = GcodeDialect::Klipper;
+            p.network.protocol = PrinterNetworkProtocol::Moonraker;
+            p.network.username.clear();
             p
         };
 
@@ -1824,6 +1827,21 @@ impl PresetLibrary {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(mut p) = toml::from_str::<PrinterPreset>(&text) {
                     p.is_builtin = false;
+                    let has_explicit_protocol = toml::from_str::<toml::Value>(&text)
+                        .ok()
+                        .and_then(|v| v.get("network").and_then(|n| n.get("protocol")).cloned())
+                        .is_some();
+                    if !has_explicit_protocol {
+                        p.network.protocol = PrinterNetworkProtocol::default_for_printer(
+                            p.gcode_dialect,
+                            &p.name,
+                        );
+                        if p.network.protocol == PrinterNetworkProtocol::PrusaLink
+                            && p.network.username.trim().is_empty()
+                        {
+                            p.network.username = "maker".to_string();
+                        }
+                    }
                     if !p.name.trim().is_empty() {
                         self.printers
                             .retain(|existing| existing.is_builtin || existing.name != p.name);
@@ -2235,30 +2253,7 @@ mod tests {
         assert!((cfg.slicing.layer_height.target_mm - 0.12).abs() < 1.0e-4);
         assert!(!lib.is_category_modified(PresetCategory::Process, &cfg));
 
-        // Switching to the standard Voron printer presets applies their exact build volumes
-        let voron_expected = [
-            ("Voron 0", 120.0, 120.0, 120.0),
-            ("Voron Trident 250", 250.0, 250.0, 250.0),
-            ("Voron Trident 300", 300.0, 300.0, 250.0),
-            ("Voron Trident 350", 350.0, 350.0, 250.0),
-            ("Voron 2.4 250", 250.0, 250.0, 220.0),
-            ("Voron 2.4 300", 300.0, 300.0, 280.0),
-            ("Voron 2.4 350", 350.0, 350.0, 330.0),
-        ];
-        for (name, wx, dy, hz) in voron_expected {
-            assert!(
-                lib.select_and_apply(PresetCategory::Printer, name, &mut cfg),
-                "Missing built-in printer preset {name}"
-            );
-            assert_eq!(cfg.bed.shape, BedShape::Rectangular);
-            assert!((cfg.bed.width_x - wx).abs() < 1.0e-4);
-            assert!((cfg.bed.depth_y - dy).abs() < 1.0e-4);
-            assert!((cfg.bed.height_z - hz).abs() < 1.0e-4);
-            assert!(!cfg.gcode.gcode_origin_at_bed_center);
-            assert!(!lib.is_category_modified(PresetCategory::Printer, &cfg));
-        }
-
-        // Switching to the Prusa CORE One & INDX printer presets applies Prusa dialect, build volumes, and tool counts
+        // Switching to the Prusa CORE One & INDX printer presets applies Prusa dialect, PrusaLink protocol, build volumes, and tool counts
         let prusa_expected: [(&str, f32, f32, f32, usize); 6] = [
             ("Prusa CORE One", 250.0, 220.0, 270.0, 1),
             ("Prusa CORE One L", 300.0, 300.0, 330.0, 1),
@@ -2283,6 +2278,31 @@ mod tests {
             assert!(cfg.gcode.start_gcode_template.contains("M555"));
             assert!(cfg.gcode.start_gcode_template.contains("G29"));
             assert_eq!(cfg.tools.len(), expected_tools);
+            assert!(!lib.is_category_modified(PresetCategory::Printer, &cfg));
+        }
+
+        // Switching from Prusa back to any Voron preset restores Klipper dialect and Moonraker network protocol
+        let voron_expected = [
+            ("Voron 0", 120.0, 120.0, 120.0),
+            ("Voron Trident 250", 250.0, 250.0, 250.0),
+            ("Voron Trident 300", 300.0, 300.0, 250.0),
+            ("Voron Trident 350", 350.0, 350.0, 250.0),
+            ("Voron 2.4 250", 250.0, 250.0, 220.0),
+            ("Voron 2.4 300", 300.0, 300.0, 280.0),
+            ("Voron 2.4 350", 350.0, 350.0, 330.0),
+        ];
+        for (name, wx, dy, hz) in voron_expected {
+            assert!(
+                lib.select_and_apply(PresetCategory::Printer, name, &mut cfg),
+                "Missing built-in printer preset {name}"
+            );
+            assert_eq!(cfg.bed.shape, BedShape::Rectangular);
+            assert_eq!(cfg.gcode.gcode_dialect, GcodeDialect::Klipper);
+            assert_eq!(cfg.network.protocol, PrinterNetworkProtocol::Moonraker);
+            assert!((cfg.bed.width_x - wx).abs() < 1.0e-4);
+            assert!((cfg.bed.depth_y - dy).abs() < 1.0e-4);
+            assert!((cfg.bed.height_z - hz).abs() < 1.0e-4);
+            assert!(!cfg.gcode.gcode_origin_at_bed_center);
             assert!(!lib.is_category_modified(PresetCategory::Printer, &cfg));
         }
 

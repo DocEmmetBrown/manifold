@@ -2788,6 +2788,12 @@ pub fn ui_workspace_system(
                         &mut config,
                         &mut plate.status_message,
                     ) {
+                        if active_category == PresetCategory::Printer {
+                            moonraker_state.last_test_result = None;
+                            moonraker_state.last_status = None;
+                            moonraker_state.last_upload_result = None;
+                            moonraker_state.last_poll_instant = None;
+                        }
                         if !is_computing {
                             sync_config_to_backend(&config);
                         }
@@ -4940,16 +4946,20 @@ fn render_printer_config_tab(
                 param_help_button(ui, "gcode.gcode_dialect");
             });
         }
-        if dialect_switched && config.network.printer_uri.trim().is_empty() {
+        if dialect_switched {
             match config.gcode.gcode_dialect {
                 GcodeDialect::Prusa => {
                     config.network.protocol = PrinterNetworkProtocol::PrusaLink;
                     if config.network.username.trim().is_empty() {
                         config.network.username = "maker".to_string();
                     }
+                    moonraker_state.last_test_result = None;
+                    moonraker_state.last_status = None;
                 }
                 GcodeDialect::Klipper => {
                     config.network.protocol = PrinterNetworkProtocol::Moonraker;
+                    moonraker_state.last_test_result = None;
+                    moonraker_state.last_status = None;
                 }
                 GcodeDialect::RepRapFirmware => {}
             }
@@ -5036,7 +5046,7 @@ fn render_printer_config_tab(
                 ui.label("Protocol:");
                 for proto in PrinterNetworkProtocol::ALL {
                     if ui
-                        .selectable_value(&mut config.network.protocol, proto, proto.short_label())
+                        .selectable_value(&mut config.network.protocol, proto, proto.choice_label())
                         .on_hover_text(proto.label())
                         .changed()
                     {
