@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cmath>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -27,10 +28,26 @@
 #include <IFSelect_ReturnStatus.hxx>
 #include <IMeshTools_MeshAlgoType.hxx>
 #include <IMeshTools_Parameters.hxx>
+#include <Interface_InterfaceModel.hxx>
 #include <Poly_Triangulation.hxx>
+#include <Quantity_Color.hxx>
+#include <Quantity_ColorRGBA.hxx>
+#include <Quantity_TypeOfColor.hxx>
+#include <STEPCAFControl_Reader.hxx>
 #include <STEPControl_Reader.hxx>
 #include <STEPControl_StepModelType.hxx>
 #include <STEPControl_Writer.hxx>
+#include <StepData_StepModel.hxx>
+#include <StepRepr_DescriptiveRepresentationItem.hxx>
+#include <StepRepr_RepresentationItem.hxx>
+#include <StepVisual_ColourRgb.hxx>
+#include <TCollection_AsciiString.hxx>
+#include <TCollection_HAsciiString.hxx>
+#include <TDF_Label.hxx>
+#include <TDF_LabelSequence.hxx>
+#include <TDataStd_Name.hxx>
+#include <TDataStd_TreeNode.hxx>
+#include <TDocStd_Document.hxx>
 #include <TopAbs_Orientation.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopExp_Explorer.hxx>
@@ -40,6 +57,14 @@
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Iterator.hxx>
 #include <TopoDS_Shape.hxx>
+#include <XCAFDoc.hxx>
+#include <XCAFDoc_ColorTool.hxx>
+#include <XCAFDoc_ColorType.hxx>
+#include <XCAFDoc_DocumentTool.hxx>
+#include <XCAFDoc_MaterialTool.hxx>
+#include <XCAFDoc_ShapeTool.hxx>
+#include <XSControl_TransferReader.hxx>
+#include <XSControl_WorkSession.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
@@ -1406,11 +1431,16 @@ void tessellateTopoShape(
     double angularDeflection,
     std::vector<RenderVertex>& vertexBuffer,
     std::vector<std::uint32_t>& indexBuffer,
-    std::vector<std::uint32_t>& triangleFaceIds)
+    std::vector<std::uint32_t>& triangleFaceIds,
+    const std::function<std::uint32_t(const TopoDS_Face&)>& faceColorFn = nullptr,
+    std::vector<std::uint32_t>* outTriangleColorsRgba = nullptr)
 {
     vertexBuffer.clear();
     indexBuffer.clear();
     triangleFaceIds.clear();
+    if (outTriangleColorsRgba != nullptr) {
+        outTriangleColorsRgba->clear();
+    }
 
     if (shape.IsNull()) {
         return;
@@ -1445,6 +1475,7 @@ void tessellateTopoShape(
     }
 
     std::uint32_t currentFaceId = 0;
+    std::uint32_t lastNonZeroColorRgba = 0u;
     for (TopExp_Explorer explorer(shape, TopAbs_FACE); explorer.More(); explorer.Next()) {
         const TopoDS_Face& face = TopoDS::Face(explorer.Current());
         TopLoc_Location location;
@@ -1452,6 +1483,11 @@ void tessellateTopoShape(
 
         if (triangulation.IsNull()) {
             continue;
+        }
+
+        const std::uint32_t faceColorRgba = faceColorFn ? faceColorFn(face) : 0u;
+        if (faceColorRgba != 0u) {
+            lastNonZeroColorRgba = faceColorRgba;
         }
 
         const gp_Trsf& trsf = location.Transformation();
@@ -1476,6 +1512,10 @@ void tessellateTopoShape(
 
         indexBuffer.reserve(indexBuffer.size() + static_cast<std::size_t>(numTriangles) * 3);
         triangleFaceIds.reserve(triangleFaceIds.size() + static_cast<std::size_t>(numTriangles));
+        if (outTriangleColorsRgba != nullptr) {
+            outTriangleColorsRgba->reserve(
+                outTriangleColorsRgba->size() + static_cast<std::size_t>(numTriangles));
+        }
         for (Standard_Integer t = 1; t <= numTriangles; ++t) {
             Standard_Integer n1 = 0, n2 = 0, n3 = 0;
             triangulation->Triangle(t).Get(n1, n2, n3);
@@ -1492,6 +1532,9 @@ void tessellateTopoShape(
             indexBuffer.push_back(idx1);
             indexBuffer.push_back(idx2);
             triangleFaceIds.push_back(currentFaceId);
+            if (outTriangleColorsRgba != nullptr) {
+                outTriangleColorsRgba->push_back(faceColorRgba);
+            }
 
             const auto& v0 = vertexBuffer[idx0];
             const auto& v1 = vertexBuffer[idx1];
@@ -1551,6 +1594,9 @@ void tessellateTopoShape(
             indexBuffer.push_back(baseIdx + 1);
             indexBuffer.push_back(baseIdx + 2);
             triangleFaceIds.push_back(currentFaceId);
+            if (outTriangleColorsRgba != nullptr) {
+                outTriangleColorsRgba->push_back(lastNonZeroColorRgba);
+            }
         }
         ++currentFaceId;
     }
@@ -1680,48 +1726,501 @@ std::vector<DecomposedPartInfo> SlicerBackend::loadStepAssembly(
     double angularDeflection)
 {
     std::vector<DecomposedPartInfo> results;
+    const std::string stem = std::filesystem::path(filePath).stem().string();
 
-    STEPControl_Reader reader;
-    const IFSelect_ReturnStatus status = reader.ReadFile(filePath.c_str());
+    auto isGenericAutoShapeName = [](const std::string& s) -> bool {
+        if (s.empty()) {
+            return true;
+        }
+        if (s.rfind("=>[", 0) == 0) {
+            return true;
+        }
+        return s == "COMPOUND" || s == "COMPSOLID" || s == "SOLID" ||
+               s == "SHELL" || s == "FACE" || s == "ASSEMBLY" || s == "SHUO" ||
+               s == "NONE";
+    };
+
+    auto getLabelName = [&](const TDF_Label& lbl) -> std::string {
+        if (lbl.IsNull()) {
+            return {};
+        }
+        Handle(TDataStd_Name) nameAttr;
+        if (lbl.FindAttribute(TDataStd_Name::GetID(), nameAttr) && !nameAttr.IsNull()) {
+            const TCollection_AsciiString ascii(nameAttr->Get());
+            std::string s(ascii.ToCString());
+            if (!isGenericAutoShapeName(s)) {
+                return s;
+            }
+        }
+        return {};
+    };
+
+    auto packSrgb = [](double r, double g, double b, double a = 1.0) -> std::uint32_t {
+        const auto ru = static_cast<std::uint32_t>(std::clamp(std::lround(r * 255.0), 0l, 255l));
+        const auto gu = static_cast<std::uint32_t>(std::clamp(std::lround(g * 255.0), 0l, 255l));
+        const auto bu = static_cast<std::uint32_t>(std::clamp(std::lround(b * 255.0), 0l, 255l));
+        const auto au = static_cast<std::uint32_t>(std::clamp(std::lround(a * 255.0), 1l, 255l));
+        return (ru << 24u) | (gu << 16u) | (bu << 8u) | au;
+    };
+
+    auto packQuantityColorRgba = [&](const Quantity_ColorRGBA& colRgba) -> std::uint32_t {
+        Standard_Real r = 0.0, g = 0.0, b = 0.0;
+        colRgba.GetRGB().Values(r, g, b, Quantity_TOC_sRGB);
+        return packSrgb(r, g, b, colRgba.Alpha());
+    };
+
+    auto packQuantityColor = [&](const Quantity_Color& col) -> std::uint32_t {
+        Standard_Real r = 0.0, g = 0.0, b = 0.0;
+        col.Values(r, g, b, Quantity_TOC_sRGB);
+        return packSrgb(r, g, b, 1.0);
+    };
+
+    Handle(TDocStd_Document) doc = new TDocStd_Document("MDTV-XCAF");
+    STEPCAFControl_Reader cafReader;
+    cafReader.SetColorMode(Standard_True);
+    cafReader.SetNameMode(Standard_True);
+    cafReader.SetLayerMode(Standard_True);
+    cafReader.SetPropsMode(Standard_True);
+    cafReader.SetMatMode(Standard_True);
+
+    const IFSelect_ReturnStatus status = cafReader.ReadFile(filePath.c_str());
     if (status != IFSelect_RetDone) {
         return results;
     }
 
-    reader.TransferRoots();
-    const TopoDS_Shape rootShape = reader.OneShape();
-    if (rootShape.IsNull()) {
-        return results;
+    const bool cafTransferred = (cafReader.Transfer(doc) == Standard_True);
+    const Handle(XCAFDoc_ShapeTool) shapeTool = XCAFDoc_DocumentTool::ShapeTool(doc->Main());
+    const Handle(XCAFDoc_ColorTool) colorTool = XCAFDoc_DocumentTool::ColorTool(doc->Main());
+    const Handle(XCAFDoc_MaterialTool) matTool = XCAFDoc_DocumentTool::MaterialTool(doc->Main());
+    (void)matTool;
+
+    // Extract STEP entity metadata from the underlying STEP model (e.g. COLOUR_RGB appearance
+    // names, DESCRIPTIVE_REPRESENTATION_ITEM material names, and MANIFOLD_SOLID_BREP body names).
+    std::unordered_map<std::uint32_t, std::string> colorAppearanceNames;
+    std::string globalStepMaterialName;
+    Handle(XSControl_TransferReader) transferReader;
+    if (!cafReader.Reader().WS().IsNull()) {
+        transferReader = cafReader.Reader().WS()->TransferReader();
+    }
+    const Handle(Interface_InterfaceModel) stepModel = cafReader.Reader().StepModel();
+    if (!stepModel.IsNull()) {
+        const Standard_Integer nbEntities = stepModel->NbEntities();
+        for (Standard_Integer i = 1; i <= nbEntities; ++i) {
+            const Handle(Standard_Transient)& ent = stepModel->Value(i);
+            if (ent.IsNull()) {
+                continue;
+            }
+            if (const auto colEnt = Handle(StepVisual_ColourRgb)::DownCast(ent); !colEnt.IsNull()) {
+                const std::uint32_t rgba = packSrgb(colEnt->Red(), colEnt->Green(), colEnt->Blue(), 1.0);
+                if (!colEnt->Name().IsNull() && colEnt->Name()->Length() > 0) {
+                    const std::string cName(colEnt->Name()->ToCString());
+                    if (!cName.empty() && cName != "NONE" &&
+                        cName.rfind("Opaque(", 0) != 0 &&
+                        cName.rfind("Translucent(", 0) != 0) {
+                        colorAppearanceNames[rgba] = cName;
+                    }
+                }
+            } else if (const auto descEnt = Handle(StepRepr_DescriptiveRepresentationItem)::DownCast(ent);
+                       !descEnt.IsNull()) {
+                const std::string dName = (!descEnt->Name().IsNull() && descEnt->Name()->Length() > 0)
+                    ? std::string(descEnt->Name()->ToCString())
+                    : std::string();
+                const std::string dDesc = (!descEnt->Description().IsNull() && descEnt->Description()->Length() > 0)
+                    ? std::string(descEnt->Description()->ToCString())
+                    : std::string();
+                auto isLikelyMaterialString = [](const std::string& s) -> bool {
+                    if (s.empty() || s.size() > 48) {
+                        return false;
+                    }
+                    return s != "NONE" && s != "material name" && s != "material property" &&
+                           s != "not specified" && s != "unknown";
+                };
+                if (globalStepMaterialName.empty()) {
+                    if (dName == "material name" && isLikelyMaterialString(dDesc)) {
+                        globalStepMaterialName = dDesc;
+                    } else if (!dName.empty() && dName == dDesc && isLikelyMaterialString(dName)) {
+                        globalStepMaterialName = dName;
+                    }
+                }
+            }
+        }
     }
 
-    std::vector<TopoDS_Shape> leafShapes;
-    collectDecomposedLeaves(rootShape, leafShapes);
-    if (leafShapes.empty()) {
-        leafShapes.push_back(rootShape);
+    auto queryLabelColor = [&](const TDF_Label& lbl) -> std::uint32_t {
+        if (lbl.IsNull() || colorTool.IsNull()) {
+            return 0u;
+        }
+        const XCAFDoc_ColorType types[3] = {
+            XCAFDoc_ColorSurf,
+            XCAFDoc_ColorGen,
+            XCAFDoc_ColorCurv,
+        };
+        for (const XCAFDoc_ColorType ct : types) {
+            Quantity_ColorRGBA colRgba;
+            if (XCAFDoc_ColorTool::GetColor(lbl, ct, colRgba)) {
+                return packQuantityColorRgba(colRgba);
+            }
+            Quantity_Color colRgb;
+            if (XCAFDoc_ColorTool::GetColor(lbl, ct, colRgb)) {
+                return packQuantityColor(colRgb);
+            }
+        }
+        return 0u;
+    };
+
+    auto queryShapeColor = [&](const TopoDS_Shape& s) -> std::uint32_t {
+        if (s.IsNull() || colorTool.IsNull()) {
+            return 0u;
+        }
+        const XCAFDoc_ColorType types[3] = {
+            XCAFDoc_ColorSurf,
+            XCAFDoc_ColorGen,
+            XCAFDoc_ColorCurv,
+        };
+        for (const XCAFDoc_ColorType ct : types) {
+            Quantity_ColorRGBA colRgba;
+            if (colorTool->GetInstanceColor(s, ct, colRgba)) {
+                return packQuantityColorRgba(colRgba);
+            }
+            Quantity_Color colRgb;
+            if (colorTool->GetInstanceColor(s, ct, colRgb)) {
+                return packQuantityColor(colRgb);
+            }
+            if (colorTool->GetColor(s, ct, colRgba)) {
+                return packQuantityColorRgba(colRgba);
+            }
+            if (colorTool->GetColor(s, ct, colRgb)) {
+                return packQuantityColor(colRgb);
+            }
+        }
+        if (!s.Location().IsIdentity()) {
+            const TopoDS_Shape unlocated = s.Located(TopLoc_Location());
+            for (const XCAFDoc_ColorType ct : types) {
+                Quantity_ColorRGBA colRgba;
+                if (colorTool->GetColor(unlocated, ct, colRgba)) {
+                    return packQuantityColorRgba(colRgba);
+                }
+                Quantity_Color colRgb;
+                if (colorTool->GetColor(unlocated, ct, colRgb)) {
+                    return packQuantityColor(colRgb);
+                }
+            }
+        }
+        return 0u;
+    };
+
+    auto queryLabelMaterial = [&](const TDF_Label& lbl, std::string& ioMatName, float& ioDensity) {
+        if (lbl.IsNull()) {
+            return;
+        }
+        Handle(TDataStd_TreeNode) matNode;
+        if (lbl.FindAttribute(XCAFDoc::MaterialRefGUID(), matNode) &&
+            !matNode.IsNull() && !matNode->Father().IsNull()) {
+            const TDF_Label matLbl = matNode->Father()->Label();
+            Handle(TCollection_HAsciiString) aName, aDesc, aDensName, aDensValType;
+            Standard_Real aDensity = 0.0;
+            if (XCAFDoc_MaterialTool::GetMaterial(
+                    matLbl, aName, aDesc, aDensity, aDensName, aDensValType)) {
+                if (!aName.IsNull() && aName->Length() > 0) {
+                    const std::string mName(aName->ToCString());
+                    if (!mName.empty() && mName != "NONE") {
+                        ioMatName = mName;
+                    }
+                }
+                if (aDensity > 0.0) {
+                    ioDensity = static_cast<float>(aDensity);
+                }
+            }
+        }
+    };
+
+    auto queryStepEntityName = [&](const TopoDS_Shape& s) -> std::string {
+        if (s.IsNull() || transferReader.IsNull()) {
+            return {};
+        }
+        for (int mode : {1, 3}) {
+            Handle(Standard_Transient) ent = transferReader->EntityFromShapeResult(s, mode);
+            if (ent.IsNull() && !s.Location().IsIdentity()) {
+                ent = transferReader->EntityFromShapeResult(s.Located(TopLoc_Location()), mode);
+            }
+            if (!ent.IsNull()) {
+                if (const auto reprItem = Handle(StepRepr_RepresentationItem)::DownCast(ent);
+                    !reprItem.IsNull() && !reprItem->Name().IsNull() && reprItem->Name()->Length() > 0) {
+                    const std::string eName(reprItem->Name()->ToCString());
+                    if (!isGenericAutoShapeName(eName)) {
+                        return eName;
+                    }
+                }
+            }
+        }
+        return {};
+    };
+
+    struct CandidatePart {
+        TopoDS_Shape shape;
+        std::vector<std::string> assemblyPath;
+        std::string materialName;
+        float materialDensityGCm3 = 0.0f;
+        std::uint32_t fallbackColorRgba = 0u;
+    };
+    std::vector<CandidatePart> candidateParts;
+
+    std::function<void(
+        const TDF_Label&,
+        const TopLoc_Location&,
+        std::vector<std::string>,
+        std::uint32_t,
+        std::string,
+        float)>
+        traverseLabel = [&](const TDF_Label& lbl,
+                            const TopLoc_Location& parentLoc,
+                            std::vector<std::string> path,
+                            std::uint32_t inheritedColor,
+                            std::string inheritedMatName,
+                            float inheritedDensity) {
+            if (lbl.IsNull() || shapeTool.IsNull()) {
+                return;
+            }
+
+            if (const std::uint32_t c = queryLabelColor(lbl); c != 0u) {
+                inheritedColor = c;
+            }
+            queryLabelMaterial(lbl, inheritedMatName, inheritedDensity);
+
+            if (XCAFDoc_ShapeTool::IsReference(lbl)) {
+                const std::string instName = getLabelName(lbl);
+                const TopLoc_Location compLoc = parentLoc * XCAFDoc_ShapeTool::GetLocation(lbl);
+                TDF_Label refLbl;
+                if (XCAFDoc_ShapeTool::GetReferredShape(lbl, refLbl) && !refLbl.IsNull()) {
+                    const std::string refName = getLabelName(refLbl);
+                    const std::string chosenName = !instName.empty() ? instName : refName;
+                    if (!chosenName.empty() && (path.empty() || path.back() != chosenName)) {
+                        path.push_back(chosenName);
+                    }
+                    traverseLabel(
+                        refLbl,
+                        compLoc,
+                        std::move(path),
+                        inheritedColor,
+                        inheritedMatName,
+                        inheritedDensity);
+                    return;
+                }
+            }
+
+            const std::string lblName = getLabelName(lbl);
+            if (!lblName.empty() && (path.empty() || path.back() != lblName)) {
+                path.push_back(lblName);
+            }
+
+            if (XCAFDoc_ShapeTool::IsAssembly(lbl)) {
+                TDF_LabelSequence compLabels;
+                if (XCAFDoc_ShapeTool::GetComponents(lbl, compLabels) && compLabels.Length() > 0) {
+                    for (Standard_Integer i = 1; i <= compLabels.Length(); ++i) {
+                        traverseLabel(
+                            compLabels.Value(i),
+                            parentLoc,
+                            path,
+                            inheritedColor,
+                            inheritedMatName,
+                            inheritedDensity);
+                    }
+                    return;
+                }
+            }
+
+            TopoDS_Shape s = XCAFDoc_ShapeTool::GetShape(lbl);
+            if (s.IsNull()) {
+                return;
+            }
+            if (!parentLoc.IsIdentity()) {
+                s = s.Moved(parentLoc);
+            }
+            if (const std::uint32_t sc = queryShapeColor(s); sc != 0u) {
+                inheritedColor = sc;
+            }
+
+            std::vector<TopoDS_Shape> leaves;
+            collectDecomposedLeaves(s, leaves);
+            if (leaves.empty()) {
+                leaves.push_back(s);
+            }
+
+            for (std::size_t leafIdx = 0; leafIdx < leaves.size(); ++leafIdx) {
+                const TopoDS_Shape& leaf = leaves[leafIdx];
+                std::uint32_t leafColor = inheritedColor;
+                if (const std::uint32_t lc = queryShapeColor(leaf); lc != 0u) {
+                    leafColor = lc;
+                }
+                std::string leafMatName = inheritedMatName;
+                float leafDensity = inheritedDensity;
+                std::string subLabelName;
+
+                TDF_Label subLbl;
+                if (shapeTool->Search(leaf, subLbl, Standard_True, Standard_True, Standard_True) &&
+                    !subLbl.IsNull()) {
+                    if (const std::uint32_t slc = queryLabelColor(subLbl); slc != 0u) {
+                        leafColor = slc;
+                    }
+                    queryLabelMaterial(subLbl, leafMatName, leafDensity);
+                    subLabelName = getLabelName(subLbl);
+                }
+
+                std::string bodyName = queryStepEntityName(leaf);
+                if (bodyName.empty() && !subLabelName.empty()) {
+                    bodyName = subLabelName;
+                }
+
+                std::vector<std::string> leafPath = path;
+                if (leafPath.empty()) {
+                    leafPath.push_back(stem);
+                }
+                if (!bodyName.empty() && leafPath.back() != bodyName) {
+                    leafPath.push_back(bodyName);
+                } else if (leaves.size() > 1) {
+                    leafPath.push_back("Part_" + std::to_string(leafIdx + 1));
+                }
+
+                CandidatePart cp;
+                cp.shape = leaf;
+                cp.assemblyPath = std::move(leafPath);
+                cp.materialName = std::move(leafMatName);
+                cp.materialDensityGCm3 = leafDensity;
+                cp.fallbackColorRgba = leafColor;
+                candidateParts.push_back(std::move(cp));
+            }
+        };
+
+    if (cafTransferred && !shapeTool.IsNull()) {
+        TDF_LabelSequence freeLabels;
+        shapeTool->GetFreeShapes(freeLabels);
+        for (Standard_Integer i = 1; i <= freeLabels.Length(); ++i) {
+            traverseLabel(
+                freeLabels.Value(i),
+                TopLoc_Location(),
+                {},
+                0u,
+                globalStepMaterialName,
+                0.0f);
+        }
     }
 
-    const std::string stem = std::filesystem::path(filePath).stem().string();
-    const bool isMultiPart = leafShapes.size() > 1;
+    if (candidateParts.empty()) {
+        // Fallback to direct STEPControl_Reader shape extraction
+        STEPControl_Reader& baseReader = cafReader.ChangeReader();
+        baseReader.TransferRoots();
+        const TopoDS_Shape rootShape = baseReader.OneShape();
+        if (rootShape.IsNull()) {
+            return results;
+        }
+        std::vector<TopoDS_Shape> leafShapes;
+        collectDecomposedLeaves(rootShape, leafShapes);
+        if (leafShapes.empty()) {
+            leafShapes.push_back(rootShape);
+        }
+        for (std::size_t idx = 0; idx < leafShapes.size(); ++idx) {
+            CandidatePart cp;
+            cp.shape = leafShapes[idx];
+            cp.assemblyPath.push_back(stem);
+            const std::string bodyName = queryStepEntityName(cp.shape);
+            if (!bodyName.empty() && bodyName != stem) {
+                cp.assemblyPath.push_back(bodyName);
+            } else if (leafShapes.size() > 1) {
+                cp.assemblyPath.push_back("Part_" + std::to_string(idx + 1));
+            }
+            cp.materialName = globalStepMaterialName;
+            cp.fallbackColorRgba = queryShapeColor(cp.shape);
+            candidateParts.push_back(std::move(cp));
+        }
+    }
+
+    const bool isMultiPart = candidateParts.size() > 1;
+    std::unordered_map<std::string, std::size_t> usedPartNames;
 
     std::size_t partIndex = 1;
-    for (const TopoDS_Shape& leaf : leafShapes) {
+    for (auto& cp : candidateParts) {
         ObjectRecord rec;
         rec.id = impl_->nextObjectId++;
-        rec.name = isMultiPart
-            ? (stem + "::Part_" + std::to_string(partIndex))
-            : stem;
-        rec.shape = leaf;
+
+        // Ensure the root of assemblyPath is consistently populated
+        if (cp.assemblyPath.empty()) {
+            cp.assemblyPath.push_back(stem);
+        } else if (isMultiPart && cp.assemblyPath.size() == 1 && cp.assemblyPath[0] != stem) {
+            cp.assemblyPath.insert(cp.assemblyPath.begin(), stem);
+        }
+
+        std::string displayName = cp.assemblyPath.back();
+        if (displayName.empty()) {
+            displayName = isMultiPart ? (stem + "::Part_" + std::to_string(partIndex)) : stem;
+        }
+        const std::size_t dupCount = ++usedPartNames[displayName];
+        if (dupCount > 1) {
+            displayName += " (" + std::to_string(dupCount) + ")";
+            cp.assemblyPath.back() = displayName;
+        }
+
+        rec.name = displayName;
+        rec.shape = cp.shape;
         rec.hasBrep = true;
 
+        auto faceColorLookup = [&](const TopoDS_Face& face) -> std::uint32_t {
+            if (const std::uint32_t fc = queryShapeColor(face); fc != 0u) {
+                return fc;
+            }
+            if (!shapeTool.IsNull()) {
+                TDF_Label faceLbl;
+                if (shapeTool->Search(face, faceLbl, Standard_True, Standard_True, Standard_True) &&
+                    !faceLbl.IsNull()) {
+                    if (const std::uint32_t flc = queryLabelColor(faceLbl); flc != 0u) {
+                        return flc;
+                    }
+                }
+            }
+            return cp.fallbackColorRgba;
+        };
+
         tessellateTopoShape(
-            leaf,
+            cp.shape,
             linearDeflection,
             angularDeflection,
             rec.vertexBuffer,
             rec.indexBuffer,
-            rec.triangleFaceIds);
+            rec.triangleFaceIds,
+            faceColorLookup,
+            &rec.triangleColorsRgba);
 
         if (rec.vertexBuffer.empty() || rec.indexBuffer.empty()) {
             continue;
+        }
+
+        // Determine dominant triangle colour and normalize any uncoloured triangles on a coloured part
+        std::unordered_map<std::uint32_t, std::size_t> colorCounts;
+        std::uint32_t dominantColorRgba = cp.fallbackColorRgba;
+        std::size_t bestColorCount = 0;
+        for (const std::uint32_t c : rec.triangleColorsRgba) {
+            if (c != 0u) {
+                const std::size_t cnt = ++colorCounts[c];
+                if (cnt > bestColorCount) {
+                    bestColorCount = cnt;
+                    dominantColorRgba = c;
+                }
+            }
+        }
+        if (dominantColorRgba == 0u) {
+            rec.triangleColorsRgba.clear();
+        } else {
+            for (std::uint32_t& c : rec.triangleColorsRgba) {
+                if (c == 0u) {
+                    c = dominantColorRgba;
+                }
+            }
+        }
+
+        if (cp.materialName.empty() && dominantColorRgba != 0u) {
+            const auto appIt = colorAppearanceNames.find(dominantColorRgba);
+            if (appIt != colorAppearanceNames.end()) {
+                cp.materialName = appIt->second;
+            }
         }
 
         recenterVertexBuffer(rec);
@@ -1737,6 +2236,13 @@ std::vector<DecomposedPartInfo> SlicerBackend::loadStepAssembly(
         info.origin_y = rec.originY;
         info.origin_z = rec.originZ;
         info.has_brep = true;
+        for (const std::string& seg : cp.assemblyPath) {
+            info.assembly_path.push_back(rust::String(seg));
+        }
+        info.material_name = rust::String(cp.materialName);
+        info.material_density_g_cm3 = cp.materialDensityGCm3;
+        info.has_color = (dominantColorRgba != 0u);
+        info.color_rgba = dominantColorRgba;
 
         impl_->lastLoadedId = rec.id;
         impl_->objects.emplace(rec.id, std::move(rec));
@@ -1761,6 +2267,10 @@ DecomposedPartInfo SlicerBackend::registerTriangleMesh(
     info.origin_y = 0.0f;
     info.origin_z = 0.0f;
     info.has_brep = false;
+    info.material_name = rust::String();
+    info.material_density_g_cm3 = 0.0f;
+    info.has_color = false;
+    info.color_rgba = 0u;
 
     const std::size_t numVertices = positionFloatsCount / 3;
     if (numVertices == 0 || indexCount < 3) {

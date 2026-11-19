@@ -34,12 +34,22 @@ find_package(TBB REQUIRED)
 set(OCCT_LIBS
     TKernel
     TKMath
+    TKG2d
+    TKG3d
     TKBRep
     TKTopAlgo
     TKGeomBase
     TKGeomAlgo
     TKMesh
     TKXSBase
+    TKCDF
+    TKLCAF
+    TKCAF
+    TKService
+    TKV3d
+    TKVCAF
+    TKXCAF
+    TKXDESTEP
     TKDESTEP
     TKSTEP
     TKSTEPAttr

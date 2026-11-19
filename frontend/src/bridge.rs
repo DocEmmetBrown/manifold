@@ -29,6 +29,17 @@ pub mod ffi {
         pub origin_y: f32,
         pub origin_z: f32,
         pub has_brep: bool,
+        /// Hierarchical assembly path from the STEP root down to this component/solid
+        /// (e.g. `["Toolhead Assembly", "Cowling", "Body1"]`).
+        pub assembly_path: Vec<String>,
+        /// Material or appearance name extracted from the STEP file (e.g. `"ABS"`, `"Steel - Satin"`).
+        pub material_name: String,
+        /// Material mass density ($\text{g/cm}^3$) extracted from the STEP file (`0.0` if unspecified).
+        pub material_density_g_cm3: f32,
+        /// Whether a STEP surface/solid colour was assigned to this part.
+        pub has_color: bool,
+        /// Dominant packed `0xRRGGBBAA` sRGBA colour assigned to this part in the STEP file.
+        pub color_rgba: u32,
     }
 
     /// Summary statistics for a named `openvdb::FloatGrid` scalar field on an object.

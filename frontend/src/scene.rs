@@ -93,6 +93,18 @@ pub struct SceneObject {
     pub name: String,
     pub source_file: String,
     pub has_brep: bool,
+    /// Hierarchical STEP assembly path from root assembly to leaf component/body.
+    pub assembly_path: Vec<String>,
+    /// Original 3D CAD assembly coordinates `(X, Y, Z)` for Orca-style 3D Assembly View.
+    pub assembly_translation: Vec3,
+    /// Saved build-plate translation while viewing in 3D Assembly View.
+    pub saved_plate_translation: Vec3,
+    /// Saved build-plate rotation while viewing in 3D Assembly View.
+    pub saved_plate_rotation: Quat,
+    /// STEP material / appearance name extracted from XCAF or STEP product metadata (if present).
+    pub step_material_name: String,
+    /// STEP material density ($\text{g/cm}^3$) extracted from XCAF material metadata (`0.0` if unspecified).
+    pub step_material_density_g_cm3: f32,
     pub printable: bool,
     pub plate_index: usize,
     pub entity: Entity,
@@ -528,6 +540,16 @@ pub struct BuildPlateState {
     pub clone_copies_count: u32,
     /// Whether to display `exclude_object` name labels on the build plate in the 3D viewport.
     pub show_object_labels: bool,
+    /// Whether Orca-style 3D CAD Assembly View is active (showing all components in their original 3D STEP coordinates).
+    pub assembly_view_active: bool,
+    /// Radial 3D explode offset (mm) applied around the assembly centroid while in Assembly View.
+    pub assembly_explode_mm: f32,
+    /// Whether unselected (`!printable`) components render as translucent ghosts in Assembly View.
+    pub assembly_ghost_unselected: bool,
+    /// Whether unselected (`!printable`) components are hidden when viewing/arranging the build plate.
+    pub hide_non_printable_on_plate: bool,
+    /// Whether the Assembly Tree panel groups components by Material/Colour (`true`) or CAD Hierarchy (`false`).
+    pub assembly_group_by_material: bool,
     /// Remembered `.3mf` file name when a Manifold `.3mf` project was loaded (used as the default on Save 3MF).
     pub project_3mf_filename: Option<String>,
     pub status_message: String,
@@ -562,6 +584,11 @@ impl Default for BuildPlateState {
             drag_offset_xy: Vec2::ZERO,
             clone_copies_count: 1,
             show_object_labels: true,
+            assembly_view_active: false,
+            assembly_explode_mm: 0.0,
+            assembly_ghost_unselected: true,
+            hide_non_printable_on_plate: true,
+            assembly_group_by_material: false,
             project_3mf_filename: None,
             status_message: String::new(),
             import_notices: Vec::new(),
@@ -577,6 +604,15 @@ impl BuildPlateState {
     pub fn selected_object(&self) -> Option<&SceneObject> {
         let id = self.selected_object_id?;
         self.objects.iter().find(|o| o.object_id == id)
+    }
+
+    /// Returns `true` when the workspace contains a multi-part STEP assembly or STEP material/hierarchy metadata.
+    pub fn has_step_assembly(&self) -> bool {
+        (self.objects.len() > 1 && self.objects.iter().any(|o| o.has_brep))
+            || self
+                .objects
+                .iter()
+                .any(|o| o.assembly_path.len() > 1 || !o.step_material_name.is_empty())
     }
 
     pub fn active_plate_name(&self) -> &str {
@@ -609,6 +645,84 @@ impl BuildPlateState {
         self.plates.iter().map(|p| p.name.clone()).collect()
     }
 
+    /// Applies 3D CAD assembly transforms (including optional radial `assembly_explode_mm` offset)
+    /// and shows all visible assembly components while `assembly_view_active` is `true`.
+    pub fn apply_assembly_view_transforms(
+        &mut self,
+        transform_query: &mut Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
+    ) {
+        if !self.assembly_view_active || self.objects.is_empty() {
+            return;
+        }
+        let mut sum_center = Vec3::ZERO;
+        let mut count = 0usize;
+        for obj in &self.objects {
+            let c = obj.assembly_translation + 0.5 * (obj.local_min + obj.local_max);
+            if c.is_finite() {
+                sum_center += c;
+                count += 1;
+            }
+        }
+        let centroid = if count > 0 {
+            sum_center / (count as f32)
+        } else {
+            Vec3::ZERO
+        };
+        let explode = self.assembly_explode_mm.max(0.0);
+
+        for obj in &self.objects {
+            if let Ok((mut tf, mut vis)) = transform_query.get_mut(obj.entity) {
+                let part_center = obj.assembly_translation + 0.5 * (obj.local_min + obj.local_max);
+                let radial_dir = (part_center - centroid).normalize_or_zero();
+                tf.translation = obj.assembly_translation + radial_dir * explode;
+                tf.rotation = Quat::IDENTITY;
+                *vis = if obj.visible {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
+            }
+        }
+    }
+
+    /// Toggles between **3D CAD Assembly View** (original 3D STEP coordinates) and
+    /// **Build Plate View** (arranged on the bed at $z = 0$).
+    pub fn set_assembly_view_active(
+        &mut self,
+        active: bool,
+        transform_query: &mut Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
+    ) {
+        if self.assembly_view_active == active {
+            if active {
+                self.apply_assembly_view_transforms(transform_query);
+            }
+            return;
+        }
+        if active {
+            for obj in &mut self.objects {
+                if let Ok((tf, _)) = transform_query.get(obj.entity) {
+                    obj.saved_plate_translation = tf.translation;
+                    obj.saved_plate_rotation = tf.rotation;
+                }
+            }
+            self.assembly_view_active = true;
+            self.apply_assembly_view_transforms(transform_query);
+            self.status_message =
+                "Switched to 3D STEP Assembly View — select components/sub-assemblies or materials to arrange."
+                    .to_string();
+        } else {
+            self.assembly_view_active = false;
+            for obj in &self.objects {
+                if let Ok((mut tf, _)) = transform_query.get_mut(obj.entity) {
+                    tf.translation = obj.saved_plate_translation;
+                    tf.rotation = obj.saved_plate_rotation;
+                }
+            }
+            self.sync_plate_visibility(transform_query);
+            self.status_message = format!("Returned to Build Plate View ({}).", self.active_plate_name());
+        }
+    }
+
     /// Synchronizes Bevy entity visibility so only objects on `active_plate_index` (with `obj.visible == true`)
     /// are visible in the 3D viewport, and ensures `selected_object_id` belongs to the active plate.
     pub fn sync_plate_visibility(
@@ -624,10 +738,24 @@ impl BuildPlateState {
             self.active_plate_index = self.plates.len() - 1;
         }
 
+        if self.assembly_view_active {
+            self.apply_assembly_view_transforms(transform_query);
+            return;
+        }
+
         let active_idx = self.active_plate_index;
+        let hide_non_printable = self.hide_non_printable_on_plate
+            && self
+                .objects
+                .iter()
+                .any(|o| o.plate_index == active_idx && o.printable);
+
         for obj in &self.objects {
             if let Ok((_, mut vis)) = transform_query.get_mut(obj.entity) {
-                *vis = if obj.visible && obj.plate_index == active_idx {
+                let show_on_plate = obj.visible
+                    && obj.plate_index == active_idx
+                    && (!hide_non_printable || obj.printable);
+                *vis = if show_on_plate {
                     Visibility::Inherited
                 } else {
                     Visibility::Hidden
@@ -644,7 +772,8 @@ impl BuildPlateState {
             self.selected_object_id = self
                 .objects
                 .iter()
-                .find(|o| o.plate_index == active_idx)
+                .find(|o| o.plate_index == active_idx && o.printable)
+                .or_else(|| self.objects.iter().find(|o| o.plate_index == active_idx))
                 .map(|o| o.object_id);
         }
 
@@ -869,11 +998,17 @@ pub fn spawn_loaded_objects(
                 Quat::IDENTITY
             };
 
-        let scene_obj = SceneObject {
+        let mut scene_obj = SceneObject {
             object_id: data.object_id,
             name: data.name,
             source_file: data.source_file,
             has_brep: data.has_brep,
+            assembly_path: data.assembly_path,
+            assembly_translation: data.assembly_translation,
+            saved_plate_translation: initial_transform.translation,
+            saved_plate_rotation: initial_transform.rotation,
+            step_material_name: data.step_material_name,
+            step_material_density_g_cm3: data.step_material_density_g_cm3,
             printable: data.printable,
             plate_index: data.plate_index,
             entity,
@@ -903,6 +1038,8 @@ pub fn spawn_loaded_objects(
         };
 
         snap_object_to_bed(&scene_obj, &mut initial_transform);
+        scene_obj.saved_plate_translation = initial_transform.translation;
+        scene_obj.saved_plate_rotation = initial_transform.rotation;
         commands.entity(entity).insert(initial_transform);
 
         if is_on_active_plate {
@@ -1020,6 +1157,10 @@ pub fn clone_object_on_plate(
     let base_name = strip_clone_number_suffix(&plate.objects[src_idx].name).to_string();
     let src_source_file = plate.objects[src_idx].source_file.clone();
     let src_has_brep = plate.objects[src_idx].has_brep;
+    let src_assembly_path = plate.objects[src_idx].assembly_path.clone();
+    let src_assembly_translation = plate.objects[src_idx].assembly_translation;
+    let src_step_material_name = plate.objects[src_idx].step_material_name.clone();
+    let src_step_material_density = plate.objects[src_idx].step_material_density_g_cm3;
     let src_printable = plate.objects[src_idx].printable;
     let src_base_vertices = plate.objects[src_idx].base_vertices.clone();
     let src_scale_factors = plate.objects[src_idx].scale_factors;
@@ -1127,11 +1268,21 @@ pub fn clone_object_on_plate(
         }
 
         let target_translation_xy = chosen_center - center_offset_xy;
+        let mut clone_asm_path = src_assembly_path.clone();
+        if let Some(last_seg) = clone_asm_path.last_mut() {
+            *last_seg = clone_name.clone();
+        } else {
+            clone_asm_path.push(clone_name.clone());
+        }
         new_loaded_objects.push(LoadedObjectData {
             object_id: new_id,
             name: clone_name,
             source_file: src_source_file.clone(),
             has_brep: src_has_brep,
+            assembly_path: clone_asm_path,
+            assembly_translation: src_assembly_translation,
+            step_material_name: src_step_material_name.clone(),
+            step_material_density_g_cm3: src_step_material_density,
             printable: src_printable,
             plate_index: target_plate_index,
             initial_translation: Vec3::new(target_translation_xy.x, target_translation_xy.y, 0.0),
@@ -1175,16 +1326,27 @@ pub fn clone_object_on_plate(
 }
 
 /// Runs the descending-Z-height Archimedean spiral auto-arrangement across all
-/// objects currently on the active build plate.
+/// printable objects currently on the active build plate (exiting 3D Assembly View if active).
 pub fn run_auto_arrange_on_plate(
     plate: &mut BuildPlateState,
     config: &SlicerConfig,
     transform_query: &mut Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
 ) {
+    if plate.assembly_view_active {
+        plate.set_assembly_view_active(false, transform_query);
+    }
     let active_idx = plate.active_plate_index;
+    let has_any_printable_on_plate = plate
+        .objects
+        .iter()
+        .any(|o| o.plate_index == active_idx && o.printable);
+
     let mut items = Vec::with_capacity(plate.objects.len());
     for obj in &plate.objects {
         if obj.plate_index != active_idx {
+            continue;
+        }
+        if has_any_printable_on_plate && !obj.printable {
             continue;
         }
         let transform = transform_query
@@ -1207,7 +1369,7 @@ pub fn run_auto_arrange_on_plate(
 
     if items.is_empty() {
         plate.status_message = format!(
-            "No objects on {} to arrange.",
+            "No printable objects on {} to arrange.",
             plate.active_plate_name()
         );
         return;
@@ -1222,31 +1384,135 @@ pub fn run_auto_arrange_on_plate(
         }
         if let Some(obj) = plate
             .objects
-            .iter()
+            .iter_mut()
             .find(|o| o.object_id == placement.object_id)
         {
             if let Ok((mut transform, _)) = transform_query.get_mut(obj.entity) {
                 transform.translation.x = placement.target_x;
                 transform.translation.y = placement.target_y;
                 snap_object_to_bed(obj, &mut transform);
+                obj.saved_plate_translation = transform.translation;
+                obj.saved_plate_rotation = transform.rotation;
             }
         }
     }
 
+    plate.sync_plate_visibility(transform_query);
+
     if out_of_bounds_count == 0 {
         plate.status_message = format!(
-            "Auto-arranged {} object(s) on {} in spiral order by descending Z height.",
+            "Auto-arranged {} printable object(s) on {} in spiral order by descending Z height.",
             placements.len(),
             plate.active_plate_name()
         );
     } else {
         plate.status_message = format!(
-            "Auto-arranged {} object(s) on {}; warning: {} object(s) exceed current bed dimensions.",
+            "Auto-arranged {} printable object(s) on {}; warning: {} object(s) exceed current bed dimensions.",
             placements.len(),
             plate.active_plate_name(),
             out_of_bounds_count
         );
     }
+}
+
+/// Assigns all currently selected (`printable == true`) assembly components to a newly created
+/// build plate, switches to that plate, exits Assembly View, and auto-arranges the subset.
+pub fn arrange_selected_subset_to_new_plate(
+    plate: &mut BuildPlateState,
+    config: &SlicerConfig,
+    transform_query: &mut Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
+) {
+    let selected_count = plate.objects.iter().filter(|o| o.printable).count();
+    if selected_count == 0 {
+        plate.status_message =
+            "Select at least one component (checked as Printable) before arranging to a new plate."
+                .to_string();
+        return;
+    }
+    if plate.assembly_view_active {
+        plate.set_assembly_view_active(false, transform_query);
+    }
+    let new_plate_idx = plate.add_plate(transform_query);
+    for obj in &mut plate.objects {
+        if obj.printable {
+            obj.plate_index = new_plate_idx;
+            obj.visible = true;
+        }
+    }
+    run_auto_arrange_on_plate(plate, config, transform_query);
+}
+
+/// Splits all printable assembly components across build plates grouped by their STEP material /
+/// colour slot assignment, auto-arranging each plate.
+pub fn split_assembly_to_plates_by_material(
+    plate: &mut BuildPlateState,
+    config: &SlicerConfig,
+    transform_query: &mut Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
+) {
+    if plate.assembly_view_active {
+        plate.set_assembly_view_active(false, transform_query);
+    }
+
+    let mut material_groups: Vec<String> = Vec::new();
+    let mut object_group_indices: Vec<(u64, usize)> = Vec::new();
+    for obj in &plate.objects {
+        if !obj.printable {
+            continue;
+        }
+        let group_label = if !obj.step_material_name.is_empty() {
+            obj.step_material_name.clone()
+        } else if let Some(&slot) = obj.triangle_filament_slots.first() {
+            config
+                .filament_slots
+                .get(slot as usize)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| format!("Slot {}", slot + 1))
+        } else {
+            "Default Material".to_string()
+        };
+        let grp_idx = material_groups
+            .iter()
+            .position(|g| g == &group_label)
+            .unwrap_or_else(|| {
+                material_groups.push(group_label);
+                material_groups.len() - 1
+            });
+        object_group_indices.push((obj.object_id, grp_idx));
+    }
+
+    if material_groups.is_empty() {
+        plate.status_message = "No printable components to split by material.".to_string();
+        return;
+    }
+
+    while plate.plates.len() < material_groups.len() {
+        let next_num = plate.plates.len() + 1;
+        plate.plates.push(BuildPlateInfo {
+            name: format!("Plate {next_num}"),
+        });
+    }
+    for (idx, grp_name) in material_groups.iter().enumerate() {
+        if let Some(p) = plate.plates.get_mut(idx) {
+            p.name = format!("Plate {} ({})", idx + 1, grp_name);
+        }
+    }
+    for (obj_id, grp_idx) in object_group_indices {
+        if let Some(obj) = plate.objects.iter_mut().find(|o| o.object_id == obj_id) {
+            obj.plate_index = grp_idx;
+            obj.visible = true;
+        }
+    }
+
+    for p_idx in 0..material_groups.len() {
+        plate.active_plate_index = p_idx;
+        run_auto_arrange_on_plate(plate, config, transform_query);
+    }
+    plate.active_plate_index = 0;
+    plate.sync_plate_visibility(transform_query);
+    plate.status_message = format!(
+        "Split printable assembly components into {} material plate(s) and arranged each plate.",
+        material_groups.len()
+    );
 }
 
 /// Updates object material highlights so the selected object is visually distinct,
@@ -1330,6 +1596,19 @@ pub fn update_selection_materials_system(
                     Some(wgpu::Face::Back),
                     false,
                 )
+            } else if !obj.printable && plate.assembly_view_active && plate.assembly_ghost_unselected {
+                (
+                    Color::srgba(0.45, 0.56, 0.68, 0.34),
+                    0.0,
+                    0.82,
+                    0.08,
+                    0.0,
+                    0.0,
+                    AlphaMode::Blend,
+                    16.0,
+                    Some(wgpu::Face::Back),
+                    false,
+                )
             } else if !obj.printable {
                 (
                     Color::srgba(0.45, 0.48, 0.52, 1.0),
@@ -1383,6 +1662,19 @@ pub fn update_selection_materials_system(
                     true,
                 )
             }
+        } else if !obj.printable && plate.assembly_view_active && plate.assembly_ghost_unselected {
+            (
+                Color::srgba(0.38, 0.42, 0.48, 0.18),
+                0.0,
+                0.88,
+                0.06,
+                0.0,
+                0.0,
+                AlphaMode::Blend,
+                16.0,
+                Some(wgpu::Face::Back),
+                false,
+            )
         } else if !obj.printable {
             (
                 Color::srgba(0.38, 0.40, 0.44, 1.0),
@@ -1842,13 +2134,25 @@ pub fn viewport_interaction_system(
             }
         }
 
-        // Raycast against all visible objects on the active plate to select the closest hit
+        // Raycast against all visible objects on the active plate (or all visible assembly parts in Assembly View)
         if let Some(ray) = cursor_ray {
             let active_idx = plate.active_plate_index;
+            let in_assembly_view = plate.assembly_view_active;
+            let hide_non_printable = !in_assembly_view
+                && plate.hide_non_printable_on_plate
+                && plate
+                    .objects
+                    .iter()
+                    .any(|o| o.plate_index == active_idx && o.printable);
             let mut closest_hit: Option<(u64, f32)> = None;
             for obj in &plate.objects {
-                if !obj.visible || obj.plate_index != active_idx {
+                if !obj.visible {
                     continue;
+                }
+                if !in_assembly_view {
+                    if obj.plate_index != active_idx || (hide_non_printable && !obj.printable) {
+                        continue;
+                    }
                 }
                 if let Ok(obj_tf) = object_transforms.get(obj.entity) {
                     if let Some(dist) = obj.raycast_mesh(obj_tf, ray) {
@@ -1860,8 +2164,32 @@ pub fn viewport_interaction_system(
             }
 
             if let Some((hit_id, _)) = closest_hit {
+                let was_already_selected = plate.selected_object_id == Some(hit_id);
                 plate.selected_object_id = Some(hit_id);
-                if plate.tool_mode == ToolMode::MoveOnBed {
+                if in_assembly_view {
+                    if was_already_selected {
+                        if let Some(obj) = plate.objects.iter_mut().find(|o| o.object_id == hit_id) {
+                            obj.printable = !obj.printable;
+                            let state_label = if obj.printable {
+                                "Included for printing"
+                            } else {
+                                "Excluded (reference ghost)"
+                            };
+                            plate.status_message =
+                                format!("Assembly View: '{}' -> {state_label}.", obj.name);
+                        }
+                    } else if let Some(obj) = plate.objects.iter().find(|o| o.object_id == hit_id) {
+                        let mat_suffix = if obj.step_material_name.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", obj.step_material_name)
+                        };
+                        plate.status_message = format!(
+                            "Selected '{}'{} in Assembly View (click again to toggle Printable).",
+                            obj.name, mat_suffix
+                        );
+                    }
+                } else if plate.tool_mode == ToolMode::MoveOnBed {
                     if let Some(plane_pt) = intersect_ray_z_plane(ray, 0.0) {
                         if let Some(obj) = plate.objects.iter().find(|o| o.object_id == hit_id) {
                             if let Ok(obj_tf) = object_transforms.get(obj.entity) {

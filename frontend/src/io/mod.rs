@@ -2,13 +2,18 @@ pub mod obj;
 pub mod stl;
 pub mod threemf;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use bevy::prelude::*;
 use crate::bridge::ffi::{self, DecomposedPartInfo, RenderVertex};
-use crate::config::{ObjectFilamentMode, SlicerConfig, ThreeMfFilamentSlot};
+use crate::color_optics::{format_hex_rgba, rgba8_to_srgba, unpack_rgba8};
+use crate::config::{
+    ObjectFilamentMode, SlicerConfig, ThreeMfFilamentSlot, DEFAULT_FILAMENT_SLOT_PALETTE,
+};
 use crate::hull::{
     build_surface_patches, SimplifiedConvexHull, SurfacePatch, MAX_SIMPLIFIED_HULL_FACES,
 };
+use crate::io::threemf::compute_vertex_filament_slots_from_triangles;
 
 /// Metadata for a single build plate parsed from a `.3mf` archive.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,6 +28,15 @@ pub struct LoadedObjectData {
     pub name: String,
     pub source_file: String,
     pub has_brep: bool,
+    /// Hierarchical STEP assembly tree path from root assembly to leaf component/body.
+    pub assembly_path: Vec<String>,
+    /// Original 3D CAD assembly coordinates `(X, Y, Z)` (centered in XY, with relative Z height preserved)
+    /// for Orca-style 3D Assembly View inspection and subset picking.
+    pub assembly_translation: Vec3,
+    /// STEP material / appearance name extracted from XCAF or STEP product metadata (if present).
+    pub step_material_name: String,
+    /// STEP material density ($\text{g/cm}^3$) extracted from XCAF material metadata (`0.0` if unspecified).
+    pub step_material_density_g_cm3: f32,
     /// Whether this object is included in slicing and G-code generation (default `true`; imported from `.3mf`).
     pub printable: bool,
     /// Zero-based index of the build plate this object belongs to (`0` = Plate 1).
@@ -113,7 +127,8 @@ pub fn load_files_into_backend(paths: &[PathBuf]) -> LoadedBatchReport {
 }
 
 /// Decomposes a STEP file via the C++ OCCT backend (`ffi::load_step_assembly`)
-/// and constructs `LoadedObjectData` for every solid/shell part in the assembly.
+/// and constructs `LoadedObjectData` for every solid/shell part in the assembly,
+/// preserving the original 3D assembly hierarchy, 3D assembly positions, and STEP material/colour attributes.
 pub fn load_step_file_parts(
     step_path: &Path,
     display_source: &str,
@@ -148,21 +163,135 @@ pub fn load_step_file_parts(
     }
 
     // Center the STEP part (or multi-part STEP assembly as a group) at the bed center `(0, 0)`
-    // in scene coordinates while preserving relative XY offsets between sibling parts.
+    // in scene coordinates while preserving relative XY offsets between sibling parts, and
+    // preserve relative 3D Z heights in `assembly_translation` for Orca-style 3D Assembly View.
     if !loaded_parts.is_empty() {
         let mut min_xy = Vec2::splat(f32::INFINITY);
         let mut max_xy = Vec2::splat(f32::NEG_INFINITY);
+        let mut min_asm_z = f32::INFINITY;
         for obj in &loaded_parts {
             let t_xy = obj.initial_translation.xy();
             min_xy = min_xy.min(t_xy + obj.local_min.xy());
             max_xy = max_xy.max(t_xy + obj.local_max.xy());
+            min_asm_z = min_asm_z.min(obj.assembly_translation.z + obj.local_min.z);
         }
         if min_xy.x.is_finite() && max_xy.x.is_finite() {
             let assembly_center_xy = 0.5 * (min_xy + max_xy);
+            let z_base = if min_asm_z.is_finite() { min_asm_z } else { 0.0 };
             for obj in &mut loaded_parts {
                 obj.initial_translation.x -= assembly_center_xy.x;
                 obj.initial_translation.y -= assembly_center_xy.y;
+                obj.assembly_translation.x -= assembly_center_xy.x;
+                obj.assembly_translation.y -= assembly_center_xy.y;
+                obj.assembly_translation.z = (obj.assembly_translation.z - z_base).max(0.0);
             }
+        }
+    }
+
+    // Extract distinct STEP materials and colours across all parts/triangles and map them
+    // into `report.filament_slots` and per-triangle/per-vertex filament slot assignments.
+    let any_step_color_or_mat = loaded_parts.iter().any(|o| {
+        !o.triangle_colors_rgba.is_empty()
+            || !o.step_material_name.is_empty()
+            || o.custom_color_srgba.is_some()
+    });
+    if any_step_color_or_mat {
+        let mut slot_lookup: HashMap<(u32, String), u8> = HashMap::new();
+        for existing in &report.filament_slots {
+            let rgba = crate::color_optics::pack_rgba8(
+                crate::color_optics::srgba_to_rgba8(existing.color_srgba),
+            );
+            slot_lookup.insert(
+                (rgba, existing.filament_type.clone()),
+                existing.slot_index as u8,
+            );
+        }
+
+        let mut get_or_create_step_slot = |rgba: u32, mat_name: &str| -> u8 {
+            let normalized_mat = mat_name.trim().to_string();
+            let key = (rgba, normalized_mat.clone());
+            if let Some(&idx) = slot_lookup.get(&key) {
+                return idx;
+            }
+            if rgba != 0 {
+                if let Some((&(_, _), &idx)) =
+                    slot_lookup.iter().find(|((c, _), _)| *c == rgba)
+                {
+                    return idx;
+                }
+            }
+            let slot_idx = report.filament_slots.len();
+            let color_srgba = if rgba != 0 {
+                rgba8_to_srgba(unpack_rgba8(rgba))
+            } else {
+                DEFAULT_FILAMENT_SLOT_PALETTE[slot_idx % DEFAULT_FILAMENT_SLOT_PALETTE.len()].1
+            };
+            let hex_label = if rgba != 0 {
+                format_hex_rgba(unpack_rgba8(rgba))
+            } else {
+                let p = crate::color_optics::srgba_to_rgba8(color_srgba);
+                format_hex_rgba(p)
+            };
+            let mat_label = if normalized_mat.is_empty() {
+                "STEP".to_string()
+            } else {
+                normalized_mat.clone()
+            };
+            let slot_name = if normalized_mat.is_empty() {
+                format!("Slot {} ({})", slot_idx + 1, hex_label)
+            } else {
+                format!("Slot {} ({} {})", slot_idx + 1, normalized_mat, hex_label)
+            };
+            let mut slot_entry = ThreeMfFilamentSlot::default_for_slot(slot_idx, slot_idx);
+            slot_entry.name = slot_name;
+            slot_entry.filament_type = mat_label;
+            slot_entry.color_hex = hex_label;
+            slot_entry.color_srgba = color_srgba;
+            report.filament_slots.push(slot_entry);
+            let idx_u8 = (slot_idx.min(254)) as u8;
+            slot_lookup.insert(key, idx_u8);
+            idx_u8
+        };
+
+        for obj in &mut loaded_parts {
+            let num_tris = obj.indices.len() / 3;
+            if num_tris == 0 {
+                continue;
+            }
+            if !obj.triangle_colors_rgba.is_empty() && obj.triangle_colors_rgba.len() == num_tris {
+                let mut tri_slots = Vec::with_capacity(num_tris);
+                for &rgba in &obj.triangle_colors_rgba {
+                    let s = get_or_create_step_slot(rgba, &obj.step_material_name);
+                    tri_slots.push(s);
+                }
+                let default_slot = tri_slots.first().copied().unwrap_or(0);
+                obj.vertex_filament_slots = compute_vertex_filament_slots_from_triangles(
+                    obj.vertices.len(),
+                    &obj.indices,
+                    &tri_slots,
+                    default_slot,
+                );
+                ffi::set_object_triangle_filament_slots(obj.object_id, &tri_slots);
+                ffi::set_object_triangle_colors_rgba(obj.object_id, &obj.triangle_colors_rgba);
+                obj.triangle_filament_slots = tri_slots;
+            } else if !obj.step_material_name.is_empty() {
+                let s = get_or_create_step_slot(0, &obj.step_material_name);
+                let tri_slots = vec![s; num_tris];
+                obj.vertex_filament_slots = vec![s; obj.vertices.len()];
+                ffi::set_object_triangle_filament_slots(obj.object_id, &tri_slots);
+                obj.triangle_filament_slots = tri_slots;
+            }
+        }
+
+        if !report.filament_slots.is_empty() {
+            report.notices.push(format!(
+                "Imported {} STEP material/colour definition(s) from '{}'.",
+                report.filament_slots.len(),
+                step_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(display_source)
+            ));
         }
     }
 
@@ -196,6 +325,51 @@ pub fn build_loaded_object_from_part(
         Vec::new()
     };
 
+    let triangle_colors_rgba = if part.has_brep {
+        ffi::get_object_triangle_colors_rgba(part.object_id)
+    } else {
+        Vec::new()
+    };
+
+    let num_tris = indices.len() / 3;
+    let vertex_colors_rgba = if !triangle_colors_rgba.is_empty()
+        && triangle_colors_rgba.len() == num_tris
+    {
+        let mut v_cols = vec![[220u8, 224u8, 230u8, 255u8]; vertices.len()];
+        for (t, &packed) in triangle_colors_rgba.iter().enumerate() {
+            if packed != 0 {
+                let c = unpack_rgba8(packed);
+                let i0 = indices[t * 3] as usize;
+                let i1 = indices[t * 3 + 1] as usize;
+                let i2 = indices[t * 3 + 2] as usize;
+                if i0 < v_cols.len() {
+                    v_cols[i0] = c;
+                }
+                if i1 < v_cols.len() {
+                    v_cols[i1] = c;
+                }
+                if i2 < v_cols.len() {
+                    v_cols[i2] = c;
+                }
+            }
+        }
+        v_cols
+    } else {
+        Vec::new()
+    };
+
+    let custom_color_srgba = if part.has_color && part.color_rgba != 0 {
+        Some(rgba8_to_srgba(unpack_rgba8(part.color_rgba)))
+    } else {
+        None
+    };
+
+    let assembly_path = if part.assembly_path.is_empty() {
+        vec![part.name.clone()]
+    } else {
+        part.assembly_path
+    };
+
     let (local_min, local_max) = compute_vertex_bounds(&vertices);
     let hull = SimplifiedConvexHull::from_vertices(&vertices, MAX_SIMPLIFIED_HULL_FACES);
     let (surface_patches, triangle_to_patch) =
@@ -206,6 +380,10 @@ pub fn build_loaded_object_from_part(
         name: part.name,
         source_file: source_file.to_string(),
         has_brep: part.has_brep,
+        assembly_path,
+        assembly_translation: Vec3::new(part.origin_x, part.origin_y, part.origin_z),
+        step_material_name: part.material_name,
+        step_material_density_g_cm3: part.material_density_g_cm3,
         printable: true,
         plate_index: 0,
         // Place at the assembly's XY coordinates with z=0 sitting on the print bed
@@ -224,10 +402,10 @@ pub fn build_loaded_object_from_part(
         triangle_to_patch,
         triangle_filament_slots: Vec::new(),
         vertex_filament_slots: Vec::new(),
-        triangle_colors_rgba: Vec::new(),
-        vertex_colors_rgba: Vec::new(),
+        triangle_colors_rgba,
+        vertex_colors_rgba,
         filament_mode: ObjectFilamentMode::default(),
-        custom_color_srgba: None,
+        custom_color_srgba,
     })
 }
 
@@ -399,5 +577,53 @@ mod tests {
         assert!(((r_max - r_min) - Vec3::new(10.0, 20.0, 30.0)).length() < 1e-4);
 
         let _ = ffi::remove_cad_object(obj.object_id);
+    }
+
+    #[test]
+    fn test_step_assembly_hierarchy_and_material_color_import() {
+        let _guard = crate::bridge::TEST_BACKEND_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let step_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Test Objects/A4T Cowling - Dragon-Rapido UHF [xol-carriage].step");
+        if !step_path.exists() {
+            return;
+        }
+
+        let report = load_files_into_backend(&[step_path]);
+        assert!(
+            report.errors.is_empty(),
+            "Unexpected STEP load errors: {:?}",
+            report.errors
+        );
+        assert!(!report.objects.is_empty(), "Expected at least 1 STEP part");
+
+        let first = &report.objects[0];
+        assert!(first.has_brep);
+        assert!(
+            !first.assembly_path.is_empty(),
+            "Expected non-empty STEP assembly path"
+        );
+        assert!(
+            !first.step_material_name.is_empty(),
+            "Expected STEP material name to be extracted (got empty)"
+        );
+        assert!(
+            !first.triangle_colors_rgba.is_empty(),
+            "Expected STEP face/solid colours to be extracted"
+        );
+        assert_eq!(first.triangle_colors_rgba.len(), first.indices.len() / 3);
+        assert_eq!(first.triangle_filament_slots.len(), first.indices.len() / 3);
+        assert!(
+            !report.filament_slots.is_empty(),
+            "Expected STEP material/colour definitions to populate filament_slots"
+        );
+
+        for obj in &report.objects {
+            let _ = ffi::remove_cad_object(obj.object_id);
+        }
     }
 }

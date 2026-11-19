@@ -148,6 +148,8 @@ fn main() {
         for lib in [
             "TKernel",
             "TKMath",
+            "TKG2d",
+            "TKG3d",
             "TKBRep",
             "TKTopAlgo",
             "TKGeomBase",
@@ -156,6 +158,22 @@ fn main() {
             "TKXSBase",
         ] {
             println!("cargo:rustc-link-lib=dylib={lib}");
+        }
+
+        // OCCT XCAF (Extended Data Exchange: STEPCAFControl_Reader, XCAFDoc_ShapeTool/ColorTool/MaterialTool)
+        for xcaf_lib in [
+            "TKCDF",
+            "TKLCAF",
+            "TKCAF",
+            "TKService",
+            "TKV3d",
+            "TKVCAF",
+            "TKXCAF",
+            "TKXDESTEP",
+        ] {
+            if lib_exists_in_dirs(&discovered_lib_dirs, xcaf_lib) {
+                println!("cargo:rustc-link-lib=dylib={xcaf_lib}");
+            }
         }
 
         // OCCT 7.8+ consolidates STEP into TKDESTEP; OCCT 7.6/7.7 (Ubuntu/Debian) uses TKSTEP*

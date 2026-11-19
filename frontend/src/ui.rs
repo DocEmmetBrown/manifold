@@ -30,9 +30,10 @@ use crate::moonraker::{
 };
 use crate::presets::{LeftPanelTab, PresetCategory, PresetLibrary};
 use crate::scene::{
-    clone_object_on_plate, compute_orbit_eye, remove_object_from_plate, run_auto_arrange_on_plate,
-    snap_object_to_bed, spawn_loaded_objects, BuildPlateInfo, BuildPlateState, CadObjectEntity,
-    OrbitCamera, ToolMode,
+    arrange_selected_subset_to_new_plate, clone_object_on_plate, compute_orbit_eye,
+    remove_object_from_plate, run_auto_arrange_on_plate, snap_object_to_bed,
+    spawn_loaded_objects, split_assembly_to_plates_by_material, BuildPlateInfo, BuildPlateState,
+    CadObjectEntity, OrbitCamera, ToolMode,
 };
 use crate::surface_ui::{render_delineated_icon_pill_tab, render_icon_button, UiIcon};
 
@@ -1674,6 +1675,409 @@ fn render_preset_selector_bar(
     applied_or_reverted
 }
 
+/// Renders the Orca-style **STEP Assembly View & Component/Material Selector** card in `Project Setup`.
+///
+/// Allows users to:
+/// - Toggle the 3D viewport between **Build Plate View** ($z = 0$ layout) and **3D Assembly View**
+///   (the original assembled STEP CAD coordinates `(X, Y, Z)` with an interactive 3D Explode slider
+///   and ghost rendering for unselected reference parts).
+/// - Browse and check/uncheck entire sub-assemblies, material/appearance groups, or individual bodies.
+/// - Run one-click subset arrangement actions: **"Arrange Selected on Plate"**,
+///   **"Arrange Selected to New Plate"**, and **"Split by Material to Plates"**.
+fn render_step_assembly_view_and_tree_section(
+    ui: &mut egui::Ui,
+    plate: &mut BuildPlateState,
+    config: &SlicerConfig,
+    vis_state: &mut FieldVisualizationState,
+    object_transforms: &mut Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
+) {
+    if plate.objects.is_empty() || (!plate.has_step_assembly() && plate.objects.len() <= 1) {
+        return;
+    }
+
+    let total_parts = plate.objects.len();
+    let printable_parts = plate.objects.iter().filter(|o| o.printable).count();
+
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "STEP Assembly & Subset Selector ({printable_parts}/{total_parts} selected)"
+                    ))
+                    .strong()
+                    .color(egui::Color32::from_rgb(225, 238, 255)),
+                );
+                let asm_active = plate.assembly_view_active;
+                let toggle_label = if asm_active {
+                    "3D Assembly View: ON"
+                } else {
+                    "3D Assembly View"
+                };
+                if render_delineated_pill_tab(ui, asm_active, toggle_label)
+                    .on_hover_text(
+                        "Toggle Orca-style 3D CAD Assembly View: shows all STEP components in their original 3D assembled coordinates so you can inspect and pick subsets of components or sub-assemblies to print.",
+                    )
+                    .clicked()
+                {
+                    let target = !asm_active;
+                    plate.set_assembly_view_active(target, object_transforms);
+                }
+            });
+
+            if plate.assembly_view_active {
+                ui.horizontal_wrapped(|ui| {
+                    ui.small("3D Explode:");
+                    let mut explode = plate.assembly_explode_mm;
+                    if ui
+                        .add(egui::Slider::new(&mut explode, 0.0..=150.0).suffix(" mm"))
+                        .on_hover_text(
+                            "Radially separate components around the assembly centroid to inspect and click internal parts",
+                        )
+                        .changed()
+                    {
+                        plate.assembly_explode_mm = explode;
+                        plate.apply_assembly_view_transforms(object_transforms);
+                    }
+                    if plate.assembly_explode_mm > 0.0 && ui.small_button("Reset").clicked() {
+                        plate.assembly_explode_mm = 0.0;
+                        plate.apply_assembly_view_transforms(object_transforms);
+                    }
+                    ui.checkbox(&mut plate.assembly_ghost_unselected, "Ghost Unselected")
+                        .on_hover_text(
+                            "Render unchecked (non-printable) components as translucent X-ray ghosts in 3D Assembly View",
+                        );
+                });
+            }
+
+            // Quick Subset Selection & Arrangement Action Bar
+            let mut printable_changed = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.small("Select:");
+                if ui
+                    .small_button("All")
+                    .on_hover_text("Include all components in the assembly for printing")
+                    .clicked()
+                {
+                    for obj in &mut plate.objects {
+                        obj.printable = true;
+                        obj.visible = true;
+                    }
+                    printable_changed = true;
+                }
+                if ui
+                    .small_button("None")
+                    .on_hover_text("Uncheck all components so you can pick only the subset you want to print")
+                    .clicked()
+                {
+                    for obj in &mut plate.objects {
+                        obj.printable = false;
+                    }
+                    printable_changed = true;
+                }
+                if ui
+                    .small_button("Invert")
+                    .on_hover_text("Invert the selected/printable subset of components")
+                    .clicked()
+                {
+                    for obj in &mut plate.objects {
+                        obj.printable = !obj.printable;
+                    }
+                    printable_changed = true;
+                }
+                if let Some(sel_id) = plate.selected_object_id {
+                    if ui
+                        .small_button("Only Active")
+                        .on_hover_text("Check only the currently highlighted component for printing")
+                        .clicked()
+                    {
+                        for obj in &mut plate.objects {
+                            obj.printable = obj.object_id == sel_id;
+                        }
+                        printable_changed = true;
+                    }
+                }
+                if ui
+                    .checkbox(
+                        &mut plate.hide_non_printable_on_plate,
+                        "Hide Unselected on Plate",
+                    )
+                    .on_hover_text(
+                        "When viewing or auto-arranging the build plate, hide components that are not checked for printing",
+                    )
+                    .changed()
+                {
+                    plate.sync_plate_visibility(object_transforms);
+                }
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        printable_parts > 0,
+                        egui::Button::new(
+                            egui::RichText::new(format!(
+                                "Arrange Selected on Plate ({printable_parts})"
+                            ))
+                            .strong(),
+                        )
+                        .small(),
+                    )
+                    .on_hover_text(
+                        "Exit Assembly View and auto-arrange only the checked printable subset on the active build plate",
+                    )
+                    .clicked()
+                {
+                    let active_p = plate.active_plate_index;
+                    for obj in &mut plate.objects {
+                        if obj.printable {
+                            obj.plate_index = active_p;
+                            obj.visible = true;
+                        }
+                    }
+                    run_auto_arrange_on_plate(plate, config, object_transforms);
+                    vis_state.dirty_planned_gcode = true;
+                    vis_state.dirty_toolpaths_mesh = true;
+                }
+
+                if ui
+                    .add_enabled(
+                        printable_parts > 0,
+                        egui::Button::new("Arrange Selected to New Plate").small(),
+                    )
+                    .on_hover_text(
+                        "Create a new build plate, assign the checked subset of components to it, and auto-arrange them",
+                    )
+                    .clicked()
+                {
+                    arrange_selected_subset_to_new_plate(plate, config, object_transforms);
+                    vis_state.dirty_planned_gcode = true;
+                    vis_state.dirty_toolpaths_mesh = true;
+                }
+
+                let has_multiple_materials = {
+                    let mut mats: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for o in &plate.objects {
+                        if !o.step_material_name.is_empty() {
+                            mats.insert(o.step_material_name.clone());
+                        } else if let Some(&s) = o.triangle_filament_slots.first() {
+                            mats.insert(format!("slot_{s}"));
+                        }
+                    }
+                    mats.len() > 1
+                };
+                if has_multiple_materials
+                    && ui
+                        .add_enabled(
+                            printable_parts > 0,
+                            egui::Button::new("Split by Material to Plates").small(),
+                        )
+                        .on_hover_text(
+                            "Split all checked printable components across separate build plates grouped by STEP material / colour",
+                        )
+                        .clicked()
+                {
+                    split_assembly_to_plates_by_material(plate, config, object_transforms);
+                    vis_state.dirty_planned_gcode = true;
+                    vis_state.dirty_toolpaths_mesh = true;
+                }
+            });
+
+            ui.separator();
+
+            // Grouping Mode Switcher: By CAD Assembly Hierarchy vs By Material / Appearance
+            ui.horizontal_wrapped(|ui| {
+                ui.small("Group By:");
+                if render_delineated_pill_tab(
+                    ui,
+                    !plate.assembly_group_by_material,
+                    "Assembly Hierarchy",
+                )
+                .clicked()
+                {
+                    plate.assembly_group_by_material = false;
+                }
+                if render_delineated_pill_tab(
+                    ui,
+                    plate.assembly_group_by_material,
+                    "Material / Colour",
+                )
+                .clicked()
+                {
+                    plate.assembly_group_by_material = true;
+                }
+            });
+
+            // Build grouped index lists in order of appearance
+            let mut groups: Vec<(String, Option<[f32; 4]>, Vec<usize>)> = Vec::new();
+            for (idx, obj) in plate.objects.iter().enumerate() {
+                let (group_title, swatch_opt) = if plate.assembly_group_by_material {
+                    let mat_name = if !obj.step_material_name.is_empty() {
+                        if obj.step_material_density_g_cm3 > 0.0 {
+                            format!(
+                                "{} ({:.2} g/cm³)",
+                                obj.step_material_name, obj.step_material_density_g_cm3
+                            )
+                        } else {
+                            obj.step_material_name.clone()
+                        }
+                    } else if let Some(&slot) = obj.triangle_filament_slots.first() {
+                        config
+                            .filament_slots
+                            .get(slot as usize)
+                            .map(|s| s.name.clone())
+                            .unwrap_or_else(|| format!("Filament Slot {}", slot + 1))
+                    } else {
+                        "Unassigned / Default Material".to_string()
+                    };
+                    let swatch = obj.custom_color_srgba.or_else(|| {
+                        obj.triangle_filament_slots
+                            .first()
+                            .and_then(|&s| config.filament_slots.get(s as usize))
+                            .map(|slot| slot.color_srgba)
+                    });
+                    (mat_name, swatch)
+                } else {
+                    let folder = if obj.assembly_path.len() > 1 {
+                        obj.assembly_path[..obj.assembly_path.len() - 1].join(" / ")
+                    } else {
+                        std::path::Path::new(&obj.source_file)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Assembly Root")
+                            .to_string()
+                    };
+                    (folder, None)
+                };
+
+                if let Some(existing) = groups.iter_mut().find(|(g, _, _)| g == &group_title) {
+                    if existing.1.is_none() && swatch_opt.is_some() {
+                        existing.1 = swatch_opt;
+                    }
+                    existing.2.push(idx);
+                } else {
+                    groups.push((group_title, swatch_opt, vec![idx]));
+                }
+            }
+
+            let current_selected_id = plate.selected_object_id;
+            let mut new_selected_id: Option<u64> = None;
+
+            egui::ScrollArea::vertical()
+                .id_source("step_assembly_tree_scroll")
+                .max_height(210.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (g_idx, (group_title, group_swatch, member_indices)) in
+                        groups.iter().enumerate()
+                    {
+                        let group_total = member_indices.len();
+                        let group_checked = member_indices
+                            .iter()
+                            .filter(|&&i| plate.objects[i].printable)
+                            .count();
+                        let mut all_checked = group_checked == group_total && group_total > 0;
+
+                        ui.push_id(("step_asm_group", g_idx), |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .checkbox(&mut all_checked, "")
+                                    .on_hover_text(
+                                        "Check/uncheck all components in this sub-assembly or material group",
+                                    )
+                                    .changed()
+                                {
+                                    for &i in member_indices {
+                                        plate.objects[i].printable = all_checked;
+                                        if all_checked {
+                                            plate.objects[i].visible = true;
+                                        }
+                                    }
+                                    printable_changed = true;
+                                }
+                                if let Some(rgba) = group_swatch {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(10.0, 10.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(rect, 2.0, rgba_to_color32(*rgba));
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{group_title} ({group_checked}/{group_total})"
+                                    ))
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(205, 220, 242)),
+                                );
+                            });
+
+                            ui.indent(("step_asm_group_indent", g_idx), |ui| {
+                                for &obj_idx in member_indices {
+                                    let obj = &mut plate.objects[obj_idx];
+                                    let is_selected = current_selected_id == Some(obj.object_id);
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui
+                                            .checkbox(&mut obj.printable, "")
+                                            .on_hover_text("Include this component for printing")
+                                            .changed()
+                                        {
+                                            if obj.printable {
+                                                obj.visible = true;
+                                            }
+                                            printable_changed = true;
+                                        }
+                                        let part_swatch = obj.custom_color_srgba.or_else(|| {
+                                            obj.triangle_filament_slots
+                                                .first()
+                                                .and_then(|&s| {
+                                                    config.filament_slots.get(s as usize)
+                                                })
+                                                .map(|slot| slot.color_srgba)
+                                        });
+                                        if let Some(rgba) = part_swatch {
+                                            let (rect, _) = ui.allocate_exact_size(
+                                                egui::vec2(9.0, 9.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter()
+                                                .rect_filled(rect, 2.0, rgba_to_color32(rgba));
+                                        }
+                                        let mat_tag = if !obj.step_material_name.is_empty()
+                                            && !plate.assembly_group_by_material
+                                        {
+                                            format!(" [{}]", obj.step_material_name)
+                                        } else {
+                                            String::new()
+                                        };
+                                        let leaf_label = format!(
+                                            "{}{} ({} tris)",
+                                            obj.name,
+                                            mat_tag,
+                                            obj.indices.len() / 3
+                                        );
+                                        if ui.selectable_label(is_selected, leaf_label).clicked() {
+                                            new_selected_id = Some(obj.object_id);
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                    }
+                });
+
+            if let Some(sel_id) = new_selected_id {
+                plate.selected_object_id = Some(sel_id);
+            }
+            if printable_changed {
+                plate.sync_plate_visibility(object_transforms);
+                vis_state.dirty_planned_gcode = true;
+                vis_state.dirty_toolpaths_mesh = true;
+            }
+        });
+}
+
 /// Renders the top workflow/editing toolbar, the left Project Setup & Configuration/Presets panel,
 /// and the right View & Inspection panel.
 #[allow(clippy::too_many_arguments)]
@@ -2026,6 +2430,28 @@ pub fn ui_workspace_system(
             ui.separator();
             if render_icon_button(ui, UiIcon::AutoArrange, "Auto-Arrange", false, true).clicked() {
                 run_auto_arrange_on_plate(&mut plate, &config, &mut object_transforms);
+                vis_state.dirty_planned_gcode = true;
+                vis_state.dirty_toolpaths_mesh = true;
+            }
+            if plate.has_step_assembly() || plate.objects.len() > 1 {
+                let asm_active = plate.assembly_view_active;
+                if render_delineated_pill_tab(
+                    ui,
+                    asm_active,
+                    if asm_active {
+                        "Assembly View: ON"
+                    } else {
+                        "Assembly View"
+                    },
+                )
+                .on_hover_text(
+                    "Toggle Orca-style 3D STEP Assembly View (original 3D CAD assembled positions vs arranged build plate)",
+                )
+                .clicked()
+                {
+                    let target = !asm_active;
+                    plate.set_assembly_view_active(target, &mut object_transforms);
+                }
             }
             if render_icon_button(ui, UiIcon::FrameCamera, "Frame All", false, true).clicked() {
                 frame_camera_to_plate(&plate, &config, &mut camera_query);
@@ -2460,6 +2886,14 @@ pub fn ui_workspace_system(
                             }
                         });
 
+                    ui.add_space(4.0);
+                    render_step_assembly_view_and_tree_section(
+                        ui,
+                        &mut plate,
+                        &config,
+                        &mut vis_state,
+                        &mut object_transforms,
+                    );
                     ui.add_space(4.0);
                     let active_plate_idx = plate.active_plate_index;
                     let active_plate_name = plate.active_plate_name().to_string();
