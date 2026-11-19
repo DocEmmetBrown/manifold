@@ -1792,7 +1792,6 @@ std::vector<DecomposedPartInfo> SlicerBackend::loadStepAssembly(
     const Handle(XCAFDoc_ShapeTool) shapeTool = XCAFDoc_DocumentTool::ShapeTool(doc->Main());
     const Handle(XCAFDoc_ColorTool) colorTool = XCAFDoc_DocumentTool::ColorTool(doc->Main());
     const Handle(XCAFDoc_MaterialTool) matTool = XCAFDoc_DocumentTool::MaterialTool(doc->Main());
-    (void)matTool;
 
     // Extract STEP entity metadata from the underlying STEP model (e.g. COLOUR_RGB appearance
     // names, DESCRIPTIVE_REPRESENTATION_ITEM material names, and MANIFOLD_SOLID_BREP body names).
@@ -1857,11 +1856,11 @@ std::vector<DecomposedPartInfo> SlicerBackend::loadStepAssembly(
         };
         for (const XCAFDoc_ColorType ct : types) {
             Quantity_ColorRGBA colRgba;
-            if (XCAFDoc_ColorTool::GetColor(lbl, ct, colRgba)) {
+            if (colorTool->GetColor(lbl, ct, colRgba)) {
                 return packQuantityColorRgba(colRgba);
             }
             Quantity_Color colRgb;
-            if (XCAFDoc_ColorTool::GetColor(lbl, ct, colRgb)) {
+            if (colorTool->GetColor(lbl, ct, colRgb)) {
                 return packQuantityColor(colRgb);
             }
         }
@@ -1910,7 +1909,7 @@ std::vector<DecomposedPartInfo> SlicerBackend::loadStepAssembly(
     };
 
     auto queryLabelMaterial = [&](const TDF_Label& lbl, std::string& ioMatName, float& ioDensity) {
-        if (lbl.IsNull()) {
+        if (lbl.IsNull() || matTool.IsNull()) {
             return;
         }
         Handle(TDataStd_TreeNode) matNode;
@@ -1919,7 +1918,7 @@ std::vector<DecomposedPartInfo> SlicerBackend::loadStepAssembly(
             const TDF_Label matLbl = matNode->Father()->Label();
             Handle(TCollection_HAsciiString) aName, aDesc, aDensName, aDensValType;
             Standard_Real aDensity = 0.0;
-            if (XCAFDoc_MaterialTool::GetMaterial(
+            if (matTool->GetMaterial(
                     matLbl, aName, aDesc, aDensity, aDensName, aDensValType)) {
                 if (!aName.IsNull() && aName->Length() > 0) {
                     const std::string mName(aName->ToCString());
@@ -1987,11 +1986,11 @@ std::vector<DecomposedPartInfo> SlicerBackend::loadStepAssembly(
             }
             queryLabelMaterial(lbl, inheritedMatName, inheritedDensity);
 
-            if (XCAFDoc_ShapeTool::IsReference(lbl)) {
+            if (shapeTool->IsReference(lbl)) {
                 const std::string instName = getLabelName(lbl);
-                const TopLoc_Location compLoc = parentLoc * XCAFDoc_ShapeTool::GetLocation(lbl);
+                const TopLoc_Location compLoc = parentLoc * shapeTool->GetLocation(lbl);
                 TDF_Label refLbl;
-                if (XCAFDoc_ShapeTool::GetReferredShape(lbl, refLbl) && !refLbl.IsNull()) {
+                if (shapeTool->GetReferredShape(lbl, refLbl) && !refLbl.IsNull()) {
                     const std::string refName = getLabelName(refLbl);
                     const std::string chosenName = !instName.empty() ? instName : refName;
                     if (!chosenName.empty() && (path.empty() || path.back() != chosenName)) {
@@ -2013,9 +2012,9 @@ std::vector<DecomposedPartInfo> SlicerBackend::loadStepAssembly(
                 path.push_back(lblName);
             }
 
-            if (XCAFDoc_ShapeTool::IsAssembly(lbl)) {
+            if (shapeTool->IsAssembly(lbl)) {
                 TDF_LabelSequence compLabels;
-                if (XCAFDoc_ShapeTool::GetComponents(lbl, compLabels) && compLabels.Length() > 0) {
+                if (shapeTool->GetComponents(lbl, compLabels) && compLabels.Length() > 0) {
                     for (Standard_Integer i = 1; i <= compLabels.Length(); ++i) {
                         traverseLabel(
                             compLabels.Value(i),
@@ -2029,7 +2028,7 @@ std::vector<DecomposedPartInfo> SlicerBackend::loadStepAssembly(
                 }
             }
 
-            TopoDS_Shape s = XCAFDoc_ShapeTool::GetShape(lbl);
+            TopoDS_Shape s = shapeTool->GetShape(lbl);
             if (s.IsNull()) {
                 return;
             }

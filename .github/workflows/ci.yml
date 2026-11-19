@@ -93,6 +93,8 @@ jobs:
             libocct-modeling-data-dev \
             libocct-modeling-algorithms-dev \
             libocct-data-exchange-dev \
+            libocct-ocaf-dev \
+            libocct-visualization-dev \
             libopenvdb-dev \
             libtbb-dev \
             libimath-dev \
