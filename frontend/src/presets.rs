@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::{
     BedShape, BrickLayerMode, ClearancePointXZ, ClearanceProfileMode, FiveAxisKinematicsMode,
     GcodeDialect, LayerHeightConfig, LineWidthConfig, MoonrakerNetworkConfig, OrderFieldMode,
-    SlicerConfig, SolidInfillPattern, SparseInfillPattern, SupportStyle, ToolConfig,
-    WallPrintOrder,
+    PrinterNetworkProtocol, SlicerConfig, SolidInfillPattern, SparseInfillPattern, SupportStyle,
+    ToolConfig, WallPrintOrder,
 };
 
 /// Top-level tab in the left workspace panel (`Project Setup` vs. `Configuration`).
@@ -341,8 +341,11 @@ impl PrinterPreset {
             && self.emit_thumbnails == cfg.gcode.emit_thumbnails
             && self.start_gcode_template == cfg.gcode.start_gcode_template
             && self.end_gcode_template == cfg.gcode.end_gcode_template
+            && self.network.protocol == cfg.network.protocol
             && self.network.printer_uri == cfg.network.printer_uri
             && self.network.web_ui_uri == cfg.network.web_ui_uri
+            && self.network.username == cfg.network.username
+            && self.network.password == cfg.network.password
             && self.network.api_key == cfg.network.api_key
             && self.network.ca_cert_pem_path == cfg.network.ca_cert_pem_path
             && self.network.client_cert_pem_path == cfg.network.client_cert_pem_path
@@ -1339,6 +1342,8 @@ impl PresetLibrary {
             p.height_z = hz;
             p.gcode_origin_at_bed_center = false;
             p.gcode_dialect = GcodeDialect::Prusa;
+            p.network.protocol = PrinterNetworkProtocol::PrusaLink;
+            p.network.username = "maker".to_string();
             p.emit_exclude_object = true;
             p.emit_thumbnails = true;
             p.default_tool_count = tool_count;
@@ -2269,6 +2274,8 @@ mod tests {
             );
             assert_eq!(cfg.bed.shape, BedShape::Rectangular);
             assert_eq!(cfg.gcode.gcode_dialect, GcodeDialect::Prusa);
+            assert_eq!(cfg.network.protocol, PrinterNetworkProtocol::PrusaLink);
+            assert_eq!(cfg.network.username, "maker");
             assert!((cfg.bed.width_x - wx).abs() < 1.0e-4);
             assert!((cfg.bed.depth_y - dy).abs() < 1.0e-4);
             assert!((cfg.bed.height_z - hz).abs() < 1.0e-4);

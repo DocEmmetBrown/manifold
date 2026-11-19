@@ -13,8 +13,8 @@ use crate::calibration::{
 use crate::config::{
     lookup_parameter_doc, BedShape, BrickLayerMode, ClearancePointXZ, ClearanceProfileMode,
     FiveAxisKinematicsMode, GcodeDialect, InfillFilamentMode, ObjectFilamentMode, OrderFieldMode,
-    PointNormalHint, PurgeMode, SlicerConfig, SolidInfillPattern, SparseInfillPattern,
-    SupportStyle, SurfaceHintMode, ToolConfig, WallPrintOrder,
+    PointNormalHint, PrinterNetworkProtocol, PurgeMode, SlicerConfig, SolidInfillPattern,
+    SparseInfillPattern, SupportStyle, SurfaceHintMode, ToolConfig, WallPrintOrder,
 };
 use crate::field_vis::{
     high_contrast_parameter_ramp, sample_slice_colormap_rgba, FieldColormap,
@@ -2287,6 +2287,7 @@ pub fn ui_workspace_system(
             }
 
             if config.network.is_configured() {
+                let proto_label = config.network.protocol.short_label();
                 let is_uploading = moonraker_state.pending_upload_task.is_some();
                 let can_upload =
                     has_planned && !is_computing && !is_io_busy && !is_uploading;
@@ -2302,7 +2303,7 @@ pub fn ui_workspace_system(
                         }),
                     )
                     .on_hover_text(format!(
-                        "Upload planned G-code to Moonraker ({}) without starting a print",
+                        "Upload planned G-code to {proto_label} ({}) without starting a print",
                         config.network.printer_uri.trim()
                     ))
                     .clicked()
@@ -2320,7 +2321,7 @@ pub fn ui_workspace_system(
                         ),
                     )
                     .on_hover_text(format!(
-                        "Upload planned G-code to Moonraker ({}) and immediately start printing",
+                        "Upload planned G-code to {proto_label} ({}) and immediately start printing",
                         config.network.printer_uri.trim()
                     ))
                     .clicked()
@@ -4385,7 +4386,7 @@ pub fn ui_workspace_system(
     );
 }
 
-/// Renders a compact Moonraker printer status monitor (state badge, active filename, progress bar,
+/// Renders a compact network printer status monitor (state badge, active filename, progress bar,
 /// elapsed/ETA, refresh button, and "Web UI ↗" browser launcher) in the top workflow bar.
 fn render_moonraker_toolbar_status_strip(
     ui: &mut egui::Ui,
@@ -4393,6 +4394,7 @@ fn render_moonraker_toolbar_status_strip(
     moonraker_state: &mut MoonrakerUiState,
     status_message: &mut String,
 ) {
+    let proto_label = config.network.protocol.short_label();
     ui.label(egui::RichText::new("Printer:").strong());
     match moonraker_state.last_status {
         Some(Ok(ref st)) => {
@@ -4407,9 +4409,9 @@ fn render_moonraker_toolbar_status_strip(
                 _ => (st.state.as_str(), egui::Color32::from_rgb(185, 195, 210)),
             };
             let hover_msg = if st.message.is_empty() {
-                format!("Moonraker printer state: {}", st.state)
+                format!("{proto_label} printer state: {}", st.state)
             } else {
-                format!("Moonraker printer state: {} — {}", st.state, st.message)
+                format!("{proto_label} printer state: {} — {}", st.state, st.message)
             };
             ui.label(
                 egui::RichText::new(format!("[{badge_text}]"))
@@ -4424,7 +4426,7 @@ fn render_moonraker_toolbar_status_strip(
                         .monospace()
                         .color(egui::Color32::from_gray(225)),
                 )
-                .on_hover_text("Current G-code file loaded on Moonraker");
+                .on_hover_text(format!("Current G-code file active on {proto_label}"));
             }
 
             if st.is_printing_or_paused()
@@ -4470,7 +4472,7 @@ fn render_moonraker_toolbar_status_strip(
             moonraker_state.pending_status_task.is_none(),
             egui::Button::new("↻").small(),
         )
-        .on_hover_text("Refresh Moonraker printer status now")
+        .on_hover_text(format!("Refresh {proto_label} printer status now"))
         .clicked()
     {
         let net_cfg = config.network.clone();
@@ -4920,17 +4922,39 @@ fn render_printer_config_tab(
     .id_source("printer_gcode_templates_section")
     .default_open(false)
     .show(ui, |ui| {
-        let gc = &mut config.gcode;
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Firmware Dialect:");
-            for dialect in GcodeDialect::ALL {
-                dirty_gcode |= ui
-                    .selectable_value(&mut gc.gcode_dialect, dialect, dialect.short_label())
-                    .on_hover_text(dialect.label())
-                    .changed();
+        let mut dialect_switched = false;
+        {
+            let gc = &mut config.gcode;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Firmware Dialect:");
+                for dialect in GcodeDialect::ALL {
+                    if ui
+                        .selectable_value(&mut gc.gcode_dialect, dialect, dialect.short_label())
+                        .on_hover_text(dialect.label())
+                        .changed()
+                    {
+                        dirty_gcode = true;
+                        dialect_switched = true;
+                    }
+                }
+                param_help_button(ui, "gcode.gcode_dialect");
+            });
+        }
+        if dialect_switched && config.network.printer_uri.trim().is_empty() {
+            match config.gcode.gcode_dialect {
+                GcodeDialect::Prusa => {
+                    config.network.protocol = PrinterNetworkProtocol::PrusaLink;
+                    if config.network.username.trim().is_empty() {
+                        config.network.username = "maker".to_string();
+                    }
+                }
+                GcodeDialect::Klipper => {
+                    config.network.protocol = PrinterNetworkProtocol::Moonraker;
+                }
+                GcodeDialect::RepRapFirmware => {}
             }
-            param_help_button(ui, "gcode.gcode_dialect");
-        });
+        }
+        let gc = &mut config.gcode;
         ui.horizontal_wrapped(|ui| {
             let dyn_pa_label = match gc.gcode_dialect {
                 GcodeDialect::Klipper => "Emit Dynamic SET_PRESSURE_ADVANCE Commands",
@@ -4999,67 +5023,125 @@ fn render_printer_config_tab(
     });
 
     ui.add_space(4.0);
-    egui::CollapsingHeader::new(
-        egui::RichText::new("Network Printing (Moonraker / Klipper)").strong(),
-    )
-    .id_source("printer_network_moonraker_section")
-    .default_open(true)
-    .show(ui, |ui| {
-        let mut net_changed = false;
-        ui.horizontal(|ui| {
-            ui.label("Printer URI:");
-            net_changed |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut config.network.printer_uri)
-                        .hint_text("http://printer.local:7125")
-                        .desired_width(210.0),
-                )
-                .changed();
-            param_help_button(ui, "network.printer_uri");
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Web UI URI:");
-            net_changed |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut config.network.web_ui_uri)
-                        .hint_text("Auto (Printer URI without :7125)")
-                        .desired_width(175.0),
-                )
-                .changed();
-            let can_open_ui = config.network.is_configured();
-            let web_hover = resolve_printer_web_ui_url(&config.network)
-                .unwrap_or_else(|_| "Enter a Printer URI above first".to_string());
-            if ui
-                .add_enabled(can_open_ui, egui::Button::new("Open Web UI ↗"))
-                .on_hover_text(format!("Launch {web_hover} in your system browser"))
-                .clicked()
-            {
-                match open_printer_web_ui_in_browser(&config.network) {
-                    Ok(url) => {
-                        *status_message =
-                            format!("Opened printer Web UI ({url}) in system browser.");
-                    }
-                    Err(err) => {
-                        *status_message = err;
+    let net_section_title = match config.network.protocol {
+        PrinterNetworkProtocol::Moonraker => "Network Printing (Moonraker / Klipper)",
+        PrinterNetworkProtocol::PrusaLink => "Network Printing (PrusaLink / Prusa Buddy)",
+    };
+    egui::CollapsingHeader::new(egui::RichText::new(net_section_title).strong())
+        .id_source("printer_network_moonraker_section")
+        .default_open(true)
+        .show(ui, |ui| {
+            let mut net_changed = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Protocol:");
+                for proto in PrinterNetworkProtocol::ALL {
+                    if ui
+                        .selectable_value(&mut config.network.protocol, proto, proto.short_label())
+                        .on_hover_text(proto.label())
+                        .changed()
+                    {
+                        net_changed = true;
+                        moonraker_state.last_test_result = None;
+                        moonraker_state.last_status = None;
+                        if proto == PrinterNetworkProtocol::PrusaLink
+                            && config.network.username.trim().is_empty()
+                        {
+                            config.network.username = "maker".to_string();
+                        }
                     }
                 }
-            }
-        });
+                param_help_button(ui, "network.protocol");
+            });
 
-        ui.horizontal(|ui| {
-            ui.label("API Key:");
-            net_changed |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut config.network.api_key)
-                        .password(!moonraker_state.show_api_key)
-                        .hint_text("Optional X-Api-Key")
-                        .desired_width(175.0),
-                )
-                .changed();
-            ui.checkbox(&mut moonraker_state.show_api_key, "Show");
-            param_help_button(ui, "network.api_key");
-        });
+            let uri_hint = match config.network.protocol {
+                PrinterNetworkProtocol::Moonraker => "http://printer.local:7125",
+                PrinterNetworkProtocol::PrusaLink => "http://prusa-core-one.local",
+            };
+            ui.horizontal(|ui| {
+                ui.label("Printer URI:");
+                net_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut config.network.printer_uri)
+                            .hint_text(uri_hint)
+                            .desired_width(210.0),
+                    )
+                    .changed();
+                param_help_button(ui, "network.printer_uri");
+            });
+
+            let web_ui_hint = match config.network.protocol {
+                PrinterNetworkProtocol::Moonraker => "Auto (Printer URI without :7125)",
+                PrinterNetworkProtocol::PrusaLink => "Auto (Same as Printer URI)",
+            };
+            ui.horizontal(|ui| {
+                ui.label("Web UI URI:");
+                net_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut config.network.web_ui_uri)
+                            .hint_text(web_ui_hint)
+                            .desired_width(175.0),
+                    )
+                    .changed();
+                let can_open_ui = config.network.is_configured();
+                let web_hover = resolve_printer_web_ui_url(&config.network)
+                    .unwrap_or_else(|_| "Enter a Printer URI above first".to_string());
+                if ui
+                    .add_enabled(can_open_ui, egui::Button::new("Open Web UI ↗"))
+                    .on_hover_text(format!("Launch {web_hover} in your system browser"))
+                    .clicked()
+                {
+                    match open_printer_web_ui_in_browser(&config.network) {
+                        Ok(url) => {
+                            *status_message =
+                                format!("Opened printer Web UI ({url}) in system browser.");
+                        }
+                        Err(err) => {
+                            *status_message = err;
+                        }
+                    }
+                }
+            });
+
+            if config.network.protocol == PrinterNetworkProtocol::PrusaLink {
+                ui.horizontal(|ui| {
+                    ui.label("Username:");
+                    net_changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut config.network.username)
+                                .hint_text("maker (default)")
+                                .desired_width(175.0),
+                        )
+                        .changed();
+                    param_help_button(ui, "network.credentials");
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Password:");
+                    net_changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut config.network.password)
+                                .password(!moonraker_state.show_password)
+                                .hint_text("PrusaLink password")
+                                .desired_width(175.0),
+                        )
+                        .changed();
+                    ui.checkbox(&mut moonraker_state.show_password, "Show");
+                });
+            }
+
+            ui.horizontal(|ui| {
+                ui.label("API Key:");
+                net_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut config.network.api_key)
+                            .password(!moonraker_state.show_api_key)
+                            .hint_text("Optional X-Api-Key")
+                            .desired_width(175.0),
+                    )
+                    .changed();
+                ui.checkbox(&mut moonraker_state.show_api_key, "Show");
+                param_help_button(ui, "network.api_key");
+            });
 
         egui::CollapsingHeader::new("TLS / mTLS Certificates (Optional)")
             .id_source("printer_network_tls_certs_subsection")
@@ -5186,6 +5268,15 @@ fn render_printer_config_tab(
         }
 
         ui.horizontal_wrapped(|ui| {
+            let proto_label = config.network.protocol.short_label();
+            let test_hover = match config.network.protocol {
+                PrinterNetworkProtocol::Moonraker => {
+                    "Verify connectivity, API key, and TLS certificates against Moonraker (/server/info & /printer/info) without printing anything"
+                }
+                PrinterNetworkProtocol::PrusaLink => {
+                    "Verify connectivity, HTTP Digest username/password (or API key), and TLS certificates against PrusaLink (/api/v1/info & /api/v1/status) without printing anything"
+                }
+            };
             let is_testing = moonraker_state.pending_test_task.is_some();
             let can_test = config.network.is_configured() && !is_testing;
             if ui
@@ -5197,14 +5288,12 @@ fn render_printer_config_tab(
                         "Test Connection"
                     }),
                 )
-                .on_hover_text(
-                    "Verify connectivity, authentication, and TLS certificates against Moonraker (/server/info & /printer/info) without printing anything",
-                )
+                .on_hover_text(test_hover)
                 .clicked()
             {
                 let net_cfg = config.network.clone();
                 *status_message = format!(
-                    "Testing connection to Moonraker at {}...",
+                    "Testing connection to {proto_label} at {}...",
                     net_cfg.printer_uri.trim()
                 );
                 let test_cfg = net_cfg.clone();
@@ -10542,7 +10631,8 @@ pub fn poll_io_tasks_system(
         }
     }
 
-    // 6. Poll pending Moonraker connection test task
+    // 6. Poll pending printer connection test task
+    let proto_label = config.network.protocol.short_label();
     if let Some(ref mut task) = moonraker_state.pending_test_task {
         if let Some(res) = block_on(future::poll_once(task)) {
             moonraker_state.pending_test_task = None;
@@ -10551,14 +10641,14 @@ pub fn poll_io_tasks_system(
                     plate.status_message = report.summary_line();
                 }
                 Err(err) => {
-                    plate.status_message = format!("Moonraker connection test failed: {err}");
+                    plate.status_message = format!("{proto_label} connection test failed: {err}");
                 }
             }
             moonraker_state.last_test_result = Some(res);
         }
     }
 
-    // 7. Poll pending Moonraker G-code upload / upload-and-print task
+    // 7. Poll pending printer G-code upload / upload-and-print task
     if let Some(ref mut task) = moonraker_state.pending_upload_task {
         if let Some(res) = block_on(future::poll_once(task)) {
             moonraker_state.pending_upload_task = None;
@@ -10569,7 +10659,7 @@ pub fn poll_io_tasks_system(
                     moonraker_state.last_poll_instant = None;
                 }
                 Err(err) => {
-                    plate.status_message = format!("Moonraker upload failed: {err}");
+                    plate.status_message = format!("{proto_label} upload failed: {err}");
                 }
             }
             moonraker_state.last_upload_result = Some(res);
@@ -11322,6 +11412,7 @@ fn render_calibration_utilities_window(
                 }
 
                 if config.network.is_configured() {
+                    let proto_label = config.network.protocol.short_label();
                     let is_uploading = moonraker_state.pending_upload_task.is_some();
                     let can_upload = !is_computing && !is_io_busy && !is_uploading;
                     if ui
@@ -11334,7 +11425,7 @@ fn render_calibration_utilities_window(
                             }),
                         )
                         .on_hover_text(format!(
-                            "Generate and upload calibration G-code to Moonraker ({}) without starting a print",
+                            "Generate and upload calibration G-code to {proto_label} ({}) without starting a print",
                             config.network.printer_uri.trim()
                         ))
                         .clicked()
@@ -11351,7 +11442,7 @@ fn render_calibration_utilities_window(
                             ),
                         )
                         .on_hover_text(format!(
-                            "Generate, upload calibration G-code to Moonraker ({}), and immediately start printing",
+                            "Generate, upload calibration G-code to {proto_label} ({}), and immediately start printing",
                             config.network.printer_uri.trim()
                         ))
                         .clicked()

@@ -2386,16 +2386,50 @@ impl GcodeProcessConfig {
     }
 }
 
-/// Network printing & status monitoring configuration for Moonraker / Klipper printers.
+/// Local network API protocol used for printer telemetry, connection tests, and G-code upload/print.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrinterNetworkProtocol {
+    /// Moonraker HTTP/HTTPS API for Klipper (`/server/info`, `/printer/objects/query`, `POST /server/files/upload`).
+    #[default]
+    Moonraker,
+    /// PrusaLink API v1 for Prusa Buddy / Raspberry Pi printers (`/api/v1/info`, `/api/v1/status`, `/api/v1/job`, `PUT /api/v1/files/{storage}/{path}` with HTTP Digest Auth & `X-Api-Key`).
+    PrusaLink,
+}
+
+impl PrinterNetworkProtocol {
+    pub const ALL: [Self; 2] = [Self::Moonraker, Self::PrusaLink];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Moonraker => "Moonraker (Klipper)",
+            Self::PrusaLink => "PrusaLink (Prusa Buddy / API v1)",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Moonraker => "Moonraker",
+            Self::PrusaLink => "PrusaLink",
+        }
+    }
+}
+
+/// Network printing & status monitoring configuration for Moonraker (Klipper) and PrusaLink (Prusa Buddy) printers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MoonrakerNetworkConfig {
-    /// Base URL of the Moonraker HTTP/HTTPS API (e.g., "http://voron.local:7125" or "https://printer.lan").
+    /// Selected printer network protocol (`Moonraker` or `PrusaLink`).
+    pub protocol: PrinterNetworkProtocol,
+    /// Base URL of the printer HTTP/HTTPS API (e.g., "http://voron.local:7125" or "http://prusa-core-one.local").
     pub printer_uri: String,
-    /// Optional override URL for launching the printer's Web UI (Mainsail / Fluidd) in the system browser.
-    /// When empty, defaults to `printer_uri` (with `:7125` stripped to standard HTTP/HTTPS port).
+    /// Optional override URL for launching the printer's Web UI (Mainsail / Fluidd / PrusaLink) in the system browser.
+    /// When empty, defaults to `printer_uri` (with `:7125` stripped to standard HTTP/HTTPS port for Moonraker).
     pub web_ui_uri: String,
-    /// Optional Moonraker API key sent in the `X-Api-Key` HTTP header.
+    /// Username for PrusaLink HTTP Digest / Basic authentication (defaults to `"maker"` on Prusa Buddy printers when left blank).
+    pub username: String,
+    /// Password for PrusaLink HTTP Digest / Basic authentication (from Printer Settings -> Network -> PrusaLink).
+    pub password: String,
+    /// Optional API key sent in the `X-Api-Key` HTTP header (Moonraker or PrusaLink API-key mode).
     pub api_key: String,
     /// Optional path to a custom PEM-encoded CA certificate bundle for verifying HTTPS connections.
     pub ca_cert_pem_path: String,
@@ -2412,8 +2446,11 @@ pub struct MoonrakerNetworkConfig {
 impl Default for MoonrakerNetworkConfig {
     fn default() -> Self {
         Self {
+            protocol: PrinterNetworkProtocol::Moonraker,
             printer_uri: String::new(),
             web_ui_uri: String::new(),
+            username: String::new(),
+            password: String::new(),
             api_key: String::new(),
             ca_cert_pem_path: String::new(),
             client_cert_pem_path: String::new(),
@@ -2428,6 +2465,8 @@ impl MoonrakerNetworkConfig {
     pub fn sanitize(&mut self) {
         self.printer_uri = self.printer_uri.trim().to_string();
         self.web_ui_uri = self.web_ui_uri.trim().to_string();
+        self.username = self.username.trim().to_string();
+        self.password = self.password.trim_matches(['\r', '\n']).to_string();
         self.api_key = self.api_key.trim().to_string();
         self.ca_cert_pem_path = self.ca_cert_pem_path.trim().to_string();
         self.client_cert_pem_path = self.client_cert_pem_path.trim().to_string();
@@ -2436,6 +2475,15 @@ impl MoonrakerNetworkConfig {
             self.poll_interval_s = 2.5;
         }
         self.poll_interval_s = self.poll_interval_s.clamp(1.0, 30.0);
+    }
+
+    pub fn effective_prusa_username(&self) -> &str {
+        let u = self.username.trim();
+        if u.is_empty() {
+            "maker"
+        } else {
+            u
+        }
     }
 
     pub fn is_configured(&self) -> bool {
@@ -4468,24 +4516,42 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         details: "Increase `Part Clearance` when printing tall non-planar parts sequentially or when using wide toolhead shrouds.",
     },
 
-    // --- Network Printing (Moonraker / Klipper) ---
+    // --- Network Printing (Moonraker / PrusaLink) ---
+    ParameterDoc {
+        key: "network.protocol",
+        category: "Network Printing (Moonraker / PrusaLink)",
+        title: "Printer Network Protocol (Moonraker vs PrusaLink)",
+        units: "protocol",
+        default_value: "Moonraker (or PrusaLink on Prusa presets)",
+        summary: "Selects between Klipper's Moonraker REST API and Prusa's PrusaLink v1 REST API.",
+        details: "Moonraker uses `/server/info`, `/printer/objects/query`, and `POST /server/files/upload`. PrusaLink v1 (used on Prusa CORE One, MK4/S, XL, and MINI+ Buddy boards) uses `/api/v1/info`, `/api/v1/status`, `/api/v1/job`, `/api/v1/storage`, and `PUT /api/v1/files/{storage}/{filename}` (`Print-After-Upload: ?1`, `Overwrite: ?1`) authenticated via RFC 2617/7616 HTTP Digest Auth (`maker` + password) or `X-Api-Key`.",
+    },
     ParameterDoc {
         key: "network.printer_uri",
-        category: "Network Printing (Moonraker / Klipper)",
-        title: "Moonraker Printer URI & Web UI URI",
+        category: "Network Printing (Moonraker / PrusaLink)",
+        title: "Printer URI & Web UI URI",
         units: "URL",
-        default_value: "http://printer.local:7125",
-        summary: "Base HTTP/HTTPS endpoint for Moonraker API calls, status polling, and G-code uploads, plus optional Web UI URL override.",
-        details: "Point `Printer URI` to your Moonraker server (e.g. `http://192.168.1.50:7125` or `https://voron.example.com`). Clicking `Open Web UI` launches `Web UI URI` (or `Printer URI` with `:7125` stripped to standard HTTP/HTTPS port) in your system browser.",
+        default_value: "http://printer.local:7125 or http://prusa-core-one.local",
+        summary: "Base HTTP/HTTPS endpoint for printer API calls, status polling, and G-code uploads, plus optional Web UI URL override.",
+        details: "Point `Printer URI` to your Moonraker server (e.g. `http://192.168.1.50:7125`) or PrusaLink IP/hostname (e.g. `http://192.168.1.80` or `http://prusa-core-one.local`). Clicking `Open Web UI` launches `Web UI URI` (or `Printer URI` with `:7125` stripped for Moonraker) in your system browser.",
+    },
+    ParameterDoc {
+        key: "network.credentials",
+        category: "Network Printing (Moonraker / PrusaLink)",
+        title: "PrusaLink Username & Password (HTTP Digest Auth)",
+        units: "credentials",
+        default_value: "maker / (from printer screen)",
+        summary: "HTTP Digest / Basic authentication credentials for PrusaLink on Prusa Buddy firmware.",
+        details: "On Prusa CORE One, MK4/S, and XL printers, find your local PrusaLink credentials on the printer screen under `Settings -> Network -> PrusaLink` (default username is `maker`). Password is never sent in cleartext when the printer requests HTTP Digest challenge-response authentication.",
     },
     ParameterDoc {
         key: "network.api_key",
-        category: "Network Printing (Moonraker / Klipper)",
-        title: "Moonraker API Key",
+        category: "Network Printing (Moonraker / PrusaLink)",
+        title: "API Key (X-Api-Key)",
         units: "token",
         default_value: "(optional)",
-        summary: "Optional Moonraker API key sent in the `X-Api-Key` HTTP header.",
-        details: "Required when Moonraker `[authorization]` requires API key authentication for untrusted subnets or remote reverse proxies.",
+        summary: "Optional API key sent in the `X-Api-Key` HTTP header.",
+        details: "Used when Moonraker `[authorization]` requires API key authentication or on PrusaLink setups configured for `X-Api-Key` access.",
     },
     ParameterDoc {
         key: "network.tls_certs",
