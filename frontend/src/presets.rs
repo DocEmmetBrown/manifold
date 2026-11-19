@@ -134,6 +134,10 @@ pub struct PrinterPreset {
 
     // Firmware Features & Start/End G-code Templates
     pub gcode_dialect: GcodeDialect,
+    pub enable_dynamic_pa: bool,
+    pub enable_slicer_pa_subdivision: bool,
+    pub enable_corner_flow_comp: bool,
+    pub corner_flow_comp_ratio: f32,
     pub emit_exclude_object: bool,
     pub emit_thumbnails: bool,
     pub start_gcode_template: String,
@@ -196,6 +200,10 @@ impl PrinterPreset {
             max_stepper_speed_mms: cfg.gcode.max_stepper_speed_mms,
             z_travel_penalty: cfg.gcode.z_travel_penalty,
             gcode_dialect: cfg.gcode.gcode_dialect,
+            enable_dynamic_pa: cfg.gcode.enable_dynamic_pa,
+            enable_slicer_pa_subdivision: cfg.gcode.enable_slicer_pa_subdivision,
+            enable_corner_flow_comp: cfg.gcode.enable_corner_flow_comp,
+            corner_flow_comp_ratio: cfg.gcode.corner_flow_comp_ratio,
             emit_exclude_object: cfg.gcode.emit_exclude_object,
             emit_thumbnails: cfg.gcode.emit_thumbnails,
             start_gcode_template: cfg.gcode.start_gcode_template.clone(),
@@ -242,6 +250,10 @@ impl PrinterPreset {
         cfg.gcode.max_stepper_speed_mms = self.max_stepper_speed_mms;
         cfg.gcode.z_travel_penalty = self.z_travel_penalty;
         cfg.gcode.gcode_dialect = self.gcode_dialect;
+        cfg.gcode.enable_dynamic_pa = self.enable_dynamic_pa;
+        cfg.gcode.enable_slicer_pa_subdivision = self.enable_slicer_pa_subdivision;
+        cfg.gcode.enable_corner_flow_comp = self.enable_corner_flow_comp;
+        cfg.gcode.corner_flow_comp_ratio = self.corner_flow_comp_ratio;
         cfg.gcode.emit_exclude_object = self.emit_exclude_object;
         cfg.gcode.emit_thumbnails = self.emit_thumbnails;
         cfg.gcode.start_gcode_template = self.start_gcode_template.clone();
@@ -321,6 +333,10 @@ impl PrinterPreset {
             && approx_eq(self.max_stepper_speed_mms, cfg.gcode.max_stepper_speed_mms)
             && approx_eq(self.z_travel_penalty, cfg.gcode.z_travel_penalty)
             && self.gcode_dialect == cfg.gcode.gcode_dialect
+            && self.enable_dynamic_pa == cfg.gcode.enable_dynamic_pa
+            && self.enable_slicer_pa_subdivision == cfg.gcode.enable_slicer_pa_subdivision
+            && self.enable_corner_flow_comp == cfg.gcode.enable_corner_flow_comp
+            && approx_eq(self.corner_flow_comp_ratio, cfg.gcode.corner_flow_comp_ratio)
             && self.emit_exclude_object == cfg.gcode.emit_exclude_object
             && self.emit_thumbnails == cfg.gcode.emit_thumbnails
             && self.start_gcode_template == cfg.gcode.start_gcode_template
@@ -558,17 +574,13 @@ pub struct FilamentPreset {
     pub max_fan_speed_percent: f32,
     pub target_layer_cooling_time_s: f32,
 
-    // Non-Newtonian Rheology, Dynamic Pressure Advance, Die Swell & Ooze Relaxation
-    pub enable_dynamic_pa: bool,
-    pub enable_slicer_pa_subdivision: bool,
+    // Non-Newtonian Rheology, Pressure Advance, Die Swell & Ooze Relaxation
     pub pa_low_flow_s: f32,
     pub pa_high_flow_s: f32,
     pub pa_ref_low_flow_mm3s: f32,
     pub pa_ref_high_flow_mm3s: f32,
     pub swell_low: f32,
     pub swell_high: f32,
-    pub enable_corner_flow_comp: bool,
-    pub corner_flow_comp_ratio: f32,
     pub enable_transient_pressure_comp: bool,
     pub transient_pressure_exponent: f32,
     pub transient_min_flow_multiplier: f32,
@@ -622,16 +634,12 @@ impl FilamentPreset {
             min_fan_speed_percent: cfg.gcode.min_fan_speed_percent,
             max_fan_speed_percent: cfg.gcode.max_fan_speed_percent,
             target_layer_cooling_time_s: cfg.gcode.target_layer_cooling_time_s,
-            enable_dynamic_pa: cfg.gcode.enable_dynamic_pa,
-            enable_slicer_pa_subdivision: cfg.gcode.enable_slicer_pa_subdivision,
             pa_low_flow_s: cfg.gcode.pa_low_flow_s,
             pa_high_flow_s: cfg.gcode.pa_high_flow_s,
             pa_ref_low_flow_mm3s: cfg.gcode.pa_ref_low_flow_mm3s,
             pa_ref_high_flow_mm3s: cfg.gcode.pa_ref_high_flow_mm3s,
             swell_low: cfg.gcode.swell_low,
             swell_high: cfg.gcode.swell_high,
-            enable_corner_flow_comp: cfg.gcode.enable_corner_flow_comp,
-            corner_flow_comp_ratio: cfg.gcode.corner_flow_comp_ratio,
             enable_transient_pressure_comp: cfg.gcode.enable_transient_pressure_comp,
             transient_pressure_exponent: cfg.gcode.transient_pressure_exponent,
             transient_min_flow_multiplier: cfg.gcode.transient_min_flow_multiplier,
@@ -686,16 +694,12 @@ impl FilamentPreset {
         cfg.gcode.min_fan_speed_percent = self.min_fan_speed_percent;
         cfg.gcode.max_fan_speed_percent = self.max_fan_speed_percent;
         cfg.gcode.target_layer_cooling_time_s = self.target_layer_cooling_time_s;
-        cfg.gcode.enable_dynamic_pa = self.enable_dynamic_pa;
-        cfg.gcode.enable_slicer_pa_subdivision = self.enable_slicer_pa_subdivision;
         cfg.gcode.pa_low_flow_s = self.pa_low_flow_s;
         cfg.gcode.pa_high_flow_s = self.pa_high_flow_s;
         cfg.gcode.pa_ref_low_flow_mm3s = self.pa_ref_low_flow_mm3s;
         cfg.gcode.pa_ref_high_flow_mm3s = self.pa_ref_high_flow_mm3s;
         cfg.gcode.swell_low = self.swell_low;
         cfg.gcode.swell_high = self.swell_high;
-        cfg.gcode.enable_corner_flow_comp = self.enable_corner_flow_comp;
-        cfg.gcode.corner_flow_comp_ratio = self.corner_flow_comp_ratio;
         cfg.gcode.enable_transient_pressure_comp = self.enable_transient_pressure_comp;
         cfg.gcode.transient_pressure_exponent = self.transient_pressure_exponent;
         cfg.gcode.transient_min_flow_multiplier = self.transient_min_flow_multiplier;
@@ -761,16 +765,12 @@ impl FilamentPreset {
                 self.target_layer_cooling_time_s,
                 cfg.gcode.target_layer_cooling_time_s,
             )
-            && self.enable_dynamic_pa == cfg.gcode.enable_dynamic_pa
-            && self.enable_slicer_pa_subdivision == cfg.gcode.enable_slicer_pa_subdivision
             && approx_eq(self.pa_low_flow_s, cfg.gcode.pa_low_flow_s)
             && approx_eq(self.pa_high_flow_s, cfg.gcode.pa_high_flow_s)
             && approx_eq(self.pa_ref_low_flow_mm3s, cfg.gcode.pa_ref_low_flow_mm3s)
             && approx_eq(self.pa_ref_high_flow_mm3s, cfg.gcode.pa_ref_high_flow_mm3s)
             && approx_eq(self.swell_low, cfg.gcode.swell_low)
             && approx_eq(self.swell_high, cfg.gcode.swell_high)
-            && self.enable_corner_flow_comp == cfg.gcode.enable_corner_flow_comp
-            && approx_eq(self.corner_flow_comp_ratio, cfg.gcode.corner_flow_comp_ratio)
             && self.enable_transient_pressure_comp == cfg.gcode.enable_transient_pressure_comp
             && approx_eq(
                 self.transient_pressure_exponent,
@@ -2202,6 +2202,16 @@ mod tests {
         // Reverting Printer restores the factory value
         assert!(lib.revert_selected(PresetCategory::Printer, &mut cfg));
         assert!((cfg.bed.width_x - 256.0).abs() < 1.0e-4);
+        assert!(!lib.is_category_modified(PresetCategory::Printer, &cfg));
+
+        // Dynamic PA emission & SCV Corner Flow Compensation belong to Printer, not Filament
+        cfg.gcode.enable_dynamic_pa = false;
+        cfg.gcode.enable_corner_flow_comp = false;
+        assert!(lib.is_category_modified(PresetCategory::Printer, &cfg));
+        assert!(!lib.is_category_modified(PresetCategory::Filament, &cfg));
+        assert!(lib.revert_selected(PresetCategory::Printer, &mut cfg));
+        assert!(cfg.gcode.enable_dynamic_pa);
+        assert!(cfg.gcode.enable_corner_flow_comp);
         assert!(!lib.is_category_modified(PresetCategory::Printer, &cfg));
 
         // Switching to a built-in Filament preset updates temperatures, density, and cooling

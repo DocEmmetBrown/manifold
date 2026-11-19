@@ -4861,6 +4861,26 @@ fn render_printer_config_tab(
                 .changed();
             param_help_button(ui, "gcode.minimum_cruise_ratio");
         });
+        ui.horizontal_wrapped(|ui| {
+            dirty_gcode |= ui
+                .checkbox(
+                    &mut gc.enable_corner_flow_comp,
+                    "Klipper SCV Corner Flow Compensation",
+                )
+                .changed();
+            param_help_button(ui, "gcode.corner_flow_comp");
+        });
+        if gc.enable_corner_flow_comp {
+            ui.horizontal(|ui| {
+                dirty_gcode |= ui
+                    .add(
+                        egui::Slider::new(&mut gc.corner_flow_comp_ratio, 0.0..=1.0)
+                            .text("Corner Deduction Ratio"),
+                    )
+                    .changed();
+                param_help_button(ui, "gcode.corner_flow_comp");
+            });
+        }
         ui.horizontal(|ui| {
             dirty_gcode |= ui
                 .checkbox(
@@ -4910,6 +4930,27 @@ fn render_printer_config_tab(
                     .changed();
             }
             param_help_button(ui, "gcode.gcode_dialect");
+        });
+        ui.horizontal_wrapped(|ui| {
+            let dyn_pa_label = match gc.gcode_dialect {
+                GcodeDialect::Klipper => "Emit Dynamic SET_PRESSURE_ADVANCE Commands",
+                GcodeDialect::Prusa | GcodeDialect::RepRapFirmware => {
+                    "Emit Dynamic M572 Pressure Advance Commands"
+                }
+            };
+            dirty_gcode |= ui
+                .checkbox(&mut gc.enable_dynamic_pa, dyn_pa_label)
+                .changed();
+            param_help_button(ui, "gcode.enable_dynamic_pa");
+        });
+        ui.horizontal_wrapped(|ui| {
+            dirty_gcode |= ui
+                .checkbox(
+                    &mut gc.enable_slicer_pa_subdivision,
+                    "Slicer-Side Trapezoidal PA Subdivision",
+                )
+                .changed();
+            param_help_button(ui, "gcode.enable_slicer_pa_subdivision");
         });
         ui.horizontal_wrapped(|ui| {
             let exclude_label = match gc.gcode_dialect {
@@ -7605,44 +7646,6 @@ fn render_filament_config_tab(
             gc_changed = true;
         }
 
-        ui.horizontal(|ui| {
-            gc_changed |= ui
-                .checkbox(
-                    &mut gc.enable_dynamic_pa,
-                    "Emit Dynamic M572 / SET_PRESSURE_ADVANCE",
-                )
-                .changed();
-            param_help_button(ui, "gcode.enable_dynamic_pa");
-        });
-        ui.horizontal(|ui| {
-            gc_changed |= ui
-                .checkbox(
-                    &mut gc.enable_slicer_pa_subdivision,
-                    "Slicer-Side Trapezoidal PA Subdivision",
-                )
-                .changed();
-            param_help_button(ui, "gcode.enable_slicer_pa_subdivision");
-        });
-        ui.horizontal(|ui| {
-            gc_changed |= ui
-                .checkbox(
-                    &mut gc.enable_corner_flow_comp,
-                    "Klipper SCV Corner Flow Compensation",
-                )
-                .changed();
-            param_help_button(ui, "gcode.corner_flow_comp");
-        });
-        if gc.enable_corner_flow_comp {
-            ui.horizontal(|ui| {
-                gc_changed |= ui
-                    .add(
-                        egui::Slider::new(&mut gc.corner_flow_comp_ratio, 0.0..=1.0)
-                            .text("Corner Deduction Ratio"),
-                    )
-                    .changed();
-                param_help_button(ui, "gcode.corner_flow_comp");
-            });
-        }
         ui.horizontal_wrapped(|ui| {
             gc_changed |= ui
                 .checkbox(
