@@ -1574,14 +1574,20 @@ pub fn execute_headless_slice(opts: &SliceCommandOptions) -> Result<HeadlessSlic
                     let _ = fs::create_dir_all(parent);
                 }
             }
-            fs::write(&out_dest, gcode_text.as_bytes()).map_err(|e| {
+            let out_lower = out_dest.to_string_lossy().to_ascii_lowercase();
+            let written_bytes = if out_lower.ends_with(".3mf") {
+                crate::io::threemf::build_bambu_gcode_3mf_bytes(&gcode_text, Some(&config))?
+            } else {
+                gcode_text.into_bytes()
+            };
+            fs::write(&out_dest, &written_bytes).map_err(|e| {
                 format!("Failed to write G-code to '{}': {e}", out_dest.display())
             })?;
             if !opts.quiet {
                 eprintln!(
                     "[Manifold CLI] Wrote {} ({:.1} KB, est. {}, {:.2} m / {:.1} g filament)",
                     out_dest.display(),
-                    (gcode_text.len() as f64) / 1024.0,
+                    (written_bytes.len() as f64) / 1024.0,
                     format_moonraker_estimated_time(summary.total_time_s),
                     summary.total_filament_mm / 1000.0,
                     summary.total_filament_grams
@@ -1845,6 +1851,9 @@ fn combine_planned_objects_into_plate_gcode(
                     "M486 T{} ; RepRapFirmware object cancellation count\n",
                     planned_objects.len()
                 ));
+            }
+            crate::config::GcodeDialect::BambuLab => {
+                out.push_str("M624 ; Bambu Lab object cancellation marker\n");
             }
         }
     }

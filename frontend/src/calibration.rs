@@ -1155,6 +1155,9 @@ fn finalize_calibration_gcode_result(
             GcodeDialect::RepRapFirmware => {
                 gcode.push_str("M486 T1 ; RepRapFirmware object cancellation count\n");
             }
+            GcodeDialect::BambuLab => {
+                gcode.push_str("M624 ; Bambu Lab object cancellation marker\n");
+            }
         }
     }
 
@@ -1193,6 +1196,16 @@ fn finalize_calibration_gcode_result(
                     basis.nozzle_temp_c,
                     basis.tool_id,
                     basis.tool_name,
+                    basis.tool_id,
+                ));
+            }
+            GcodeDialect::BambuLab => {
+                gcode.push_str(&format!(
+                    "M620 S{}A\nT{} ; Select calibration AMS slot ({})\nM109 S{:.0}\nM621 S{}A\n",
+                    basis.tool_id,
+                    basis.tool_id,
+                    basis.tool_name,
+                    basis.nozzle_temp_c,
                     basis.tool_id,
                 ));
             }
@@ -1246,6 +1259,11 @@ fn finalize_calibration_gcode_result(
                 }
                 GcodeDialect::RepRapFirmware => {
                     gcode.push_str(&format!("M486 S0 A\"{exclude_object_name}\"\n"));
+                }
+                GcodeDialect::BambuLab => {
+                    gcode.push_str(&format!(
+                        "; printing object {exclude_object_name} id:0 copy 0\nM624 S0\n"
+                    ));
                 }
             }
         }
@@ -1429,6 +1447,11 @@ fn finalize_calibration_gcode_result(
                 }
                 GcodeDialect::RepRapFirmware => {
                     gcode.push_str("M486 S-1\n");
+                }
+                GcodeDialect::BambuLab => {
+                    gcode.push_str(&format!(
+                        "M625\n; stop printing object {exclude_object_name} id:0 copy 0\n"
+                    ));
                 }
             }
         }

@@ -46,6 +46,10 @@ impl MoonrakerConnectionReport {
                 "Connected{host_part}: PrusaLink FW {}, State '{}'{}",
                 self.moonraker_version, self.klippy_state, msg_part
             ),
+            PrinterNetworkProtocol::BambuLan => format!(
+                "Connected{host_part}: Bambu LAN ({}) State '{}'{}",
+                self.moonraker_version, self.klippy_state, msg_part
+            ),
         }
     }
 }
@@ -1172,10 +1176,13 @@ pub fn test_prusalink_connection(
     ))
 }
 
-/// Tests connectivity to the configured printer (`Moonraker` or `PrusaLink`) without uploading or printing anything.
+/// Tests connectivity to the configured printer (`Moonraker`, `PrusaLink`, or `BambuLan`) without uploading or printing anything.
 pub fn test_moonraker_connection(
     cfg: &MoonrakerNetworkConfig,
 ) -> Result<MoonrakerConnectionReport, String> {
+    if cfg.protocol == PrinterNetworkProtocol::BambuLan {
+        return test_bambu_lan_connection(cfg);
+    }
     if cfg.protocol == PrinterNetworkProtocol::PrusaLink {
         return test_prusalink_connection(cfg);
     }
@@ -1537,7 +1544,7 @@ pub fn query_prusalink_print_status(
     (parsed, cached_metadata)
 }
 
-/// Queries Moonraker or PrusaLink for live print status.
+/// Queries Moonraker, PrusaLink, or Bambu LAN for live print status.
 pub fn query_moonraker_print_status(
     cfg: &MoonrakerNetworkConfig,
     cached_metadata: Option<(String, Option<f64>)>,
@@ -1545,6 +1552,9 @@ pub fn query_moonraker_print_status(
     Result<MoonrakerPrintStatus, String>,
     Option<(String, Option<f64>)>,
 ) {
+    if cfg.protocol == PrinterNetworkProtocol::BambuLan {
+        return query_bambu_lan_print_status(cfg, cached_metadata);
+    }
     if cfg.protocol == PrinterNetworkProtocol::PrusaLink {
         return query_prusalink_print_status(cfg, cached_metadata);
     }
@@ -1777,14 +1787,17 @@ pub fn upload_gcode_to_prusalink(
     Err(format_prusalink_http_error(put_status, cfg, &put_url, &body))
 }
 
-/// Uploads G-code to a Moonraker (`POST /server/files/upload`) or PrusaLink (`PUT /api/v1/files/{storage}/{path}`)
-/// printer and optionally starts printing immediately (`start_print = true`).
+/// Uploads G-code to a Moonraker (`POST /server/files/upload`), PrusaLink (`PUT /api/v1/files/{storage}/{path}`),
+/// or Bambu Lab LAN Mode (`FTPS :990` `.gcode.3mf` + `MQTT-TLS :8883` `project_file`) printer and optionally starts printing immediately (`start_print = true`).
 pub fn upload_gcode_to_moonraker(
     cfg: &MoonrakerNetworkConfig,
     filename: &str,
     gcode_text: String,
     start_print: bool,
 ) -> Result<MoonrakerUploadReport, String> {
+    if cfg.protocol == PrinterNetworkProtocol::BambuLan {
+        return upload_gcode_to_bambu_lan(cfg, filename, gcode_text, start_print);
+    }
     if cfg.protocol == PrinterNetworkProtocol::PrusaLink {
         return upload_gcode_to_prusalink(cfg, filename, gcode_text, start_print);
     }
@@ -1843,6 +1856,781 @@ pub fn upload_gcode_to_moonraker(
     Ok(MoonrakerUploadReport {
         protocol: PrinterNetworkProtocol::Moonraker,
         remote_path,
+        bytes_uploaded,
+        print_started: start_print,
+    })
+}
+
+// ============================================================================
+// Bambu Lab LAN Mode Support (Implicit FTPS :990 + MQTT v3.1.1 over TLS :8883)
+// ============================================================================
+
+/// TLS server certificate verifier that accepts Bambu Lab printers' self-signed device certificates
+/// on the local LAN (`BambuLab` CA / per-printer self-signed X.509 certificates on ports 990 and 8883).
+#[derive(Debug)]
+struct BambuLanSelfSignedCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for BambuLanSelfSignedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn build_bambu_lan_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("default TLS protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(BambuLanSelfSignedCertVerifier))
+        .with_no_client_auth();
+    // Enable TLS session resumption so implicit FTPS data channels on Bambu vsftpd reuse the control session
+    cfg.resumption = rustls::client::Resumption::in_memory_sessions(32);
+    std::sync::Arc::new(cfg)
+}
+
+/// Extracts `(host, optional_port)` from `cfg.printer_uri` for Bambu Lab LAN Mode.
+pub fn parse_bambu_lan_host_and_port(raw_uri: &str, default_port: u16) -> Result<(String, u16), String> {
+    let trimmed = raw_uri.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(
+            "Bambu Lab Printer IP/Host is empty. Enter the printer's LAN IP address (e.g. 192.168.1.50)."
+                .to_string(),
+        );
+    }
+    let without_scheme = trimmed
+        .strip_prefix("ftps://")
+        .or_else(|| trimmed.strip_prefix("mqtts://"))
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme).trim();
+    if host_port.is_empty() {
+        return Err("Bambu Lab Printer IP/Host is empty.".to_string());
+    }
+    if let Some((h, p_str)) = host_port.rsplit_once(':') {
+        if !h.contains(':') {
+            if let Ok(p) = p_str.parse::<u16>() {
+                return Ok((h.trim().to_string(), p));
+            }
+        }
+    }
+    Ok((host_port.to_string(), default_port))
+}
+
+fn connect_bambu_tls_stream(
+    host: &str,
+    port: u16,
+    tls_cfg: std::sync::Arc<rustls::ClientConfig>,
+    timeout: Duration,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, String> {
+    let mut addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("Failed to resolve Bambu printer host '{host}:{port}': {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("Could not resolve any IP address for '{host}:{port}'"));
+    }
+    addrs.sort_by_key(|a| a.is_ipv6());
+
+    let mut last_err = None;
+    let mut tcp_opt = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+            Ok(s) => {
+                let _ = s.set_read_timeout(Some(timeout));
+                let _ = s.set_write_timeout(Some(timeout));
+                let _ = s.set_nodelay(true);
+                tcp_opt = Some(s);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let tcp = tcp_opt.ok_or_else(|| {
+        format!(
+            "Failed to connect to Bambu printer at {host}:{port}: {}",
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unreachable".to_string())
+        )
+    })?;
+
+    let server_name = rustls_pki_types::ServerName::try_from(host.to_string())
+        .or_else(|_| rustls_pki_types::ServerName::try_from("bambulab.local".to_string()))
+        .expect("valid fallback server name");
+    let conn = rustls::ClientConnection::new(tls_cfg, server_name)
+        .map_err(|e| format!("Failed to initialize TLS session to {host}:{port}: {e}"))?;
+    Ok(rustls::StreamOwned::new(conn, tcp))
+}
+
+/// Reads an FTP response status code (e.g. `220`, `331`, `230`, `227`, `150`, `226`) and full message text
+/// from a buffered FTP control stream, handling multi-line (`XYZ-...` to `XYZ ...`) replies.
+fn read_ftp_response<R: std::io::BufRead>(reader: &mut R) -> Result<(u16, String), String> {
+    let mut full_msg = String::new();
+    let mut expected_code: Option<u16> = None;
+    loop {
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("FTPS control channel read error: {e}"))?;
+        if n == 0 {
+            return Err(format!(
+                "FTPS server closed control connection unexpectedly (received: '{}')",
+                full_msg.trim()
+            ));
+        }
+        full_msg.push_str(&line);
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.len() >= 3 {
+            if let Ok(code) = trimmed[..3].parse::<u16>() {
+                let sep = trimmed.as_bytes().get(3).copied().unwrap_or(b' ');
+                if expected_code.is_none() {
+                    if sep == b' ' {
+                        return Ok((code, full_msg));
+                    } else if sep == b'-' {
+                        expected_code = Some(code);
+                    }
+                } else if expected_code == Some(code) && sep == b' ' {
+                    return Ok((code, full_msg));
+                }
+            }
+        }
+    }
+}
+
+fn send_ftp_command<S: std::io::Read + std::io::Write>(
+    reader: &mut std::io::BufReader<S>,
+    cmd: &str,
+) -> Result<(u16, String), String> {
+    let line = format!("{cmd}\r\n");
+    reader
+        .get_mut()
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("FTPS write error sending '{}': {e}", cmd.split_whitespace().next().unwrap_or("")))?;
+    reader
+        .get_mut()
+        .flush()
+        .map_err(|e| format!("FTPS flush error: {e}"))?;
+    read_ftp_response(reader)
+}
+
+/// Parses an FTP `227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)` response to extract the passive data port.
+pub fn parse_ftp_pasv_port(resp: &str) -> Result<u16, String> {
+    let start = resp
+        .find('(')
+        .ok_or_else(|| format!("Malformed FTPS PASV response (missing '('): {}", resp.trim()))?;
+    let end = resp[start..]
+        .find(')')
+        .map(|i| start + i)
+        .ok_or_else(|| format!("Malformed FTPS PASV response (missing ')'): {}", resp.trim()))?;
+    let nums: Vec<u16> = resp[start + 1..end]
+        .split(',')
+        .filter_map(|t| t.trim().parse::<u16>().ok())
+        .collect();
+    if nums.len() < 6 {
+        return Err(format!("Malformed FTPS PASV address tuple: {}", resp.trim()));
+    }
+    Ok((nums[4] << 8) | (nums[5] & 0xFF))
+}
+
+/// Uploads `file_bytes` to a Bambu Lab printer over implicit FTPS (port 990 by default)
+/// authenticating as `bblp` + `<8-char Access Code>`.
+pub fn upload_bytes_to_bambu_ftps(
+    cfg: &MoonrakerNetworkConfig,
+    remote_filename: &str,
+    file_bytes: &[u8],
+) -> Result<String, String> {
+    use std::io::Write as _;
+    let (host, port) = parse_bambu_lan_host_and_port(&cfg.printer_uri, 990)?;
+    let access_code = cfg.effective_bambu_access_code();
+    if access_code.is_empty() {
+        return Err(
+            "Bambu Lab Access Code is empty. Enter the 8-character LAN Access Code from the printer screen (Settings -> LAN Only Mode)."
+                .to_string(),
+        );
+    }
+    let username = cfg.effective_bambu_username();
+    let tls_cfg = build_bambu_lan_tls_config();
+
+    let ctrl_stream = connect_bambu_tls_stream(&host, port, tls_cfg.clone(), Duration::from_secs(20))?;
+    let mut ctrl_reader = std::io::BufReader::new(ctrl_stream);
+
+    // 1. Read 220 greeting
+    let (greet_code, greet_msg) = read_ftp_response(&mut ctrl_reader)?;
+    if greet_code != 220 {
+        return Err(format!("Bambu FTPS unexpected greeting ({greet_code}): {}", greet_msg.trim()));
+    }
+
+    // 2. Authenticate USER bblp / PASS <access_code>
+    let (u_code, u_msg) = send_ftp_command(&mut ctrl_reader, &format!("USER {username}"))?;
+    if u_code == 331 {
+        let (p_code, p_msg) = send_ftp_command(&mut ctrl_reader, &format!("PASS {access_code}"))?;
+        if p_code != 230 {
+            return Err(format!(
+                "Bambu FTPS authentication failed ({p_code}): {}. Check the 8-character LAN Access Code.",
+                p_msg.trim()
+            ));
+        }
+    } else if u_code != 230 {
+        return Err(format!("Bambu FTPS USER rejected ({u_code}): {}", u_msg.trim()));
+    }
+
+    // 3. Negotiate TLS data channel protection (PBSZ 0, PROT P, TYPE I, PASV)
+    let _ = send_ftp_command(&mut ctrl_reader, "PBSZ 0")?;
+    let _ = send_ftp_command(&mut ctrl_reader, "PROT P")?;
+    let (t_code, t_msg) = send_ftp_command(&mut ctrl_reader, "TYPE I")?;
+    if t_code != 200 {
+        return Err(format!("Bambu FTPS TYPE I failed ({t_code}): {}", t_msg.trim()));
+    }
+
+    let (pasv_code, pasv_msg) = send_ftp_command(&mut ctrl_reader, "PASV")?;
+    if pasv_code != 227 {
+        return Err(format!("Bambu FTPS PASV failed ({pasv_code}): {}", pasv_msg.trim()));
+    }
+    let data_port = parse_ftp_pasv_port(&pasv_msg)?;
+
+    // 4. Issue STOR and open implicit TLS data stream (reusing TLS session cache)
+    let clean_name = remote_filename.trim_start_matches('/');
+    let (stor_code, stor_msg) = send_ftp_command(&mut ctrl_reader, &format!("STOR {clean_name}"))?;
+    if stor_code != 150 && stor_code != 125 {
+        return Err(format!(
+            "Bambu FTPS STOR '{clean_name}' rejected ({stor_code}): {}",
+            stor_msg.trim()
+        ));
+    }
+
+    {
+        let mut data_stream =
+            connect_bambu_tls_stream(&host, data_port, tls_cfg, Duration::from_secs(90))?;
+        data_stream
+            .write_all(file_bytes)
+            .map_err(|e| format!("Bambu FTPS data transfer error: {e}"))?;
+        data_stream
+            .flush()
+            .map_err(|e| format!("Bambu FTPS data flush error: {e}"))?;
+        data_stream.conn.send_close_notify();
+        let _ = data_stream.conn.complete_io(&mut data_stream.sock);
+    }
+
+    let (done_code, done_msg) = read_ftp_response(&mut ctrl_reader)?;
+    if done_code != 226 && done_code != 250 {
+        return Err(format!(
+            "Bambu FTPS transfer did not complete cleanly ({done_code}): {}",
+            done_msg.trim()
+        ));
+    }
+    let _ = send_ftp_command(&mut ctrl_reader, "QUIT");
+    Ok(clean_name.to_string())
+}
+
+// ============================================================================
+// Pure-Rust MQTT v3.1.1 over TLS (:8883) Client for Bambu Lab LAN Mode
+// ============================================================================
+
+fn encode_mqtt_var_len(mut len: usize, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (len % 128) as u8;
+        len /= 128;
+        if len > 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if len == 0 {
+            break;
+        }
+    }
+}
+
+fn encode_mqtt_utf8(s: &str, out: &mut Vec<u8>) {
+    let bytes = s.as_bytes();
+    let len = bytes.len().min(u16::MAX as usize) as u16;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&bytes[..len as usize]);
+}
+
+fn build_mqtt_connect_packet(client_id: &str, username: &str, password: &str) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(128);
+    // Protocol Name "MQTT", Level 4 (v3.1.1)
+    encode_mqtt_utf8("MQTT", &mut payload);
+    payload.push(4);
+    // Connect Flags: Username (0x80) | Password (0x40) | Clean Session (0x02) = 0xC2
+    payload.push(0xC2);
+    // Keep Alive = 30 seconds
+    payload.extend_from_slice(&30u16.to_be_bytes());
+    encode_mqtt_utf8(client_id, &mut payload);
+    encode_mqtt_utf8(username, &mut payload);
+    encode_mqtt_utf8(password, &mut payload);
+
+    let mut pkt = Vec::with_capacity(payload.len() + 5);
+    pkt.push(0x10); // CONNECT
+    encode_mqtt_var_len(payload.len(), &mut pkt);
+    pkt.extend_from_slice(&payload);
+    pkt
+}
+
+fn build_mqtt_subscribe_packet(packet_id: u16, topic: &str) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(topic.len() + 6);
+    payload.extend_from_slice(&packet_id.to_be_bytes());
+    encode_mqtt_utf8(topic, &mut payload);
+    payload.push(0x00); // QoS 0
+
+    let mut pkt = Vec::with_capacity(payload.len() + 5);
+    pkt.push(0x82); // SUBSCRIBE
+    encode_mqtt_var_len(payload.len(), &mut pkt);
+    pkt.extend_from_slice(&payload);
+    pkt
+}
+
+fn build_mqtt_publish_packet(topic: &str, message_bytes: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(topic.len() + 2 + message_bytes.len());
+    encode_mqtt_utf8(topic, &mut payload);
+    payload.extend_from_slice(message_bytes);
+
+    let mut pkt = Vec::with_capacity(payload.len() + 5);
+    pkt.push(0x30); // PUBLISH QoS 0
+    encode_mqtt_var_len(payload.len(), &mut pkt);
+    pkt.extend_from_slice(&payload);
+    pkt
+}
+
+fn read_mqtt_packet<R: std::io::Read>(reader: &mut R) -> Result<(u8, Vec<u8>), String> {
+    let mut hdr = [0u8; 1];
+    reader
+        .read_exact(&mut hdr)
+        .map_err(|e| format!("MQTT read header error: {e}"))?;
+    let pkt_type = hdr[0];
+
+    let mut mult: usize = 1;
+    let mut rem_len: usize = 0;
+    loop {
+        let mut b = [0u8; 1];
+        reader
+            .read_exact(&mut b)
+            .map_err(|e| format!("MQTT read length error: {e}"))?;
+        rem_len += ((b[0] & 0x7F) as usize) * mult;
+        if (b[0] & 0x80) == 0 {
+            break;
+        }
+        mult *= 128;
+        if mult > 128 * 128 * 128 {
+            return Err("Malformed MQTT variable length".to_string());
+        }
+    }
+
+    let mut body = vec![0u8; rem_len];
+    if rem_len > 0 {
+        reader
+            .read_exact(&mut body)
+            .map_err(|e| format!("MQTT read body error: {e}"))?;
+    }
+    Ok((pkt_type, body))
+}
+
+/// Parses a Bambu Lab MQTT `device/<SERIAL>/report` JSON payload (`{"print": {...}}`)
+/// into `MoonrakerPrintStatus`.
+pub fn parse_bambu_mqtt_report_json(report_json: &Value) -> Option<MoonrakerPrintStatus> {
+    let print_obj = report_json.get("print").unwrap_or(report_json);
+    if !print_obj.is_object() {
+        return None;
+    }
+
+    let gcode_state = print_obj
+        .get("gcode_state")
+        .and_then(Value::as_str)
+        .unwrap_or("IDLE");
+    let state = match gcode_state.trim().to_ascii_uppercase().as_str() {
+        "RUNNING" | "PREPARE" => "printing".to_string(),
+        "PAUSE" => "paused".to_string(),
+        "FINISH" => "complete".to_string(),
+        "FAILED" => "error".to_string(),
+        _ => "standby".to_string(),
+    };
+
+    let mc_percent = print_obj
+        .get("mc_percent")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let progress = if state == "complete" {
+        1.0
+    } else {
+        (mc_percent / 100.0).clamp(0.0, 1.0) as f32
+    };
+
+    // `mc_remaining_time` in Bambu MQTT reports is in minutes!
+    let rem_s = print_obj
+        .get("mc_remaining_time")
+        .and_then(Value::as_f64)
+        .filter(|&m| m >= 0.0)
+        .map(|mins| mins * 60.0);
+
+    let filename = print_obj
+        .get("subtask_name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| print_obj.get("gcode_file").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+
+    let mut msg_parts = Vec::new();
+    if let Some(t_noz) = print_obj.get("nozzle_temper").and_then(Value::as_f64) {
+        if let Some(tgt_noz) = print_obj
+            .get("nozzle_target_temper")
+            .and_then(Value::as_f64)
+            .filter(|&t| t > 0.5)
+        {
+            msg_parts.push(format!("Nozzle {t_noz:.0}/{tgt_noz:.0}°C"));
+        } else {
+            msg_parts.push(format!("Nozzle {t_noz:.0}°C"));
+        }
+    }
+    if let Some(t_bed) = print_obj.get("bed_temper").and_then(Value::as_f64) {
+        if let Some(tgt_bed) = print_obj
+            .get("bed_target_temper")
+            .and_then(Value::as_f64)
+            .filter(|&t| t > 0.5)
+        {
+            msg_parts.push(format!("Bed {t_bed:.0}/{tgt_bed:.0}°C"));
+        } else {
+            msg_parts.push(format!("Bed {t_bed:.0}°C"));
+        }
+    }
+    if let (Some(cur_l), Some(tot_l)) = (
+        print_obj.get("layer_num").and_then(Value::as_u64),
+        print_obj
+            .get("total_layer_num")
+            .and_then(Value::as_u64)
+            .filter(|&t| t > 0),
+    ) {
+        msg_parts.push(format!("Layer {cur_l}/{tot_l}"));
+    }
+
+    let est_total_s = match (rem_s, progress > 0.01 && progress < 0.999) {
+        (Some(r), true) => Some(r / (1.0 - progress as f64)),
+        _ => None,
+    };
+    let print_duration_s = match (est_total_s, rem_s) {
+        (Some(tot), Some(r)) => (tot - r).max(0.0),
+        _ => 0.0,
+    };
+
+    Some(MoonrakerPrintStatus {
+        state,
+        filename,
+        progress,
+        print_duration_s,
+        total_duration_s: print_duration_s,
+        slicer_estimated_time_s: est_total_s,
+        eta_remaining_s: if gcode_state.eq_ignore_ascii_case("RUNNING")
+            || gcode_state.eq_ignore_ascii_case("PAUSE")
+        {
+            rem_s
+        } else {
+            None
+        },
+        message: msg_parts.join(" | "),
+    })
+}
+
+/// Connects to the Bambu Lab printer's local MQTT-TLS broker (`:8883`), authenticates with
+/// `bblp` + Access Code, optionally publishes a command to `device/<SERIAL>/request`, and
+/// optionally reads status telemetry from `device/<SERIAL>/report`.
+fn run_bambu_mqtt_session(
+    cfg: &MoonrakerNetworkConfig,
+    publish_request_json: Option<&str>,
+    wait_for_report: bool,
+) -> Result<Option<MoonrakerPrintStatus>, String> {
+    use std::io::Write as _;
+    let (host, port) = parse_bambu_lan_host_and_port(&cfg.printer_uri, 8883)?;
+    let access_code = cfg.effective_bambu_access_code();
+    if access_code.is_empty() {
+        return Err(
+            "Bambu Lab Access Code is empty. Enter the 8-character LAN Access Code from the printer screen (Settings -> LAN Only Mode)."
+                .to_string(),
+        );
+    }
+    let username = cfg.effective_bambu_username();
+    let serial = cfg.serial_number.trim();
+    if (publish_request_json.is_some() || wait_for_report) && serial.is_empty() {
+        return Err(
+            "Bambu Lab Printer Serial Number is required for MQTT print start and live telemetry (e.g. 01P00A... or 00M00A... from the printer screen)."
+                .to_string(),
+        );
+    }
+
+    let tls_cfg = build_bambu_lan_tls_config();
+    let mut stream = connect_bambu_tls_stream(&host, port, tls_cfg, Duration::from_secs(6))?;
+
+    let client_id = format!("manifold2-{}", std::process::id());
+    let connect_pkt = build_mqtt_connect_packet(&client_id, username, access_code);
+    stream
+        .write_all(&connect_pkt)
+        .map_err(|e| format!("Bambu MQTT write CONNECT error: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("Bambu MQTT flush error: {e}"))?;
+
+    let (pkt_type, body) = read_mqtt_packet(&mut stream)?;
+    if (pkt_type & 0xF0) != 0x20 || body.len() < 2 {
+        return Err(format!("Unexpected Bambu MQTT CONNACK packet (0x{pkt_type:02x})"));
+    }
+    let return_code = body[1];
+    if return_code != 0 {
+        return Err(format!(
+            "Bambu MQTT authentication failed (CONNACK return code {return_code}). Verify the 8-character LAN Access Code."
+        ));
+    }
+
+    if !serial.is_empty() && wait_for_report {
+        let report_topic = format!("device/{serial}/report");
+        let sub_pkt = build_mqtt_subscribe_packet(1, &report_topic);
+        stream
+            .write_all(&sub_pkt)
+            .map_err(|e| format!("Bambu MQTT SUBSCRIBE error: {e}"))?;
+        // Request a full `pushall` status snapshot
+        let req_topic = format!("device/{serial}/request");
+        let pushall_json = r#"{"pushing":{"sequence_id":"0","command":"pushall"}}"#;
+        let pub_pkt = build_mqtt_publish_packet(&req_topic, pushall_json.as_bytes());
+        let _ = stream.write_all(&pub_pkt);
+        let _ = stream.flush();
+    }
+
+    if let Some(req_json) = publish_request_json {
+        let req_topic = format!("device/{serial}/request");
+        let pub_pkt = build_mqtt_publish_packet(&req_topic, req_json.as_bytes());
+        stream
+            .write_all(&pub_pkt)
+            .map_err(|e| format!("Bambu MQTT PUBLISH request error: {e}"))?;
+        stream
+            .flush()
+            .map_err(|e| format!("Bambu MQTT flush request error: {e}"))?;
+    }
+
+    let mut latest_status = None;
+    if !serial.is_empty() && wait_for_report {
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < deadline {
+            match read_mqtt_packet(&mut stream) {
+                Ok((ptype, pbody)) => {
+                    if (ptype & 0xF0) == 0x30 && pbody.len() > 2 {
+                        let topic_len = u16::from_be_bytes([pbody[0], pbody[1]]) as usize;
+                        let qos = (ptype >> 1) & 0x03;
+                        let pkt_id_len = if qos > 0 { 2 } else { 0 };
+                        let payload_start = 2 + topic_len + pkt_id_len;
+                        if payload_start < pbody.len() {
+                            if let Ok(json_val) =
+                                serde_json::from_slice::<Value>(&pbody[payload_start..])
+                            {
+                                if json_val.get("print").is_some() {
+                                    if let Some(st) = parse_bambu_mqtt_report_json(&json_val) {
+                                        latest_status = Some(st);
+                                        if latest_status
+                                            .as_ref()
+                                            .is_some_and(|s| !s.message.is_empty() || s.progress > 0.0)
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    // Send MQTT DISCONNECT (0xE0, 0x00)
+    let _ = stream.write_all(&[0xE0, 0x00]);
+    let _ = stream.flush();
+    Ok(latest_status)
+}
+
+/// Builds the Bambu Lab MQTT `project_file` JSON command to start printing an uploaded `.gcode.3mf` archive.
+pub fn build_bambu_project_file_command_json(
+    remote_3mf_filename: &str,
+    subtask_name: &str,
+    use_ams: bool,
+    bed_leveling: bool,
+) -> String {
+    let clean_file = remote_3mf_filename.trim_start_matches('/');
+    let payload = serde_json::json!({
+        "print": {
+            "sequence_id": "1",
+            "command": "project_file",
+            "param": "Metadata/plate_1.gcode",
+            "project_id": "0",
+            "profile_id": "0",
+            "task_id": "0",
+            "subtask_id": "0",
+            "subtask_name": subtask_name,
+            "file": "",
+            "url": format!("ftp:///{clean_file}"),
+            "md5": "",
+            "timelapse": false,
+            "bed_type": "auto",
+            "bed_levelling": bed_leveling,
+            "bed_leveling": bed_leveling,
+            "flow_cali": false,
+            "vibration_cali": false,
+            "layer_inspect": false,
+            "ams_mapping": [0, 1, 2, 3],
+            "use_ams": use_ams
+        }
+    });
+    payload.to_string()
+}
+
+/// Tests Bambu Lab LAN connectivity:
+/// - Verifies MQTT-TLS (`:8883`) `CONNACK` authentication with `bblp` + Access Code
+/// - If `serial_number` is provided, subscribes to `device/<SERIAL>/report` and reads live temperatures & state
+pub fn test_bambu_lan_connection(
+    cfg: &MoonrakerNetworkConfig,
+) -> Result<MoonrakerConnectionReport, String> {
+    let (host, _) = parse_bambu_lan_host_and_port(&cfg.printer_uri, 8883)?;
+    let has_serial = !cfg.serial_number.trim().is_empty();
+    let status_opt = run_bambu_mqtt_session(cfg, None, has_serial)?;
+
+    let (state, msg) = if let Some(st) = status_opt {
+        (st.state, st.message)
+    } else if has_serial {
+        (
+            "ready".to_string(),
+            format!("SN {}", cfg.serial_number.trim()),
+        )
+    } else {
+        (
+            "authenticated".to_string(),
+            "Enter Serial Number for live MQTT status & print start".to_string(),
+        )
+    };
+
+    Ok(MoonrakerConnectionReport {
+        protocol: PrinterNetworkProtocol::BambuLan,
+        normalized_uri: format!("mqtts://{host}:8883"),
+        moonraker_version: "FTPS :990 + MQTT :8883".to_string(),
+        klippy_state: state,
+        hostname: host,
+        state_message: msg,
+    })
+}
+
+/// Queries live print status from a Bambu Lab printer via MQTT-TLS (`:8883`).
+pub fn query_bambu_lan_print_status(
+    cfg: &MoonrakerNetworkConfig,
+    cached_metadata: Option<(String, Option<f64>)>,
+) -> (
+    Result<MoonrakerPrintStatus, String>,
+    Option<(String, Option<f64>)>,
+) {
+    if cfg.serial_number.trim().is_empty() {
+        return (
+            Err("Enter Printer Serial Number for Bambu live status".to_string()),
+            cached_metadata,
+        );
+    }
+    match run_bambu_mqtt_session(cfg, None, true) {
+        Ok(Some(st)) => (Ok(st), cached_metadata),
+        Ok(None) => (
+            Ok(MoonrakerPrintStatus {
+                state: "standby".to_string(),
+                filename: String::new(),
+                progress: 0.0,
+                print_duration_s: 0.0,
+                total_duration_s: 0.0,
+                slicer_estimated_time_s: None,
+                eta_remaining_s: None,
+                message: format!("SN {}", cfg.serial_number.trim()),
+            }),
+            cached_metadata,
+        ),
+        Err(e) => (Err(e), cached_metadata),
+    }
+}
+
+/// Packages `gcode_text` into a Bambu Lab `.gcode.3mf` container (`Metadata/plate_1.gcode`,
+/// `Metadata/plate_1.gcode.md5`, `Metadata/slice_info.config`, `Metadata/plate_1.png`),
+/// uploads it over implicit FTPS (`:990`), and when `start_print == true`, publishes the
+/// `project_file` start command over MQTT-TLS (`:8883`).
+pub fn upload_gcode_to_bambu_lan(
+    cfg: &MoonrakerNetworkConfig,
+    filename: &str,
+    gcode_text: String,
+    start_print: bool,
+) -> Result<MoonrakerUploadReport, String> {
+    let basename = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("manifold2_print");
+    let stem = basename
+        .strip_suffix(".gcode.3mf")
+        .or_else(|| basename.strip_suffix(".3mf"))
+        .or_else(|| basename.strip_suffix(".gcode"))
+        .or_else(|| basename.strip_suffix(".nc"))
+        .unwrap_or(basename);
+    let remote_3mf_name = format!("{stem}.gcode.3mf");
+
+    let archive_bytes = crate::io::threemf::build_bambu_gcode_3mf_bytes(&gcode_text, None)?;
+    let bytes_uploaded = archive_bytes.len();
+
+    let uploaded_path = upload_bytes_to_bambu_ftps(cfg, &remote_3mf_name, &archive_bytes)?;
+
+    if start_print {
+        let cmd_json = build_bambu_project_file_command_json(
+            &uploaded_path,
+            stem,
+            cfg.bambu_use_ams,
+            cfg.bambu_bed_leveling,
+        );
+        run_bambu_mqtt_session(cfg, Some(&cmd_json), false)?;
+    }
+
+    Ok(MoonrakerUploadReport {
+        protocol: PrinterNetworkProtocol::BambuLan,
+        remote_path: uploaded_path,
         bytes_uploaded,
         print_started: start_print,
     })
@@ -2309,5 +3097,87 @@ mod tests {
         assert!(upload.summary_line().contains("to PrusaLink and started print"));
 
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_bambu_lan_parsing_ftps_pasv_mqtt_report_and_gcode_3mf_container() {
+        // 1. Host & port parsing
+        assert_eq!(
+            parse_bambu_lan_host_and_port("192.168.1.88", 990).unwrap(),
+            ("192.168.1.88".to_string(), 990)
+        );
+        assert_eq!(
+            parse_bambu_lan_host_and_port("ftps://192.168.1.88:9990/", 990).unwrap(),
+            ("192.168.1.88".to_string(), 9990)
+        );
+
+        // 2. FTPS PASV port parsing: (192,168,1,88,195,80) -> 195*256 + 80 = 50000
+        let pasv_port =
+            parse_ftp_pasv_port("227 Entering Passive Mode (192,168,1,88,195,80).\r\n").unwrap();
+        assert_eq!(pasv_port, 50000);
+
+        // 3. Bambu MQTT report JSON parsing
+        let report_json: Value = serde_json::from_str(
+            r#"{
+                "print": {
+                    "gcode_state": "RUNNING",
+                    "mc_percent": 60,
+                    "mc_remaining_time": 12,
+                    "subtask_name": "bambu_benchy",
+                    "nozzle_temper": 220.4,
+                    "nozzle_target_temper": 220.0,
+                    "bed_temper": 55.1,
+                    "bed_target_temper": 55.0,
+                    "layer_num": 150,
+                    "total_layer_num": 250
+                }
+            }"#,
+        )
+        .unwrap();
+        let status = parse_bambu_mqtt_report_json(&report_json).expect("Should parse Bambu MQTT report");
+        assert_eq!(status.state, "printing");
+        assert_eq!(status.filename, "bambu_benchy");
+        assert!((status.progress - 0.60).abs() < 1.0e-5);
+        assert_eq!(status.eta_remaining_s, Some(720.0)); // 12 minutes = 720s
+        assert!(status.message.contains("Nozzle 220/220°C"));
+        assert!(status.message.contains("Bed 55/55°C"));
+        assert!(status.message.contains("Layer 150/250"));
+
+        // 4. Bambu MQTT `project_file` command JSON generation
+        let cmd_str = build_bambu_project_file_command_json("part.gcode.3mf", "part", true, true);
+        let cmd_json: Value = serde_json::from_str(&cmd_str).unwrap();
+        let p = cmd_json.get("print").unwrap();
+        assert_eq!(p.get("command").and_then(Value::as_str), Some("project_file"));
+        assert_eq!(p.get("param").and_then(Value::as_str), Some("Metadata/plate_1.gcode"));
+        assert_eq!(p.get("url").and_then(Value::as_str), Some("ftp:///part.gcode.3mf"));
+        assert_eq!(p.get("use_ams").and_then(Value::as_bool), Some(true));
+
+        // 5. `.gcode.3mf` packaging and MD5 verification
+        let sample_gcode = "; generated by PrusaSlicer 2.8.0-Manifold2 on 2026-11-20\nG28\nG1 X10 Y10 Z0.2 E1.0 F3000\n; filament used [mm] = 1500.0\n; total filament used [g] = 4.50\n; estimated printing time (normal mode) = 12m 30s\n";
+        let archive_bytes =
+            crate::io::threemf::build_bambu_gcode_3mf_bytes(sample_gcode, None).unwrap();
+        let cursor = std::io::Cursor::new(archive_bytes);
+        let mut zip = zip::ZipArchive::new(cursor).expect("Valid .gcode.3mf zip");
+        let mut plate_gcode = String::new();
+        zip.by_name("Metadata/plate_1.gcode")
+            .expect("plate_1.gcode present")
+            .read_to_string(&mut plate_gcode)
+            .unwrap();
+        assert_eq!(plate_gcode, sample_gcode);
+
+        let mut plate_md5 = String::new();
+        zip.by_name("Metadata/plate_1.gcode.md5")
+            .expect("plate_1.gcode.md5 present")
+            .read_to_string(&mut plate_md5)
+            .unwrap();
+        assert_eq!(plate_md5, md5_hex(sample_gcode.as_bytes()));
+
+        let mut slice_info = String::new();
+        zip.by_name("Metadata/slice_info.config")
+            .expect("slice_info.config present")
+            .read_to_string(&mut slice_info)
+            .unwrap();
+        assert!(slice_info.contains("key=\"prediction\" value=\"750\""));
+        assert!(slice_info.contains("key=\"weight\" value=\"4.50\""));
     }
 }

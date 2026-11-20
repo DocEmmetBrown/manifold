@@ -2258,8 +2258,13 @@ pub fn ui_workspace_system(
                     } else {
                         "manifold2_calibration".to_string()
                     };
-                    let default_filename = format!("{stem}.gcode");
+                    let default_filename = if config.gcode.gcode_dialect == GcodeDialect::BambuLab {
+                        format!("{stem}.gcode.3mf")
+                    } else {
+                        format!("{stem}.gcode")
+                    };
                     let gcode_bytes = planned.gcode_text.clone();
+                    let cfg_snapshot = (*config).clone();
                     let total_moves =
                         planned.extruding_move_count + planned.travel_move_count;
                     plate.status_message =
@@ -2267,22 +2272,33 @@ pub fn ui_workspace_system(
 
                     let save_task = IoTaskPool::get().spawn(async move {
                         let file_handle = rfd::AsyncFileDialog::new()
-                            .add_filter("G-code (.gcode, .nc)", &["gcode", "nc"])
+                            .add_filter("G-code / Bambu 3MF (.gcode, .gcode.3mf, .3mf, .nc)", &["gcode", "3mf", "nc"])
                             .set_file_name(&default_filename)
                             .save_file()
                             .await?;
                         let out_path = file_handle.path().to_path_buf();
-                        let kb = gcode_bytes.len() as f64 / 1024.0;
-                        let res = std::fs::write(&out_path, gcode_bytes)
-                            .map(|()| {
-                                format!(
-                                    "{} ({:.1} KB, {} moves)",
-                                    out_path.display(),
-                                    kb,
-                                    total_moves
-                                )
-                            })
-                            .map_err(|e| e.to_string());
+                        let out_str = out_path.to_string_lossy().to_ascii_lowercase();
+                        let payload_res = if out_str.ends_with(".3mf") {
+                            crate::io::threemf::build_bambu_gcode_3mf_bytes(
+                                &gcode_bytes,
+                                Some(&cfg_snapshot),
+                            )
+                        } else {
+                            Ok(gcode_bytes.into_bytes())
+                        };
+                        let res = payload_res.and_then(|bytes| {
+                            let kb = bytes.len() as f64 / 1024.0;
+                            std::fs::write(&out_path, bytes)
+                                .map(|()| {
+                                    format!(
+                                        "{} ({:.1} KB, {} moves)",
+                                        out_path.display(),
+                                        kb,
+                                        total_moves
+                                    )
+                                })
+                                .map_err(|e| e.to_string())
+                        });
                         Some(res)
                     });
                     plate.pending_save_task = Some(save_task);
@@ -5079,8 +5095,20 @@ fn render_printer_config_tab(
             match config.gcode.gcode_dialect {
                 GcodeDialect::Prusa => {
                     config.network.protocol = PrinterNetworkProtocol::PrusaLink;
-                    if config.network.username.trim().is_empty() {
+                    if config.network.username.trim().is_empty()
+                        || config.network.username.eq_ignore_ascii_case("bblp")
+                    {
                         config.network.username = "maker".to_string();
+                    }
+                    moonraker_state.last_test_result = None;
+                    moonraker_state.last_status = None;
+                }
+                GcodeDialect::BambuLab => {
+                    config.network.protocol = PrinterNetworkProtocol::BambuLan;
+                    if config.network.username.trim().is_empty()
+                        || config.network.username.eq_ignore_ascii_case("maker")
+                    {
+                        config.network.username = "bblp".to_string();
                     }
                     moonraker_state.last_test_result = None;
                     moonraker_state.last_status = None;
@@ -5100,6 +5128,7 @@ fn render_printer_config_tab(
                 GcodeDialect::Prusa | GcodeDialect::RepRapFirmware => {
                     "Emit Dynamic M572 Pressure Advance Commands"
                 }
+                GcodeDialect::BambuLab => "Emit Dynamic M900 K Pressure Advance Commands",
             };
             dirty_gcode |= ui
                 .checkbox(&mut gc.enable_dynamic_pa, dyn_pa_label)
@@ -5120,6 +5149,7 @@ fn render_printer_config_tab(
                 GcodeDialect::Klipper => "Emit Klipper EXCLUDE_OBJECT commands",
                 GcodeDialect::Prusa => "Emit Prusa M486 Cancel-Object Labels",
                 GcodeDialect::RepRapFirmware => "Emit RepRapFirmware M486 Object Cancellation",
+                GcodeDialect::BambuLab => "Emit Bambu Lab M624/M625 Skip-Object Labels",
             };
             dirty_gcode |= ui
                 .checkbox(&mut gc.emit_exclude_object, exclude_label)
@@ -5129,6 +5159,7 @@ fn render_printer_config_tab(
         ui.horizontal_wrapped(|ui| {
             let thumb_label = match gc.gcode_dialect {
                 GcodeDialect::Prusa => "Embed Prusa / Buddy PNG Thumbnails (32x32 & 300x300)",
+                GcodeDialect::BambuLab => "Embed Bambu Studio PNG Thumbnails (32x32 & 300x300)",
                 _ => "Embed Moonraker PNG Thumbnails (32x32 & 300x300)",
             };
             dirty_gcode |= ui
@@ -5165,6 +5196,7 @@ fn render_printer_config_tab(
     let net_section_title = match config.network.protocol {
         PrinterNetworkProtocol::Moonraker => "Network Printing (Moonraker / Klipper)",
         PrinterNetworkProtocol::PrusaLink => "Network Printing (PrusaLink / Prusa Buddy)",
+        PrinterNetworkProtocol::BambuLan => "Network Printing (Bambu Lab LAN Mode)",
     };
     egui::CollapsingHeader::new(egui::RichText::new(net_section_title).strong())
         .id_source("printer_network_moonraker_section")
@@ -5183,21 +5215,28 @@ fn render_printer_config_tab(
                         moonraker_state.last_test_result = None;
                         moonraker_state.last_status = None;
                         if proto == PrinterNetworkProtocol::PrusaLink
-                            && config.network.username.trim().is_empty()
+                            && (config.network.username.trim().is_empty()
+                                || config.network.username.eq_ignore_ascii_case("bblp"))
                         {
                             config.network.username = "maker".to_string();
+                        } else if proto == PrinterNetworkProtocol::BambuLan
+                            && (config.network.username.trim().is_empty()
+                                || config.network.username.eq_ignore_ascii_case("maker"))
+                        {
+                            config.network.username = "bblp".to_string();
                         }
                     }
                 }
                 param_help_button(ui, "network.protocol");
             });
 
-            let uri_hint = match config.network.protocol {
-                PrinterNetworkProtocol::Moonraker => "http://printer.local:7125",
-                PrinterNetworkProtocol::PrusaLink => "http://prusa-core-one.local",
+            let (uri_label, uri_hint) = match config.network.protocol {
+                PrinterNetworkProtocol::Moonraker => ("Printer URI:", "http://printer.local:7125"),
+                PrinterNetworkProtocol::PrusaLink => ("Printer URI:", "http://prusa-core-one.local"),
+                PrinterNetworkProtocol::BambuLan => ("Printer IP / Host:", "192.168.1.50"),
             };
             ui.horizontal(|ui| {
-                ui.label("Printer URI:");
+                ui.label(uri_label);
                 net_changed |= ui
                     .add(
                         egui::TextEdit::singleline(&mut config.network.printer_uri)
@@ -5208,40 +5247,84 @@ fn render_printer_config_tab(
                 param_help_button(ui, "network.printer_uri");
             });
 
-            let web_ui_hint = match config.network.protocol {
-                PrinterNetworkProtocol::Moonraker => "Auto (Printer URI without :7125)",
-                PrinterNetworkProtocol::PrusaLink => "Auto (Same as Printer URI)",
-            };
-            ui.horizontal(|ui| {
-                ui.label("Web UI URI:");
-                net_changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut config.network.web_ui_uri)
-                            .hint_text(web_ui_hint)
-                            .desired_width(175.0),
-                    )
-                    .changed();
-                let can_open_ui = config.network.is_configured();
-                let web_hover = resolve_printer_web_ui_url(&config.network)
-                    .unwrap_or_else(|_| "Enter a Printer URI above first".to_string());
-                if ui
-                    .add_enabled(can_open_ui, egui::Button::new("Open Web UI ↗"))
-                    .on_hover_text(format!("Launch {web_hover} in your system browser"))
-                    .clicked()
-                {
-                    match open_printer_web_ui_in_browser(&config.network) {
-                        Ok(url) => {
-                            *status_message =
-                                format!("Opened printer Web UI ({url}) in system browser.");
-                        }
-                        Err(err) => {
-                            *status_message = err;
+            if config.network.protocol != PrinterNetworkProtocol::BambuLan {
+                let web_ui_hint = match config.network.protocol {
+                    PrinterNetworkProtocol::Moonraker => "Auto (Printer URI without :7125)",
+                    PrinterNetworkProtocol::PrusaLink | PrinterNetworkProtocol::BambuLan => {
+                        "Auto (Same as Printer URI)"
+                    }
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Web UI URI:");
+                    net_changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut config.network.web_ui_uri)
+                                .hint_text(web_ui_hint)
+                                .desired_width(175.0),
+                        )
+                        .changed();
+                    let can_open_ui = config.network.is_configured();
+                    let web_hover = resolve_printer_web_ui_url(&config.network)
+                        .unwrap_or_else(|_| "Enter a Printer URI above first".to_string());
+                    if ui
+                        .add_enabled(can_open_ui, egui::Button::new("Open Web UI ↗"))
+                        .on_hover_text(format!("Launch {web_hover} in your system browser"))
+                        .clicked()
+                    {
+                        match open_printer_web_ui_in_browser(&config.network) {
+                            Ok(url) => {
+                                *status_message =
+                                    format!("Opened printer Web UI ({url}) in system browser.");
+                            }
+                            Err(err) => {
+                                *status_message = err;
+                            }
                         }
                     }
-                }
-            });
+                });
+            }
 
-            if config.network.protocol == PrinterNetworkProtocol::PrusaLink {
+            if config.network.protocol == PrinterNetworkProtocol::BambuLan {
+                ui.horizontal(|ui| {
+                    ui.label("Serial Number:");
+                    net_changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut config.network.serial_number)
+                                .hint_text("e.g. 01P00A... or 00M00A...")
+                                .desired_width(175.0),
+                        )
+                        .on_hover_text(
+                            "15-character Bambu Lab printer Serial Number (used for MQTT device/<SERIAL>/request and report topics)",
+                        )
+                        .changed();
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Access Code:");
+                    net_changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut config.network.password)
+                                .password(!moonraker_state.show_password)
+                                .hint_text("8-character LAN Access Code")
+                                .desired_width(175.0),
+                        )
+                        .on_hover_text(
+                            "8-character LAN Access Code from Printer Settings -> LAN Only Mode (authenticates as user 'bblp' on FTPS :990 and MQTT :8883)",
+                        )
+                        .changed();
+                    ui.checkbox(&mut moonraker_state.show_password, "Show");
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    net_changed |= ui
+                        .checkbox(&mut config.network.bambu_use_ams, "Use AMS")
+                        .changed();
+                    net_changed |= ui
+                        .checkbox(&mut config.network.bambu_bed_leveling, "Auto Bed Leveling")
+                        .changed();
+                    ui.small("• Enable LAN Only Mode (+ Developer Mode on 2025+ FW)");
+                });
+            } else if config.network.protocol == PrinterNetworkProtocol::PrusaLink {
                 ui.horizontal(|ui| {
                     ui.label("Username:");
                     net_changed |= ui
@@ -5268,19 +5351,21 @@ fn render_printer_config_tab(
                 });
             }
 
-            ui.horizontal(|ui| {
-                ui.label("API Key:");
-                net_changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut config.network.api_key)
-                            .password(!moonraker_state.show_api_key)
-                            .hint_text("Optional X-Api-Key")
-                            .desired_width(175.0),
-                    )
-                    .changed();
-                ui.checkbox(&mut moonraker_state.show_api_key, "Show");
-                param_help_button(ui, "network.api_key");
-            });
+            if config.network.protocol != PrinterNetworkProtocol::BambuLan {
+                ui.horizontal(|ui| {
+                    ui.label("API Key:");
+                    net_changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut config.network.api_key)
+                                .password(!moonraker_state.show_api_key)
+                                .hint_text("Optional X-Api-Key")
+                                .desired_width(175.0),
+                        )
+                        .changed();
+                    ui.checkbox(&mut moonraker_state.show_api_key, "Show");
+                    param_help_button(ui, "network.api_key");
+                });
+            }
 
         egui::CollapsingHeader::new("TLS / mTLS Certificates (Optional)")
             .id_source("printer_network_tls_certs_subsection")
@@ -5414,6 +5499,9 @@ fn render_printer_config_tab(
                 }
                 PrinterNetworkProtocol::PrusaLink => {
                     "Verify connectivity, HTTP Digest username/password (or API key), and TLS certificates against PrusaLink (/api/v1/info & /api/v1/status) without printing anything"
+                }
+                PrinterNetworkProtocol::BambuLan => {
+                    "Verify LAN connectivity, Access Code ('bblp'), and MQTT-TLS (:8883) status against the Bambu Lab printer without printing anything"
                 }
             };
             let is_testing = moonraker_state.pending_test_task.is_some();

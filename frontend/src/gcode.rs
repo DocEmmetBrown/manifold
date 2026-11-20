@@ -16,6 +16,7 @@ pub fn format_pressure_advance_cmd(dialect: GcodeDialect, tool_id: u32, pa_s: f3
         GcodeDialect::Klipper => format!("SET_PRESSURE_ADVANCE ADVANCE={pa_s:.5}\n"),
         GcodeDialect::Prusa => format!("M572 S{pa_s:.4}\n"),
         GcodeDialect::RepRapFirmware => format!("M572 D{tool_id} S{pa_s:.4}\n"),
+        GcodeDialect::BambuLab => format!("M900 K{pa_s:.4}\n"),
     }
 }
 
@@ -28,7 +29,7 @@ pub fn format_accel_limit_cmd(
 ) -> String {
     match dialect {
         GcodeDialect::Klipper => format!("SET_VELOCITY_LIMIT ACCEL={print_accel_mms2:.0}\n"),
-        GcodeDialect::Prusa | GcodeDialect::RepRapFirmware => {
+        GcodeDialect::Prusa | GcodeDialect::RepRapFirmware | GcodeDialect::BambuLab => {
             format!("M204 P{print_accel_mms2:.0} T{travel_accel_mms2:.0}\n")
         }
     }
@@ -6124,6 +6125,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
             GcodeDialect::RepRapFirmware => {
                 gcode.push_str("M486 T1 ; RepRapFirmware object cancellation count\n");
             }
+            GcodeDialect::BambuLab => {
+                gcode.push_str("M624 ; Bambu Lab object cancellation marker\n");
+            }
         }
     }
     let start_expanded = expand_gcode_template(
@@ -6168,6 +6172,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                         gcode,
                         "M568 P{aux_tool_id} S{aux_temp_c:.0} R{aux_temp_c:.0} A2 ; Preheat tool T{aux_tool_id}"
                     );
+                }
+                GcodeDialect::BambuLab => {
+                    // Single-hotend AMS switches filament at toolchange time via M620/M621
                 }
             }
         }
@@ -6302,6 +6309,13 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                     let obj_idx = object_id.saturating_sub(1);
                     let _ = writeln!(gcode, "M486 S{obj_idx} A\"{exclude_object_name}\"");
                 }
+                GcodeDialect::BambuLab => {
+                    let obj_idx = object_id.saturating_sub(1);
+                    let _ = writeln!(
+                        gcode,
+                        "; printing object {exclude_object_name} id:{obj_idx} copy 0\nM624 S{obj_idx}"
+                    );
+                }
             }
         }
 
@@ -6309,10 +6323,18 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
         if let Some(&first_pwm) = fan_pwm_schedule.first() {
             if emitted_fan_pwm != Some(first_pwm) {
                 if first_pwm == 0 {
-                    gcode.push_str("M107 ; Part cooling fan off\n");
+                    if gcfg.gcode_dialect == GcodeDialect::BambuLab {
+                        gcode.push_str("M106 P1 S0 ; Part cooling fan off\n");
+                    } else {
+                        gcode.push_str("M107 ; Part cooling fan off\n");
+                    }
                 } else {
                     let pct = (first_pwm as f32) / 2.55;
-                    let _ = writeln!(gcode, "M106 S{first_pwm} ; Part cooling fan {pct:.0}%");
+                    if gcfg.gcode_dialect == GcodeDialect::BambuLab {
+                        let _ = writeln!(gcode, "M106 P1 S{first_pwm} ; Part cooling fan {pct:.0}%");
+                    } else {
+                        let _ = writeln!(gcode, "M106 S{first_pwm} ; Part cooling fan {pct:.0}%");
+                    }
                 }
                 emitted_fan_pwm = Some(first_pwm);
             }
@@ -6326,14 +6348,26 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                 let seg_fan_pwm = fan_pwm_schedule.get(seg_idx).copied().unwrap_or(0);
                 if emitted_fan_pwm != Some(seg_fan_pwm) {
                     if seg_fan_pwm == 0 {
-                        gcode.push_str("M107 ; Part cooling fan off\n");
+                        if gcfg.gcode_dialect == GcodeDialect::BambuLab {
+                            gcode.push_str("M106 P1 S0 ; Part cooling fan off\n");
+                        } else {
+                            gcode.push_str("M107 ; Part cooling fan off\n");
+                        }
                     } else {
                         let seg_fan_pct = (seg_fan_pwm as f32) / 2.55;
-                        let _ = writeln!(
-                            gcode,
-                            "M106 S{seg_fan_pwm} ; {} cooling fan {seg_fan_pct:.0}%",
-                            seg.kind.label()
-                        );
+                        if gcfg.gcode_dialect == GcodeDialect::BambuLab {
+                            let _ = writeln!(
+                                gcode,
+                                "M106 P1 S{seg_fan_pwm} ; {} cooling fan {seg_fan_pct:.0}%",
+                                seg.kind.label()
+                            );
+                        } else {
+                            let _ = writeln!(
+                                gcode,
+                                "M106 S{seg_fan_pwm} ; {} cooling fan {seg_fan_pct:.0}%",
+                                seg.kind.label()
+                            );
+                        }
                     }
                     emitted_fan_pwm = Some(seg_fan_pwm);
                 }
@@ -6394,6 +6428,16 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                             seg.kind.label()
                         );
                     }
+                    GcodeDialect::BambuLab => {
+                        let _ = writeln!(
+                            gcode,
+                            "M620 S{}A\nT{}\nM109 S{target_temp_c:.0}\nM621 S{}A ; Switch AMS slot ({})",
+                            seg.tool_id,
+                            seg.tool_id,
+                            seg.tool_id,
+                            seg.kind.label()
+                        );
+                    }
                 }
                 emitted_tool_id = seg.tool_id;
                 emitted_pa = -1.0;
@@ -6439,7 +6483,7 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                     GcodeDialect::Klipper => {
                         let _ = writeln!(gcode, "SET_VELOCITY_LIMIT ACCEL={:.0}\n", seg.accel_mms2);
                     }
-                    GcodeDialect::Prusa | GcodeDialect::RepRapFirmware => {
+                    GcodeDialect::Prusa | GcodeDialect::RepRapFirmware | GcodeDialect::BambuLab => {
                         let _ = writeln!(
                             gcode,
                             "M204 P{:.0} T{:.0}\n",
@@ -6507,6 +6551,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                                 "M572 D{} S{:.4}\n",
                                 emitted_tool_id, seg.pressure_advance_s
                             );
+                        }
+                        GcodeDialect::BambuLab => {
+                            let _ = writeln!(gcode, "M900 K{:.4}\n", seg.pressure_advance_s);
                         }
                     }
                     emitted_pa = seg.pressure_advance_s;
@@ -6690,6 +6737,13 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                 }
                 GcodeDialect::RepRapFirmware => {
                     gcode.push_str("M486 S-1\n");
+                }
+                GcodeDialect::BambuLab => {
+                    let obj_idx = object_id.saturating_sub(1);
+                    let _ = writeln!(
+                        gcode,
+                        "M625\n; stop printing object {exclude_object_name} id:{obj_idx} copy 0"
+                    );
                 }
             }
         }
@@ -7068,6 +7122,9 @@ pub fn combine_planned_objects_into_plate_result(
                     "M486 T{} ; RepRapFirmware object cancellation count\n",
                     planned_objects.len()
                 ));
+            }
+            crate::config::GcodeDialect::BambuLab => {
+                out.push_str("M624 ; Bambu Lab object cancellation marker\n");
             }
         }
     }

@@ -1812,6 +1812,235 @@ pub fn save_project_to_3mf(
     Ok(())
 }
 
+/// Packages a sliced G-code string (`plate_1.gcode`) and its metadata into an in-memory
+/// Bambu Lab `.gcode.3mf` OPC/ZIP archive containing:
+/// - `[Content_Types].xml` & `_rels/.rels`
+/// - `3D/3dmodel.model`
+/// - `Metadata/plate_1.gcode`
+/// - `Metadata/plate_1.gcode.md5` (RFC 1321 MD5 hex digest required by Bambu Lab firmware)
+/// - `Metadata/slice_info.config` (XML manifest with filament types, colors, weight, and prediction time)
+/// - `Metadata/plate_1.png` (optional 300x300 PNG thumbnail extracted from the G-code header)
+pub fn build_bambu_gcode_3mf_bytes(
+    gcode_text: &str,
+    config: Option<&SlicerConfig>,
+) -> Result<Vec<u8>, String> {
+    let mut cursor = Cursor::new(Vec::with_capacity(gcode_text.len() / 2 + 16384));
+    {
+        let mut zip = ZipWriter::new(&mut cursor);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+        let content_types_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
+  <Default Extension="png" ContentType="image/png"/>
+  <Default Extension="gcode" ContentType="text/x.gcode"/>
+  <Default Extension="config" ContentType="text/xml"/>
+  <Default Extension="md5" ContentType="text/plain"/>
+</Types>"#;
+        zip.start_file("[Content_Types].xml", options)
+            .map_err(|e| e.to_string())?;
+        zip.write_all(content_types_xml.as_bytes())
+            .map_err(|e| e.to_string())?;
+
+        let rels_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Target="/3D/3dmodel.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
+  <Relationship Target="/Metadata/plate_1.png" Id="rel-2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail"/>
+</Relationships>"#;
+        zip.start_file("_rels/.rels", options)
+            .map_err(|e| e.to_string())?;
+        zip.write_all(rels_xml.as_bytes())
+            .map_err(|e| e.to_string())?;
+
+        let model_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:BambuStudio="http://schemas.bambulab.com/package/2021">
+  <metadata name="Application">BambuStudio-01.09.05.51-Manifold2</metadata>
+  <metadata name="BambuStudio:3mfVersion">1</metadata>
+  <resources/>
+  <build/>
+</model>"#;
+        zip.start_file("3D/3dmodel.model", options)
+            .map_err(|e| e.to_string())?;
+        zip.write_all(model_xml.as_bytes())
+            .map_err(|e| e.to_string())?;
+
+        // Write `Metadata/plate_1.gcode` and `Metadata/plate_1.gcode.md5`
+        let gcode_bytes = gcode_text.as_bytes();
+        zip.start_file("Metadata/plate_1.gcode", options)
+            .map_err(|e| e.to_string())?;
+        zip.write_all(gcode_bytes).map_err(|e| e.to_string())?;
+
+        let md5_digest = crate::moonraker::md5_hex(gcode_bytes);
+        zip.start_file("Metadata/plate_1.gcode.md5", options)
+            .map_err(|e| e.to_string())?;
+        zip.write_all(md5_digest.as_bytes())
+            .map_err(|e| e.to_string())?;
+
+        // Extract optional PNG thumbnail from G-code header comments (`; thumbnail begin WxH LEN`)
+        if let Some(png_bytes) = extract_largest_png_thumbnail_from_gcode(gcode_text) {
+            zip.start_file("Metadata/plate_1.png", options)
+                .map_err(|e| e.to_string())?;
+            zip.write_all(&png_bytes).map_err(|e| e.to_string())?;
+        }
+
+        // Write `Metadata/slice_info.config`
+        let slice_info_xml = build_bambu_slice_info_config_xml(gcode_text, config);
+        zip.start_file("Metadata/slice_info.config", options)
+            .map_err(|e| e.to_string())?;
+        zip.write_all(slice_info_xml.as_bytes())
+            .map_err(|e| e.to_string())?;
+
+        zip.finish().map_err(|e| e.to_string())?;
+    }
+    Ok(cursor.into_inner())
+}
+
+fn build_bambu_slice_info_config_xml(gcode_text: &str, config: Option<&SlicerConfig>) -> String {
+    let mut est_time_s: u64 = 0;
+    let mut weight_g: f32 = 0.0;
+    let mut length_m: f32 = 0.0;
+    let mut nozzle_diam: f32 = config
+        .and_then(|c| c.active_tool())
+        .map(|t| t.nozzle_diameter_mm)
+        .unwrap_or(0.40);
+
+    // Parse footer metadata comments from `gcode_text` when available
+    for line in gcode_text.lines().rev().take(64) {
+        let trimmed = line.trim().trim_start_matches(';').trim();
+        if let Some(val) = trimmed.strip_prefix("estimated printing time (normal mode) =") {
+            est_time_s = parse_hms_duration_to_seconds(val.trim());
+        } else if let Some(val) = trimmed.strip_prefix("total filament used [g] =") {
+            weight_g = val.trim().parse::<f32>().unwrap_or(weight_g);
+        } else if let Some(val) = trimmed.strip_prefix("filament used [mm] =") {
+            if let Ok(mm) = val.trim().parse::<f32>() {
+                length_m = mm / 1000.0;
+            }
+        } else if let Some(val) = trimmed.strip_prefix("nozzle_diameter =") {
+            nozzle_diam = val.trim().parse::<f32>().unwrap_or(nozzle_diam);
+        }
+    }
+
+    let mut filaments_xml = String::new();
+    if let Some(cfg) = config {
+        let count = cfg.tools.len().max(1);
+        let per_tool_m = if count > 0 { length_m / (count as f32) } else { length_m };
+        let per_tool_g = if count > 0 { weight_g / (count as f32) } else { weight_g };
+        for (idx, tool) in cfg.tools.iter().enumerate() {
+            let tray_id = idx + 1;
+            let f_type = escape_xml_attr(if tool.filament_type.trim().is_empty() {
+                "PLA"
+            } else {
+                tool.filament_type.trim()
+            });
+            let f_color = escape_xml_attr(if tool.filament_color_hex.trim().is_empty() {
+                "#2298FA"
+            } else {
+                tool.filament_color_hex.trim()
+            });
+            filaments_xml.push_str(&format!(
+                "    <filament id=\"{tray_id}\" type=\"{f_type}\" color=\"{f_color}\" used_m=\"{per_tool_m:.2}\" used_g=\"{per_tool_g:.2}\"/>\n"
+            ));
+        }
+    } else {
+        filaments_xml.push_str(&format!(
+            "    <filament id=\"1\" type=\"PLA\" color=\"#2298FA\" used_m=\"{length_m:.2}\" used_g=\"{weight_g:.2}\"/>\n"
+        ));
+    }
+
+    format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<config>\n",
+            "  <header>\n",
+            "    <header_item key=\"X-BBL-Client-Type\" value=\"slicer\"/>\n",
+            "    <header_item key=\"X-BBL-Client-Version\" value=\"01.09.05.51-Manifold2\"/>\n",
+            "  </header>\n",
+            "  <plate>\n",
+            "    <metadata key=\"index\" value=\"1\"/>\n",
+            "    <metadata key=\"prediction\" value=\"{est_time_s}\"/>\n",
+            "    <metadata key=\"weight\" value=\"{weight_g:.2}\"/>\n",
+            "    <metadata key=\"outside\" value=\"false\"/>\n",
+            "    <metadata key=\"support_used\" value=\"false\"/>\n",
+            "    <metadata key=\"nozzle_diameters\" value=\"{nozzle_diam:.2}\"/>\n",
+            "{filaments_xml}",
+            "  </plate>\n",
+            "</config>\n"
+        ),
+        est_time_s = est_time_s,
+        weight_g = weight_g,
+        nozzle_diam = nozzle_diam,
+        filaments_xml = filaments_xml
+    )
+}
+
+fn parse_hms_duration_to_seconds(s: &str) -> u64 {
+    let mut total: u64 = 0;
+    for tok in s.split_whitespace() {
+        if let Some(h) = tok.strip_suffix('h') {
+            total += h.parse::<u64>().unwrap_or(0) * 3600;
+        } else if let Some(m) = tok.strip_suffix('m') {
+            total += m.parse::<u64>().unwrap_or(0) * 60;
+        } else if let Some(sec) = tok.strip_suffix('s') {
+            total += sec.parse::<u64>().unwrap_or(0);
+        }
+    }
+    total
+}
+
+fn extract_largest_png_thumbnail_from_gcode(gcode_text: &str) -> Option<Vec<u8>> {
+    let mut best_b64 = String::new();
+    let mut in_thumb = false;
+    let mut cur_b64 = String::new();
+
+    for line in gcode_text.lines().take(1200) {
+        let trimmed = line.trim();
+        if trimmed.starts_with("; thumbnail begin ") {
+            in_thumb = true;
+            cur_b64.clear();
+        } else if trimmed.starts_with("; thumbnail end") {
+            if in_thumb && cur_b64.len() > best_b64.len() {
+                best_b64 = cur_b64.clone();
+            }
+            in_thumb = false;
+        } else if in_thumb {
+            let chunk = trimmed.trim_start_matches(';').trim();
+            cur_b64.push_str(chunk);
+        }
+    }
+
+    if best_b64.is_empty() {
+        None
+    } else {
+        decode_base64_simple(&best_b64)
+    }
+}
+
+fn decode_base64_simple(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u8;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            _ if b.is_ascii_whitespace() => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Parses a 3MF `.model` XML buffer using `quick-xml`, extracting `<object>` meshes,
 /// `<basematerials>`, `<m:colorgroup>`, `<m:texture2d>`, `<m:texture2dgroup>`,
 /// `<components>`, and `<build><item>` entries while ignoring unknown slicer tags.

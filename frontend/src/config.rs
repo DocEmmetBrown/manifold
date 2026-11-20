@@ -1656,16 +1656,24 @@ pub enum GcodeDialect {
     Prusa,
     /// RepRapFirmware / Duet (`M572 D... S...`, `M204`, `M486`, `M568`/`M116`, 5-axis RTCP `XYZBC`).
     RepRapFirmware,
+    /// Bambu Lab (X1C, X1E, P1P, P1S, A1, A1 Mini: `M900 K...`, `M204 P... T...`, `M106 P1 S...`, `M620`/`M621` AMS, `.gcode.3mf`).
+    BambuLab,
 }
 
 impl GcodeDialect {
-    pub const ALL: [Self; 3] = [Self::Klipper, Self::Prusa, Self::RepRapFirmware];
+    pub const ALL: [Self; 4] = [
+        Self::Klipper,
+        Self::Prusa,
+        Self::RepRapFirmware,
+        Self::BambuLab,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Klipper => "Klipper",
             Self::Prusa => "Prusa (Buddy / Marlin 2)",
             Self::RepRapFirmware => "RepRapFirmware (RRF / Duet)",
+            Self::BambuLab => "Bambu Lab (X1 / P1 / A1 + AMS)",
         }
     }
 
@@ -1674,6 +1682,7 @@ impl GcodeDialect {
             Self::Klipper => "Klipper",
             Self::Prusa => "Prusa",
             Self::RepRapFirmware => "RRF / Duet",
+            Self::BambuLab => "Bambu Lab",
         }
     }
 }
@@ -2505,17 +2514,22 @@ pub enum PrinterNetworkProtocol {
     Moonraker,
     /// PrusaLink API v1 for Prusa Buddy / Raspberry Pi printers (`/api/v1/info`, `/api/v1/status`, `/api/v1/job`, `PUT /api/v1/files/{storage}/{path}` with HTTP Digest Auth & `X-Api-Key`).
     PrusaLink,
+    /// Bambu Lab LAN Mode (`FTPS` implicit TLS on port 990 + `MQTT` over TLS on port 8883 with username `bblp`, 8-char Access Code, and printer Serial Number).
+    BambuLan,
 }
 
 impl PrinterNetworkProtocol {
-    pub const ALL: [Self; 2] = [Self::Moonraker, Self::PrusaLink];
+    pub const ALL: [Self; 3] = [Self::Moonraker, Self::PrusaLink, Self::BambuLan];
 
     /// Returns the default network protocol for a printer given its firmware dialect and preset name:
+    /// - `BambuLan` for Bambu Lab printers / `GcodeDialect::BambuLab`
     /// - `PrusaLink` for Prusa printers / `GcodeDialect::Prusa`
     /// - `Moonraker` for Voron / Klipper printers
     pub fn default_for_printer(dialect: GcodeDialect, printer_name: &str) -> Self {
         let lower_name = printer_name.to_ascii_lowercase();
-        if dialect == GcodeDialect::Prusa || lower_name.contains("prusa") {
+        if dialect == GcodeDialect::BambuLab || lower_name.contains("bambu") {
+            Self::BambuLan
+        } else if dialect == GcodeDialect::Prusa || lower_name.contains("prusa") {
             Self::PrusaLink
         } else {
             Self::Moonraker
@@ -2526,6 +2540,7 @@ impl PrinterNetworkProtocol {
         match self {
             Self::Moonraker => "Klipper (Moonraker HTTP/HTTPS)",
             Self::PrusaLink => "Prusa (PrusaLink API v1 / Buddy)",
+            Self::BambuLan => "Bambu Lab (LAN Mode FTPS :990 + MQTT-TLS :8883)",
         }
     }
 
@@ -2533,6 +2548,7 @@ impl PrinterNetworkProtocol {
         match self {
             Self::Moonraker => "Klipper (Moonraker)",
             Self::PrusaLink => "Prusa (PrusaLink)",
+            Self::BambuLan => "Bambu Lab (LAN Mode)",
         }
     }
 
@@ -2540,25 +2556,35 @@ impl PrinterNetworkProtocol {
         match self {
             Self::Moonraker => "Moonraker",
             Self::PrusaLink => "PrusaLink",
+            Self::BambuLan => "Bambu LAN",
         }
     }
 }
 
-/// Network printing & status monitoring configuration for Moonraker (Klipper) and PrusaLink (Prusa Buddy) printers.
+/// Network printing & status monitoring configuration for Moonraker (Klipper), PrusaLink (Prusa Buddy), and Bambu Lab (LAN Mode) printers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MoonrakerNetworkConfig {
-    /// Selected printer network protocol (`Moonraker` or `PrusaLink`).
+    /// Selected printer network protocol (`Moonraker`, `PrusaLink`, or `BambuLan`).
     pub protocol: PrinterNetworkProtocol,
-    /// Base URL of the printer HTTP/HTTPS API (e.g., "http://voron.local:7125" or "http://prusa-core-one.local").
+    /// Base URL or IP/hostname of the printer (e.g., "http://voron.local:7125", "http://prusa-core-one.local", or "192.168.1.50").
     pub printer_uri: String,
     /// Optional override URL for launching the printer's Web UI (Mainsail / Fluidd / PrusaLink) in the system browser.
     /// When empty, defaults to `printer_uri` (with `:7125` stripped to standard HTTP/HTTPS port for Moonraker).
     pub web_ui_uri: String,
-    /// Username for PrusaLink HTTP Digest / Basic authentication (defaults to `"maker"` on Prusa Buddy printers when left blank).
+    /// Username for PrusaLink HTTP Digest / Basic authentication (defaults to `"maker"` on Prusa Buddy printers, or `"bblp"` on Bambu Lab LAN Mode).
     pub username: String,
-    /// Password for PrusaLink HTTP Digest / Basic authentication (from Printer Settings -> Network -> PrusaLink).
+    /// Password for PrusaLink HTTP Digest / Basic authentication, or 8-character LAN Access Code for Bambu Lab LAN Mode.
     pub password: String,
+    /// Printer Serial Number for Bambu Lab LAN Mode MQTT topics (`device/<SERIAL>/request` and `device/<SERIAL>/report`, e.g. `"01P00A..."`).
+    #[serde(default)]
+    pub serial_number: String,
+    /// Enable AMS filament mapping when starting a print on Bambu Lab printers (`use_ams: true`).
+    #[serde(default = "default_true_bool_cfg")]
+    pub bambu_use_ams: bool,
+    /// Enable automatic bed leveling when starting a print on Bambu Lab printers (`bed_leveling: true`).
+    #[serde(default = "default_true_bool_cfg")]
+    pub bambu_bed_leveling: bool,
     /// Optional API key sent in the `X-Api-Key` HTTP header (Moonraker or PrusaLink API-key mode).
     pub api_key: String,
     /// Optional path to a custom PEM-encoded CA certificate bundle for verifying HTTPS connections.
@@ -2573,6 +2599,10 @@ pub struct MoonrakerNetworkConfig {
     pub poll_interval_s: f32,
 }
 
+const fn default_true_bool_cfg() -> bool {
+    true
+}
+
 impl Default for MoonrakerNetworkConfig {
     fn default() -> Self {
         Self {
@@ -2581,6 +2611,9 @@ impl Default for MoonrakerNetworkConfig {
             web_ui_uri: String::new(),
             username: String::new(),
             password: String::new(),
+            serial_number: String::new(),
+            bambu_use_ams: true,
+            bambu_bed_leveling: true,
             api_key: String::new(),
             ca_cert_pem_path: String::new(),
             client_cert_pem_path: String::new(),
@@ -2597,6 +2630,7 @@ impl MoonrakerNetworkConfig {
         self.web_ui_uri = self.web_ui_uri.trim().to_string();
         self.username = self.username.trim().to_string();
         self.password = self.password.trim_matches(['\r', '\n']).to_string();
+        self.serial_number = self.serial_number.trim().to_ascii_uppercase();
         self.api_key = self.api_key.trim().to_string();
         self.ca_cert_pem_path = self.ca_cert_pem_path.trim().to_string();
         self.client_cert_pem_path = self.client_cert_pem_path.trim().to_string();
@@ -2616,11 +2650,32 @@ impl MoonrakerNetworkConfig {
         }
     }
 
+    pub fn effective_bambu_username(&self) -> &str {
+        let u = self.username.trim();
+        if u.is_empty() || u.eq_ignore_ascii_case("maker") {
+            "bblp"
+        } else {
+            u
+        }
+    }
+
+    /// Returns the Bambu Lab 8-character LAN Access Code (checking `password` first, then `api_key` fallback).
+    pub fn effective_bambu_access_code(&self) -> &str {
+        let pw = self.password.trim();
+        if !pw.is_empty() {
+            pw
+        } else {
+            self.api_key.trim()
+        }
+    }
+
     pub fn is_configured(&self) -> bool {
         let trimmed = self.printer_uri.trim().trim_end_matches('/');
         let host_part = trimmed
             .strip_prefix("http://")
             .or_else(|| trimmed.strip_prefix("https://"))
+            .or_else(|| trimmed.strip_prefix("ftps://"))
+            .or_else(|| trimmed.strip_prefix("mqtts://"))
             .unwrap_or(trimmed);
         !host_part.trim().is_empty() && !host_part.ends_with(':')
     }

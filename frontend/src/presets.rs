@@ -293,7 +293,12 @@ impl PrinterPreset {
                     [idx % crate::config::DEFAULT_FILAMENT_SLOT_PALETTE.len()];
                 t.filament_color_hex = hex.to_string();
                 t.filament_color_srgba = srgba;
-                t.name = format!("T{idx} - {:.1}mm INDX", t.nozzle_diameter_mm);
+                let suffix = if self.gcode_dialect == GcodeDialect::BambuLab {
+                    "AMS"
+                } else {
+                    "INDX"
+                };
+                t.name = format!("T{idx} - {:.1}mm {suffix}", t.nozzle_diameter_mm);
                 cfg.tools.push(t);
             }
             if cfg.active_tool_index >= cfg.tools.len() {
@@ -1646,6 +1651,110 @@ impl PresetLibrary {
         p_6axis.infill_accel_mms2 = 3500.0;
         p_6axis.travel_accel_mms2 = 5000.0;
 
+        let make_bambu = |name: &str,
+                          wx: f32,
+                          dy: f32,
+                          hz: f32,
+                          park_x: f32,
+                          park_y: f32,
+                          tool_count: Option<usize>|
+         -> PrinterPreset {
+            let mut p = PrinterPreset::from_config(name, &base_cfg, true);
+            p.bed_shape = BedShape::Rectangular;
+            p.width_x = wx;
+            p.depth_y = dy;
+            p.height_z = hz;
+            p.gcode_origin_at_bed_center = false;
+            p.gcode_dialect = GcodeDialect::BambuLab;
+            p.network.protocol = PrinterNetworkProtocol::BambuLan;
+            p.network.username = "bblp".to_string();
+            p.emit_exclude_object = true;
+            p.emit_thumbnails = true;
+            p.default_tool_count = tool_count;
+            p.travel_speed_mms = 400.0;
+            p.z_hop_speed_mms = 15.0;
+            p.outer_wall_accel_mms2 = 5000.0;
+            p.inner_wall_accel_mms2 = 8000.0;
+            p.infill_accel_mms2 = 10000.0;
+            p.travel_accel_mms2 = 10000.0;
+            p.square_corner_velocity_mms = 9.0;
+
+            let use_ams_swap = tool_count.unwrap_or(1) > 1;
+            let ams_init = if use_ams_swap {
+                "M620 M\nM620 S{tool_id}A\nT{tool_id}\nM109 S{nozzle_temp}\nM621 S{tool_id}A ; Load initial AMS filament slot\n"
+            } else {
+                "T{tool_id}\n"
+            };
+            p.start_gcode_template = format!(
+                concat!(
+                    "; --- Manifold2 {name} Print Start ---\n",
+                    "M17 ; Enable steppers\n",
+                    "G90 ; Absolute positioning\n",
+                    "M83 ; Relative extrusion\n",
+                    "M140 S{{bed_temp}} ; Set bed temperature\n",
+                    "M104 S150 ; Preheat nozzle for bed probing\n",
+                    "G28 ; Home all axes\n",
+                    "M190 S{{bed_temp}} ; Wait for bed temperature\n",
+                    "G29.1 Z0.0 ; Apply bed mesh offset\n",
+                    "G29 A X{{bbox_min_x}} Y{{bbox_min_y}} I{{bbox_width_x}} J{{bbox_depth_y}} ; Print-area mesh bed leveling\n",
+                    "{ams_init}",
+                    "M109 S{{nozzle_temp}} ; Wait for nozzle print temperature\n",
+                    "G92 E0 ; Reset extruder"
+                ),
+                name = name,
+                ams_init = ams_init
+            );
+            p.end_gcode_template = format!(
+                concat!(
+                    "; --- Manifold2 {name} Print End ---\n",
+                    "M400 ; Wait for moves to finish\n",
+                    "M104 S0 ; Turn off hotend\n",
+                    "M140 S0 ; Turn off heated bed\n",
+                    "M106 P1 S0 ; Turn off part cooling fan\n",
+                    "M106 P2 S0 ; Turn off auxiliary cooling fan\n",
+                    "M106 P3 S0 ; Turn off chamber fan\n",
+                    "G1 X{park_x:.0} Y{park_y:.0} F12000 ; Park toolhead\n",
+                    "M84 ; Disable steppers"
+                ),
+                name = name,
+                park_x = park_x,
+                park_y = park_y
+            );
+            p
+        };
+
+        let p_bambu_x1c = make_bambu("Bambu Lab X1 Carbon", 256.0, 256.0, 256.0, 65.0, 250.0, Some(1));
+        let p_bambu_x1c_ams = make_bambu(
+            "Bambu Lab X1 Carbon (AMS 4-Slot)",
+            256.0,
+            256.0,
+            256.0,
+            65.0,
+            250.0,
+            Some(4),
+        );
+        let p_bambu_p1s = make_bambu("Bambu Lab P1S / P1P", 256.0, 256.0, 256.0, 65.0, 250.0, Some(1));
+        let p_bambu_p1s_ams = make_bambu(
+            "Bambu Lab P1S (AMS 4-Slot)",
+            256.0,
+            256.0,
+            256.0,
+            65.0,
+            250.0,
+            Some(4),
+        );
+        let p_bambu_a1 = make_bambu("Bambu Lab A1", 256.0, 256.0, 256.0, 0.0, 250.0, Some(1));
+        let p_bambu_a1_ams = make_bambu(
+            "Bambu Lab A1 (AMS Lite 4-Slot)",
+            256.0,
+            256.0,
+            256.0,
+            0.0,
+            250.0,
+            Some(4),
+        );
+        let p_bambu_a1_mini = make_bambu("Bambu Lab A1 Mini", 180.0, 180.0, 180.0, 0.0, 176.0, Some(1));
+
         vec![
             p_corexy,
             p_v0,
@@ -1661,6 +1770,13 @@ impl PresetLibrary {
             p_core_one_indx_8,
             p_core_one_l_indx_4,
             p_core_one_l_indx_8,
+            p_bambu_x1c,
+            p_bambu_x1c_ams,
+            p_bambu_p1s,
+            p_bambu_p1s_ams,
+            p_bambu_a1,
+            p_bambu_a1_ams,
+            p_bambu_a1_mini,
             p_5axis,
             p_trident_5axis_ab,
             p_rrf_5axis_bc,
@@ -1727,7 +1843,50 @@ impl PresetLibrary {
         t_indx.tool_change_hop_before = true;
         t_indx.tool_change_approach_after = true;
 
-        vec![t_04, t_06, t_025, t_rect, t_nextruder, t_indx]
+        let mut t_bambu_x1_p1 =
+            ToolPreset::from_config("0.4mm Bambu Lab X1/P1 Hardened Steel", &base_cfg, true);
+        t_bambu_x1_p1.nozzle_diameter_mm = 0.40;
+        t_bambu_x1_p1.has_rotational_axes = false;
+        t_bambu_x1_p1.max_volumetric_flow_mm3s = 22.0;
+        t_bambu_x1_p1.retract_length_mm = 0.80;
+        t_bambu_x1_p1.retract_speed_mms = 30.0;
+        t_bambu_x1_p1.z_hop_mm = 0.40;
+        t_bambu_x1_p1.tool_change_time_s = 85.0;
+        t_bambu_x1_p1.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.55, 0.0),
+            ClearancePointXZ::new(3.2, 2.2),
+            ClearancePointXZ::new(14.5, 4.5),
+            ClearancePointXZ::new(28.0, 14.0),
+            ClearancePointXZ::new(42.0, 45.0),
+        ];
+
+        let mut t_bambu_a1 =
+            ToolPreset::from_config("0.4mm Bambu Lab A1 Quick-Swap", &base_cfg, true);
+        t_bambu_a1.nozzle_diameter_mm = 0.40;
+        t_bambu_a1.has_rotational_axes = false;
+        t_bambu_a1.max_volumetric_flow_mm3s = 22.0;
+        t_bambu_a1.retract_length_mm = 0.80;
+        t_bambu_a1.retract_speed_mms = 30.0;
+        t_bambu_a1.z_hop_mm = 0.40;
+        t_bambu_a1.tool_change_time_s = 45.0;
+        t_bambu_a1.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.55, 0.0),
+            ClearancePointXZ::new(3.0, 2.5),
+            ClearancePointXZ::new(13.0, 5.0),
+            ClearancePointXZ::new(26.0, 15.0),
+            ClearancePointXZ::new(38.0, 45.0),
+        ];
+
+        vec![
+            t_04,
+            t_06,
+            t_025,
+            t_rect,
+            t_nextruder,
+            t_indx,
+            t_bambu_x1_p1,
+            t_bambu_a1,
+        ]
     }
 
     pub fn builtin_filaments() -> Vec<FilamentPreset> {
@@ -2397,6 +2556,39 @@ mod tests {
             &mut cfg
         ));
         assert!((cfg.gcode.tool_change_time_s - 12.0).abs() < 1.0e-4);
+        assert!(!lib.is_category_modified(PresetCategory::Tool, &cfg));
+
+        // Switching to Bambu Lab printer presets applies BambuLab dialect, BambuLan protocol, build volumes, and AMS tool counts
+        let bambu_expected: [(&str, f32, f32, f32, usize); 7] = [
+            ("Bambu Lab X1 Carbon", 256.0, 256.0, 256.0, 1),
+            ("Bambu Lab X1 Carbon (AMS 4-Slot)", 256.0, 256.0, 256.0, 4),
+            ("Bambu Lab P1S / P1P", 256.0, 256.0, 256.0, 1),
+            ("Bambu Lab P1S (AMS 4-Slot)", 256.0, 256.0, 256.0, 4),
+            ("Bambu Lab A1", 256.0, 256.0, 256.0, 1),
+            ("Bambu Lab A1 (AMS Lite 4-Slot)", 256.0, 256.0, 256.0, 4),
+            ("Bambu Lab A1 Mini", 180.0, 180.0, 180.0, 1),
+        ];
+        for (name, wx, dy, hz, expected_tools) in bambu_expected {
+            assert!(
+                lib.select_and_apply(PresetCategory::Printer, name, &mut cfg),
+                "Missing built-in printer preset {name}"
+            );
+            assert_eq!(cfg.bed.shape, BedShape::Rectangular);
+            assert_eq!(cfg.gcode.gcode_dialect, GcodeDialect::BambuLab);
+            assert_eq!(cfg.network.protocol, PrinterNetworkProtocol::BambuLan);
+            assert_eq!(cfg.network.username, "bblp");
+            assert!((cfg.bed.width_x - wx).abs() < 1.0e-4);
+            assert!((cfg.bed.depth_y - dy).abs() < 1.0e-4);
+            assert!((cfg.bed.height_z - hz).abs() < 1.0e-4);
+            assert_eq!(cfg.tools.len(), expected_tools);
+            assert!(!lib.is_category_modified(PresetCategory::Printer, &cfg));
+        }
+
+        assert!(lib.select_and_apply(
+            PresetCategory::Tool,
+            "0.4mm Bambu Lab X1/P1 Hardened Steel",
+            &mut cfg
+        ));
         assert!(!lib.is_category_modified(PresetCategory::Tool, &cfg));
     }
 
