@@ -9431,6 +9431,525 @@ mod tests {
     }
 
     #[test]
+    fn test_conformal_skin_no_missing_perimeters_below_outermost_surface() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Watertight 24 x 24 crowned block: vertical side walls with domed top z(x, y)
+        let nx = 24usize;
+        let ny = 24usize;
+        let z_top = |x: f32, y: f32| -> f32 {
+            12.0 + 1.8 * (std::f32::consts::PI * x / 24.0).cos() * (std::f32::consts::PI * y / 24.0).cos()
+        };
+        let mut stl = String::from("solid crowned_block\n");
+        let mut add_tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+            stl.push_str(&format!(
+                "  facet normal 0 0 0\n    outer loop\n      vertex {} {} {}\n      vertex {} {} {}\n      vertex {} {} {}\n    endloop\n  endfacet\n",
+                a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]
+            ));
+        };
+        let mut add_quad = |p00: [f32; 3], p10: [f32; 3], p11: [f32; 3], p01: [f32; 3]| {
+            add_tri(p00, p10, p11);
+            add_tri(p00, p11, p01);
+        };
+
+        for i in 0..nx {
+            let x0 = -12.0 + 24.0 * (i as f32 / nx as f32);
+            let x1 = -12.0 + 24.0 * ((i + 1) as f32 / nx as f32);
+            for j in 0..ny {
+                let y0 = -12.0 + 24.0 * (j as f32 / ny as f32);
+                let y1 = -12.0 + 24.0 * ((j + 1) as f32 / ny as f32);
+                add_quad([x0, y0, 0.0], [x0, y1, 0.0], [x1, y1, 0.0], [x1, y0, 0.0]);
+                add_quad(
+                    [x0, y0, z_top(x0, y0)],
+                    [x1, y0, z_top(x1, y0)],
+                    [x1, y1, z_top(x1, y1)],
+                    [x0, y1, z_top(x0, y1)],
+                );
+            }
+        }
+        for i in 0..nx {
+            let x0 = -12.0 + 24.0 * (i as f32 / nx as f32);
+            let x1 = -12.0 + 24.0 * ((i + 1) as f32 / nx as f32);
+            add_quad([x0, -12.0, 0.0], [x1, -12.0, 0.0], [x1, -12.0, z_top(x1, -12.0)], [x0, -12.0, z_top(x0, -12.0)]);
+            add_quad([x1, 12.0, 0.0], [x0, 12.0, 0.0], [x0, 12.0, z_top(x0, 12.0)], [x1, 12.0, z_top(x1, 12.0)]);
+        }
+        for j in 0..ny {
+            let y0 = -12.0 + 24.0 * (j as f32 / ny as f32);
+            let y1 = -12.0 + 24.0 * ((j + 1) as f32 / ny as f32);
+            add_quad([-12.0, y1, 0.0], [-12.0, y0, 0.0], [-12.0, y0, z_top(-12.0, y0)], [-12.0, y1, z_top(-12.0, y1)]);
+            add_quad([12.0, y0, 0.0], [12.0, y1, 0.0], [12.0, y1, z_top(12.0, y1)], [12.0, y0, z_top(12.0, y0)]);
+        }
+        stl.push_str("endsolid crowned_block\n");
+
+        let tmp_path = std::env::temp_dir().join("manifold_test_conformal_crowned_block.stl");
+        std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write crowned block STL");
+        let obj = crate::io::stl::load_stl_file(&tmp_path).expect("Expected crowned block STL load");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let mut cfg = crate::config::SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::ConstrainedNonPlanar;
+        cfg.eikonal.voxel_size_mm = 0.35;
+        cfg.eikonal.enable_multi_resolution_grid = false;
+        cfg.slicing.layer_height.target_mm = 0.25;
+        cfg.slicing.layer_height.min_mm = 0.14;
+        cfg.slicing.layer_height.max_mm = 0.36;
+        cfg.slicing.layer_height.first_layer_mm = 0.25;
+        cfg.slicing.layer_height.top_layer_mm = 0.20;
+        cfg.slicing.enable_auto_conformal_skin = true;
+        cfg.slicing.conformal_skin_layers = 3;
+        cfg.slicing.inner_wall_count = 2;
+        cfg.slicing.sanitize();
+        crate::ui::sync_config_to_backend(&cfg);
+        ffi::set_spatial_orientation_hints(&[]);
+
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+
+        let iso = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        assert!(iso.valid);
+        let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+        assert!(tp.valid && tp.total_path_count > 0);
+
+        let mut skin_layers: Vec<&ffi::SelectedLayerInfo> = iso
+            .layers
+            .iter()
+            .filter(|l| {
+                l.is_top_layer
+                    && !l.is_first_layer
+                    && (l.max_thickness_mm - l.min_thickness_mm).abs() < 1.0e-4
+                    && (l.mean_thickness_mm - 0.20).abs() < 1.0e-3
+                    && l.branch_layer_count == 3
+                    && l.vertices.len() >= 2000
+            })
+            .collect();
+        skin_layers.sort_by_key(|l| l.branch_layer_index);
+        assert_eq!(
+            skin_layers.len(),
+            3,
+            "Expected 3 conformal skin layers on crowned block, got {}",
+            skin_layers.len()
+        );
+
+        let mut outer_bounds = [(0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32); 3];
+        for (idx, layer) in skin_layers.iter().enumerate() {
+            assert_eq!(layer.branch_layer_index, idx as u32);
+            let tp_layer = tp
+                .layers
+                .iter()
+                .find(|tl| tl.layer_index == layer.layer_index)
+                .expect("Missing toolpath layer for conformal skin layer");
+
+            let outer_walls: Vec<&ffi::ExtrusionPath> = tp_layer
+                .paths
+                .iter()
+                .filter(|p| p.feature_kind == 0 && p.is_closed)
+                .collect();
+            assert!(
+                !outer_walls.is_empty(),
+                "Conformal skin layer m={} missing closed OuterWall perimeter",
+                idx + 1
+            );
+            if idx < 2 {
+                let inner_walls_cnt = tp_layer.paths.iter().filter(|p| p.feature_kind == 1).count();
+                assert!(
+                    inner_walls_cnt > 0,
+                    "Deeper conformal skin layer m={} missing InnerWall perimeters",
+                    idx + 1
+                );
+            }
+
+            let mut min_x = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            for p in outer_walls {
+                for pt in &p.points {
+                    min_x = min_x.min(pt.x);
+                    max_x = max_x.max(pt.x);
+                    min_y = min_y.min(pt.y);
+                    max_y = max_y.max(pt.y);
+                }
+            }
+            outer_bounds[idx] = (min_x, max_x, min_y, max_y);
+        }
+
+        let (ref_min_x, ref_max_x, ref_min_y, ref_max_y) = outer_bounds[2];
+        for m in 0..2 {
+            let (mx0, mx1, my0, my1) = outer_bounds[m];
+            assert!(
+                (mx0 - ref_min_x).abs() <= 0.35
+                    && (mx1 - ref_max_x).abs() <= 0.35
+                    && (my0 - ref_min_y).abs() <= 0.35
+                    && (my1 - ref_max_y).abs() <= 0.35,
+                "Inner skin layer m={} OuterWall bounds {:?} retreated away from outermost m=3 bounds {:?}",
+                m + 1,
+                outer_bounds[m],
+                outer_bounds[2]
+            );
+        }
+
+        let default_cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(obj.object_id);
+    }
+
+    #[test]
+    fn test_conformal_skin_sloped_roof_with_hollow_smokestack_boss_smooth_and_deferred() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Single watertight non-self-intersecting polar + corner-snapped roof with hollow smokestack
+        let cx = -4.0_f32;
+        let cy = 0.0_f32;
+        let r_in = 2.0_f32;
+        let r_out = 3.5_f32;
+        let z_bore_floor = 6.0_f32;
+        let z_stack_top = 20.0_f32;
+        let z_roof = |x: f32, y: f32| -> f32 { 10.0 + 0.12 * (x + 12.0) - 0.015 * y * y };
+
+        let mut raw_angles = Vec::with_capacity(52);
+        for k in 0..48 {
+            raw_angles.push((k as f32) * (2.0 * std::f32::consts::PI / 48.0));
+        }
+        for &(bx, by) in &[(-12.0_f32, -12.0_f32), (12.0, -12.0), (12.0, 12.0), (-12.0, 12.0)] {
+            raw_angles.push((by - cy).atan2(bx - cx).rem_euclid(2.0 * std::f32::consts::PI));
+        }
+        raw_angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut thetas = Vec::with_capacity(raw_angles.len());
+        for th in raw_angles {
+            if th < 2.0 * std::f32::consts::PI - 1.0e-4
+                && thetas
+                    .last()
+                    .map_or(true, |&prev: &f32| (th - prev).abs() > 1.0e-4)
+            {
+                thetas.push(th);
+            }
+        }
+        let n_ang = thetas.len();
+        let n_rings = 8usize;
+
+        let mut stl = String::from("solid sloped_roof_smokestack\n");
+        let add_tri = |stl: &mut String, a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+            stl.push_str(&format!(
+                "  facet normal 0 0 0\n    outer loop\n      vertex {} {} {}\n      vertex {} {} {}\n      vertex {} {} {}\n    endloop\n  endfacet\n",
+                a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]
+            ));
+        };
+        let add_quad = |stl: &mut String, p00: [f32; 3], p10: [f32; 3], p11: [f32; 3], p01: [f32; 3]| {
+            add_tri(stl, p00, p10, p11);
+            add_tri(stl, p00, p11, p01);
+        };
+
+        let box_ray_dist = |dx: f32, dy: f32| -> f32 {
+            let tx = if dx > 1.0e-6 {
+                (12.0 - cx) / dx
+            } else if dx < -1.0e-6 {
+                (-12.0 - cx) / dx
+            } else {
+                f32::INFINITY
+            };
+            let ty = if dy > 1.0e-6 {
+                (12.0 - cy) / dy
+            } else if dy < -1.0e-6 {
+                (-12.0 - cy) / dy
+            } else {
+                f32::INFINITY
+            };
+            tx.min(ty)
+        };
+
+        let ring_xy = |theta: f32, r_frac: f32| -> (f32, f32) {
+            let dx = theta.cos();
+            let dy = theta.sin();
+            let r_box = box_ray_dist(dx, dy);
+            let r = r_out + r_frac * (r_box - r_out);
+            (
+                (cx + r * dx).clamp(-12.0, 12.0),
+                (cy + r * dy).clamp(-12.0, 12.0),
+            )
+        };
+
+        for a in 0..n_ang {
+            let th0 = thetas[a];
+            let th1 = thetas[(a + 1) % n_ang];
+            let (dx0, dy0) = (th0.cos(), th0.sin());
+            let (dx1, dy1) = (th1.cos(), th1.sin());
+
+            // Roof radial rings
+            for ri in 0..n_rings {
+                let f0 = ri as f32 / n_rings as f32;
+                let f1 = (ri + 1) as f32 / n_rings as f32;
+                let (x00, y00) = ring_xy(th0, f0);
+                let (x10, y10) = ring_xy(th0, f1);
+                let (x11, y11) = ring_xy(th1, f1);
+                let (x01, y01) = ring_xy(th1, f0);
+                add_quad(
+                    &mut stl,
+                    [x00, y00, z_roof(x00, y00)],
+                    [x10, y10, z_roof(x10, y10)],
+                    [x11, y11, z_roof(x11, y11)],
+                    [x01, y01, z_roof(x01, y01)],
+                );
+            }
+
+            // Outer box side walls and bottom fan
+            let (bx0, by0) = ring_xy(th0, 1.0);
+            let (bx1, by1) = ring_xy(th1, 1.0);
+            add_tri(&mut stl, [cx, cy, 0.0], [bx1, by1, 0.0], [bx0, by0, 0.0]);
+            add_quad(
+                &mut stl,
+                [bx0, by0, 0.0],
+                [bx1, by1, 0.0],
+                [bx1, by1, z_roof(bx1, by1)],
+                [bx0, by0, z_roof(bx0, by0)],
+            );
+
+            // Outer smokestack wall, top annulus, inner bore wall, and bore floor
+            let (sx0, sy0) = (cx + r_out * dx0, cy + r_out * dy0);
+            let (sx1, sy1) = (cx + r_out * dx1, cy + r_out * dy1);
+            let (ix0, iy0) = (cx + r_in * dx0, cy + r_in * dy0);
+            let (ix1, iy1) = (cx + r_in * dx1, cy + r_in * dy1);
+            add_quad(
+                &mut stl,
+                [sx0, sy0, z_roof(sx0, sy0)],
+                [sx1, sy1, z_roof(sx1, sy1)],
+                [sx1, sy1, z_stack_top],
+                [sx0, sy0, z_stack_top],
+            );
+            add_quad(
+                &mut stl,
+                [ix0, iy0, z_stack_top],
+                [sx0, sy0, z_stack_top],
+                [sx1, sy1, z_stack_top],
+                [ix1, iy1, z_stack_top],
+            );
+            add_quad(
+                &mut stl,
+                [ix1, iy1, z_bore_floor],
+                [ix0, iy0, z_bore_floor],
+                [ix0, iy0, z_stack_top],
+                [ix1, iy1, z_stack_top],
+            );
+            add_tri(&mut stl, [cx, cy, z_bore_floor], [ix0, iy0, z_bore_floor], [ix1, iy1, z_bore_floor]);
+        }
+        stl.push_str("endsolid sloped_roof_smokestack\n");
+
+        let tmp_path = std::env::temp_dir().join("manifold_test_sloped_roof_smokestack.stl");
+        std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write smokestack roof STL");
+        let obj = crate::io::stl::load_stl_file(&tmp_path)
+            .expect("Expected sloped roof smokestack STL load");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let mut cfg = crate::config::SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::ConstrainedNonPlanar;
+        cfg.eikonal.voxel_size_mm = 0.32;
+        cfg.eikonal.enable_multi_resolution_grid = false;
+        cfg.slicing.layer_height.target_mm = 0.25;
+        cfg.slicing.layer_height.min_mm = 0.14;
+        cfg.slicing.layer_height.max_mm = 0.36;
+        cfg.slicing.layer_height.first_layer_mm = 0.25;
+        cfg.slicing.layer_height.top_layer_mm = 0.20;
+        cfg.slicing.enable_auto_conformal_skin = true;
+        cfg.slicing.conformal_skin_layers = 3;
+        cfg.slicing.inner_wall_count = 2;
+        cfg.slicing.sanitize();
+        crate::ui::sync_config_to_backend(&cfg);
+        ffi::set_spatial_orientation_hints(&[]);
+
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+
+        let iso = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        assert!(iso.valid);
+        let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+        assert!(tp.valid && tp.total_path_count > 0);
+
+        let z_centroid_of = |l: &ffi::SelectedLayerInfo| -> f32 {
+            if l.vertices.is_empty() {
+                return 0.0;
+            }
+            let sum: f32 = l.vertices.iter().map(|v| v.z).sum();
+            sum / (l.vertices.len() as f32)
+        };
+
+        let mut roof_skin_layers: Vec<&ffi::SelectedLayerInfo> = iso
+            .layers
+            .iter()
+            .filter(|l| {
+                let zc = z_centroid_of(l);
+                l.is_top_layer
+                    && !l.is_first_layer
+                    && (l.mean_thickness_mm - 0.20).abs() < 1.0e-3
+                    && (9.0..=13.5).contains(&zc)
+            })
+            .collect();
+        assert!(
+            roof_skin_layers.len() >= 3,
+            "Expected >= 3 roof conformal skin layers, got {}",
+            roof_skin_layers.len()
+        );
+        roof_skin_layers.sort_by_key(|l| (l.branch_layer_index, l.layer_index));
+        let max_roof_skin_layer_index = roof_skin_layers
+            .iter()
+            .map(|l| l.layer_index)
+            .max()
+            .unwrap();
+
+        let upper_stack_layers: Vec<&ffi::SelectedLayerInfo> = iso
+            .layers
+            .iter()
+            .filter(|l| z_centroid_of(l) > 14.0)
+            .collect();
+        assert!(
+            !upper_stack_layers.is_empty(),
+            "Expected upper smokestack layers above z = 14.0 mm"
+        );
+        for stack_layer in &upper_stack_layers {
+            assert!(
+                stack_layer.layer_index > max_roof_skin_layer_index,
+                "Expected upper smokestack layer (#{}, zc={:.2}) to be causally deferred after roof skin layer (#{max_roof_skin_layer_index})",
+                stack_layer.layer_index,
+                z_centroid_of(stack_layer)
+            );
+        }
+
+        let outermost_roof_skin = roof_skin_layers.last().copied().unwrap();
+        let tp_outer = tp
+            .layers
+            .iter()
+            .find(|tl| tl.layer_index == outermost_roof_skin.layer_index)
+            .expect("Missing toolpath layer for outermost roof conformal skin");
+        let outer_walls: Vec<&ffi::ExtrusionPath> = tp_outer
+            .paths
+            .iter()
+            .filter(|p| p.feature_kind == 0)
+            .collect();
+        let outer_wall_len: f32 = outer_walls.iter().map(|p| p.total_length_mm).sum();
+        assert!(
+            (1..=2).contains(&outer_walls.len()) && outer_wall_len < 140.0,
+            "Expected smooth non-fragmented collar on outermost roof skin layer (count={}, len={:.2} mm)",
+            outer_walls.len(),
+            outer_wall_len
+        );
+
+        let default_cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(obj.object_id);
+    }
+
+    #[test]
+    fn test_conformal_skin_benchy_5axis_roof_smooth_and_smokestack_deferred() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path_3mf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Test Objects/benchy-5axis.3mf");
+        if !path_3mf.exists() {
+            return;
+        }
+
+        let report = crate::io::load_files_into_backend(&[path_3mf]);
+        let mut cfg = report.restored_config.expect("Expected config in benchy-5axis.3mf");
+        let obj = &report.objects[0];
+        cfg.slicing.enable_auto_conformal_skin = true;
+        cfg.slicing.sanitize();
+        crate::ui::sync_config_to_backend(&cfg);
+        ffi::set_spatial_orientation_hints(&[]);
+
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+
+        let iso = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        assert!(iso.valid && !iso.layers.is_empty());
+        let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+        assert!(tp.valid && tp.total_path_count > 0);
+        assert_eq!(iso.layers.len(), tp.layers.len());
+
+        let z_stats = |l: &ffi::SelectedLayerInfo| -> (f32, f32, f32) {
+            let mut zmin = f32::INFINITY;
+            let mut zmax = f32::NEG_INFINITY;
+            let mut sum = 0.0_f32;
+            for v in &l.vertices {
+                zmin = zmin.min(v.z);
+                zmax = zmax.max(v.z);
+                sum += v.z;
+            }
+            let mean = if l.vertices.is_empty() { 0.0 } else { sum / l.vertices.len() as f32 };
+            (zmin, zmax, mean)
+        };
+
+        let top_h = cfg.slicing.layer_height.top_layer_mm;
+        let mut roof_skins: Vec<&ffi::SelectedLayerInfo> = iso
+            .layers
+            .iter()
+            .filter(|l| {
+                let (_, _, zc) = z_stats(l);
+                l.is_top_layer
+                    && !l.is_first_layer
+                    && (l.mean_thickness_mm - top_h).abs() < 1.0e-3
+                    && (36.5..=40.8).contains(&zc)
+            })
+            .collect();
+        assert!(
+            roof_skins.len() >= 3,
+            "Expected >= 3 cabin roof conformal skin layers on benchy-5axis.3mf, got {}",
+            roof_skins.len()
+        );
+        roof_skins.sort_by_key(|l| (l.branch_layer_index, l.layer_index));
+        let max_roof_idx = roof_skins.iter().map(|l| l.layer_index).max().unwrap();
+
+        let upper_stack: Vec<&ffi::SelectedLayerInfo> = iso
+            .layers
+            .iter()
+            .filter(|l| !l.vertices.is_empty() && z_stats(l).0 > 41.5)
+            .collect();
+        assert!(
+            !upper_stack.is_empty(),
+            "Expected upper smokestack layers with z_min > 41.5 mm on benchy-5axis.3mf"
+        );
+        for l in &upper_stack {
+            assert!(
+                l.layer_index > max_roof_idx,
+                "Benchy smokestack layer #{} (z_min={:.2}) was not deferred after cabin roof skin #{}",
+                l.layer_index,
+                z_stats(l).0,
+                max_roof_idx
+            );
+        }
+
+        let outermost_roof = roof_skins.last().copied().unwrap();
+        let tp_roof = tp
+            .layers
+            .iter()
+            .find(|tl| tl.layer_index == outermost_roof.layer_index)
+            .unwrap();
+        let ow_cnt = tp_roof.paths.iter().filter(|p| p.feature_kind == 0).count();
+        println!(
+            "Benchy 5-axis roof skin: layers={}, max_roof_idx={}, stack_min_idx={}, outermost_roof OW={}",
+            roof_skins.len(),
+            max_roof_idx,
+            upper_stack.iter().map(|l| l.layer_index).min().unwrap(),
+            ow_cnt
+        );
+        assert!(
+            (1..=4).contains(&ow_cnt),
+            "Expected smooth non-fragmented OuterWall loops (1..=4) on Benchy cabin roof skin, got {ow_cnt}"
+        );
+
+        let default_cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(obj.object_id);
+    }
+
+    #[test]
     fn test_layer_and_within_layer_scrub_tracks_tool_and_gravity() {
         let mut cfg = SlicerConfig::default();
         cfg.machine.kinematics_mode = crate::config::FiveAxisKinematicsMode::FiveAxisBC;

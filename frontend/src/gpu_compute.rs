@@ -397,31 +397,45 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let max_plausible_tau = u.scalars1.y;
     let radial_step = u.scalars1.w;
 
-    let z_sweep_max = min(max_z_along_nozzle, min(max_tool_h, 12.0));
+    let z_sweep_max = min(max_z_along_nozzle, min(max_tool_h, skin_depth_mm + 3.0 * h_top));
     let z_start = max(0.60 * h_top, 0.50 * fine_voxel);
     if (z_sweep_max <= z_start) {
         out_flags[idx] = 0u;
         return;
     }
 
-    let near_tip_limit = skin_depth_mm + max(1.75 * h_top, 1.35 * fine_voxel);
+    let near_tip_limit = skin_depth_mm + max(1.25 * h_top, 1.0 * fine_voxel);
+    let tip_orifice_limit_z = skin_depth_mm + 0.85 * h_top;
+    let tip_orifice_clear_r = u.scalars0.x + u.scalars0.y + 0.25 * fine_voxel;
     let print_tau_tol = print_tau + 0.65 * h_top;
     let base_curv_tol = max(0.45 * h_top, 0.35 * fine_voxel);
     let margin_extra = max(0.65 * fine_voxel, 0.85 * h_top);
 
-    var dirs12 = array<vec2<f32>, 12>(
+    var dirs24 = array<vec2<f32>, 24>(
         vec2<f32>(1.0, 0.0),
+        vec2<f32>(0.9659258, 0.2588190),
         vec2<f32>(0.8660254, 0.5),
+        vec2<f32>(0.7071068, 0.7071068),
         vec2<f32>(0.5, 0.8660254),
+        vec2<f32>(0.2588190, 0.9659258),
         vec2<f32>(0.0, 1.0),
+        vec2<f32>(-0.2588190, 0.9659258),
         vec2<f32>(-0.5, 0.8660254),
+        vec2<f32>(-0.7071068, 0.7071068),
         vec2<f32>(-0.8660254, 0.5),
+        vec2<f32>(-0.9659258, 0.2588190),
         vec2<f32>(-1.0, 0.0),
+        vec2<f32>(-0.9659258, -0.2588190),
         vec2<f32>(-0.8660254, -0.5),
+        vec2<f32>(-0.7071068, -0.7071068),
         vec2<f32>(-0.5, -0.8660254),
+        vec2<f32>(-0.2588190, -0.9659258),
         vec2<f32>(0.0, -1.0),
+        vec2<f32>(0.2588190, -0.9659258),
         vec2<f32>(0.5, -0.8660254),
-        vec2<f32>(0.8660254, -0.5)
+        vec2<f32>(0.7071068, -0.7071068),
+        vec2<f32>(0.8660254, -0.5),
+        vec2<f32>(0.9659258, -0.2588190)
     );
 
     var near_margin = false;
@@ -433,7 +447,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let r_clear = eval_tool_clearance_radius_at_z(z);
         let r_margin = select(r_clear, r_clear + margin_extra, z <= near_tip_limit + 2.0 * h_top);
         let p_axis = x_base + z * z_axis;
-        let slice_tau_limit = select(print_tau_tol, max_plausible_tau, z <= near_tip_limit);
+        let allow_future_at_z = z <= tip_orifice_limit_z;
+        let slice_tau_limit = select(print_tau_tol, max_plausible_tau, allow_future_at_z);
         let z_step = select(
             max(0.95 * fine_voxel, 0.65),
             max(0.55 * fine_voxel, 0.65 * h_top),
@@ -453,7 +468,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 is_brick_possibly_occupied(p_axis, slice_tau_limit)) {
                 let st = sample_dense_sdf_and_tau(p_axis);
                 if (st.x <= 0.08 * fine_voxel) {
-                    if (z <= near_tip_limit || st.y <= print_tau_tol) {
+                    if (st.y <= print_tau_tol || allow_future_at_z) {
                         out_flags[idx] = 1u;
                         return;
                     }
@@ -470,9 +485,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             let curv_tol = base_curv_tol + 0.03 * r;
             let check_steep_core = z > skin_depth_mm + 0.75 * h_top;
+            let allow_future_tip = allow_future_at_z && (r <= tip_orifice_clear_r);
 
-            for (var d = 0u; d < 12u; d = d + 1u) {
-                let dir = dirs12[d];
+            for (var d = 0u; d < 24u; d = d + 1u) {
+                let dir = dirs24[d];
                 let r_vec = x_axis * dir.x + y_axis * dir.y;
                 let y_pos = p_axis + r * r_vec;
 
@@ -487,7 +503,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let max_allowed_tau = select(
                     print_tau_tol,
                     max_plausible_tau,
-                    above_surf && (z <= near_tip_limit)
+                    above_surf && allow_future_tip
                 );
                 if (!is_brick_possibly_occupied(y_pos, max_allowed_tau)) {
                     continue;
@@ -500,7 +516,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
                 var hits_obstacle = false;
                 if (above_surf) {
-                    if (z <= near_tip_limit || st.y <= print_tau_tol) {
+                    if (st.y <= print_tau_tol || allow_future_tip) {
                         hits_obstacle = true;
                     }
                 } else if (above_base && st.x <= -(skin_depth_mm + 0.35 * h_top)) {

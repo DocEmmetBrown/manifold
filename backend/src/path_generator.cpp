@@ -2753,7 +2753,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     float objectMinAxialBed,
     const openvdb::FloatGrid* filamentSlotGrid,
     const openvdb::FloatGrid* coarseFilamentSlotGrid,
-    bool bedTiltsWithRotaryAxes)
+    bool bedTiltsWithRotaryAxes,
+    const openvdb::Vec3SGrid* skinToolAxisGrid)
 {
     ObjectToolpathsResult result{};
     result.valid = false;
@@ -2886,6 +2887,13 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 cToolSamplerPtr = std::make_unique<ToolSampler>(*cToolAccPtr, coarseToolAxisGrid->transform());
             }
 
+            std::unique_ptr<ToolAcc> skinToolAccPtr;
+            std::unique_ptr<ToolSampler> skinToolSamplerPtr;
+            if (skinToolAxisGrid != nullptr) {
+                skinToolAccPtr = std::make_unique<ToolAcc>(skinToolAxisGrid->getConstAccessor());
+                skinToolSamplerPtr = std::make_unique<ToolSampler>(*skinToolAccPtr, skinToolAxisGrid->transform());
+            }
+
             std::unique_ptr<FloatAcc> ovAccPtr;
             std::unique_ptr<FloatSampler> ovSamplerPtr;
             if (overhangGrid != nullptr) {
@@ -2943,6 +2951,19 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
                 }
                 return fallbackNozzle;
+            };
+
+            auto sampleSkinToolAxis = [&](const Vec3f& p, Vec3f& outAxis) -> bool {
+                if (skinToolSamplerPtr == nullptr) {
+                    return false;
+                }
+                const openvdb::Vec3s v = skinToolSamplerPtr->wsSample(openvdb::Vec3d(p.x, p.y, p.z));
+                const Vec3f raw{v.x(), v.y(), v.z()};
+                if (lengthSq3(raw) > 0.04f) {
+                    outAxis = normalize3(raw, fallbackNozzle);
+                    return true;
+                }
+                return false;
             };
 
             auto sampleGravityDir = [&](const Vec3f& p) -> Vec3f {
@@ -3068,7 +3089,14 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     nIso = nIso * -1.0f;
                 }
                 const float gammaMax = computeBedSafeMaxTiltRad(p);
-                if (isConformalSkin || orientOuterSurfacesToNormal) {
+                if (isConformalSkin) {
+                    Vec3f skinAx{};
+                    if (sampleSkinToolAxis(p, skinAx)) {
+                        return clampVecToCone(skinAx, fallbackNozzle, gammaMax);
+                    }
+                    return clampVecToCone(nIso, fallbackNozzle, gammaMax);
+                }
+                if (orientOuterSurfacesToNormal) {
                     return clampVecToCone(nIso, fallbackNozzle, gammaMax);
                 }
                 return clampVecToCone(sampleNozzleAxis(p), fallbackNozzle, gammaMax);
@@ -3090,11 +3118,18 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 }
                 const float gammaMax = computeBedSafeMaxTiltRad(p);
                 const Vec3f isoAxis = clampVecToCone(nIso, fallbackNozzle, gammaMax);
+                Vec3f skinAx{};
+                const bool hasSkinAx = isConformalSkin && sampleSkinToolAxis(p, skinAx);
+                const Vec3f baseSkinIso =
+                    hasSkinAx ? clampVecToCone(skinAx, fallbackNozzle, gammaMax) : isoAxis;
 
                 if (!orientOuterSurfacesToNormal) {
                     return isConformalSkin
-                        ? isoAxis
+                        ? baseSkinIso
                         : clampVecToCone(sampleNozzleAxis(p), fallbackNozzle, gammaMax);
+                }
+                if (isConformalSkin && hasSkinAx && dot3(baseSkinIso, isoAxis) < 0.9993f) {
+                    return baseSkinIso;
                 }
 
                 const Vec3f nSurf = sampleOutwardSdfNormal(p, nIso, isConformalSkin);
@@ -3113,7 +3148,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         return surfAxis;
                     }
                 }
-                return isoAxis;
+                return isConformalSkin ? baseSkinIso : isoAxis;
             };
 
             auto sampleEikGradNorm = [&](const Vec3f& p) -> float {
@@ -3341,7 +3376,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 std::vector<float> dFromClipBoundary;
                 if (!isConformalSkinLayer &&
                     std::isfinite(minBoundarySdf) &&
-                    minBoundarySdf < -0.50f * hMin) {
+                    minBoundarySdf < -0.15f * voxelSize) {
                     dFromClipBoundary = computeOnSurfaceBoundaryDistance(
                         baseMesh,
                         shellThicknessMm + 0.5f * outerW.target_mm);
@@ -3903,9 +3938,16 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             : rawHStep;
                         const Vec3f localGrav = sampleGravityDir(p);
                         const float phiCurr = sampleSdf(p) - sdfZeroShift;
-                        const float sdfDownNoz = sampleSdf(p - (zNoz * hStep)) - sdfZeroShift;
-                        const float sdfDownGrav = sampleSdf(p + (localGrav * hStep)) - sdfZeroShift;
-                        const float phiBelow = std::max(sdfDownNoz, sdfDownGrav);
+                        float phiBelow = 0.0f;
+                        if (isConformalSkinLayer) {
+                            phiBelow = sampleSdf(
+                                           p - (normalize3(shellMesh.verts[i].normal, zNoz) * hStep)) -
+                                       sdfZeroShift;
+                        } else {
+                            const float sdfDownNoz = sampleSdf(p - (zNoz * hStep)) - sdfZeroShift;
+                            const float sdfDownGrav = sampleSdf(p + (localGrav * hStep)) - sdfZeroShift;
+                            phiBelow = std::max(sdfDownNoz, sdfDownGrav);
+                        }
                         const float downwardSlope = (phiBelow - phiCurr) / std::max(hStep, 1.0e-4f);
                         const float ov = std::min(
                             sampleOverhang(p),

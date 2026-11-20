@@ -9,6 +9,7 @@
 #include <numeric>
 #include <queue>
 #include <string>
+#include <unordered_map>
 
 #include <openvdb/tools/Interpolation.h>
 #include <tbb/blocked_range.h>
@@ -650,6 +651,7 @@ void ActiveVolumeDomain::initializeFromSdfGrid(
     overhang.clear();
     tau.clear();
     slowness.clear();
+    baseSlowness.clear();
     targetDir.clear();
     toolAxis.clear();
     toolTiltDeg.clear();
@@ -686,6 +688,7 @@ void ActiveVolumeDomain::initializeFromSdfGrid(
     overhang.assign(n, 0.0f);
     tau.assign(n, kInfinityTau);
     slowness.assign(n, 1.0f);
+    baseSlowness.assign(n, 1.0f);
     targetDir.assign(n, {0.0f, 0.0f, 1.0f});
     toolAxis.assign(n, {0.0f, 0.0f, 1.0f});
     toolTiltDeg.assign(n, 0.0f);
@@ -1237,7 +1240,8 @@ void OverhangIslandConstraint::applyPreSweepModifiers(
         tbb::blocked_range<std::size_t>(0, n, 512),
         [&](const tbb::blocked_range<std::size_t>& r) {
             for (std::size_t i = r.begin(); i != r.end(); ++i) {
-                domain.slowness[i] = 1.0f;
+                domain.slowness[i] =
+                    (i < domain.baseSlowness.size()) ? domain.baseSlowness[i] : 1.0f;
                 if (!domain.isInterior[i]) {
                     continue;
                 }
@@ -2152,6 +2156,461 @@ void evaluateSupportNeededAndSeedOrderField(
     }
 }
 
+/// Interior variable-layer-height cushion state for aligning sloped/curved upward crown patches
+/// toward uniform \tau isosurfaces before protruding bosses begin.
+struct CrownPatchData {
+    std::vector<std::size_t> surfGlobalIdx;
+    std::vector<std::array<float, 3>> surfNormals;
+    std::vector<std::vector<std::size_t>> surfAdjLocal;
+    std::vector<float> colMult;
+    float dCushion = 1.0f;
+};
+
+struct CrownAlignmentState {
+    bool active = false;
+    float sMin = 0.5f;
+    float sMax = 2.0f;
+    std::vector<CrownPatchData> patches;
+    std::vector<std::int32_t> voxelPatchId;
+    std::vector<std::size_t> voxelSrcLocalIdx;
+    std::vector<float> voxelCushionWeight;
+};
+
+CrownAlignmentState buildCrownAlignmentState(
+    const ActiveVolumeDomain& domain,
+    const EikonalSolverContext& ctx)
+{
+    CrownAlignmentState state{};
+    const std::size_t n = domain.coords.size();
+    if (n == 0 || !domain.indexGrid || !domain.transform || ctx.heightOnlyOrderField) {
+        return state;
+    }
+    if (!ctx.conformalSkin.auto_enabled && ctx.conformalSkinHints.empty()) {
+        return state;
+    }
+
+    const float hTarget = std::max(0.02f, ctx.layerHeight.target_mm);
+    const float hMin = std::clamp(ctx.layerHeight.min_mm, 0.01f, hTarget);
+    const float hMax = std::max(hTarget, ctx.layerHeight.max_mm);
+    const float sMin = std::clamp(hTarget / std::max(hMax, 1.0e-3f), 0.45f, 1.0f);
+    const float sMax = std::clamp(hTarget / std::max(hMin, 1.0e-3f), 1.0f, 2.5f);
+    if (sMax - sMin <= 0.08f) {
+        return state;
+    }
+    state.sMin = sMin;
+    state.sMax = sMax;
+
+    const float dx = static_cast<float>(domain.voxelSize);
+    const float maxSlopeRad =
+        std::clamp(ctx.conformalSkin.max_slope_angle_deg, 10.0f, 85.0f) * kDegToRad;
+    const float cosMaxSlope = std::cos(maxSlopeRad);
+    const float clearanceSlopeRad =
+        ToolClearanceConstraint::computeMaxClearanceSlopeRad(ctx.activeTool) +
+        (ctx.activeTool.has_rotational_axes
+             ? std::clamp(ctx.activeTool.max_angle_from_bed_normal_deg, 0.0f, 85.0f) * kDegToRad
+             : 0.0f);
+    const float cosClearance =
+        std::cos(std::clamp(clearanceSlopeRad, 5.0f * kDegToRad, 85.0f * kDegToRad));
+    const float minSlopeCos = std::max(cosMaxSlope, cosClearance);
+    const float minHBed = std::max(3.5f * dx, 3.0f * hTarget);
+
+    std::vector<const SpatialOrientationHint*> includeHints;
+    std::vector<const SpatialOrientationHint*> excludeHints;
+    for (const auto& h : ctx.conformalSkinHints) {
+        if (h.skin_layer_count == 0 || h.weight <= 0.0f) {
+            excludeHints.push_back(&h);
+        } else {
+            includeHints.push_back(&h);
+        }
+    }
+
+    auto matchesHintList = [&](
+        const std::array<float, 3>& pos,
+        const std::array<float, 3>& nSurf,
+        const std::vector<const SpatialOrientationHint*>& list,
+        float minDotDir) -> bool {
+        for (const SpatialOrientationHint* hp : list) {
+            const float dxH = pos[0] - hp->position_bed[0];
+            const float dyH = pos[1] - hp->position_bed[1];
+            const float dzH = pos[2] - hp->position_bed[2];
+            const float rad = std::max(hp->influence_radius_mm, 1.5f * dx);
+            const float distSq = dxH * dxH + dyH * dyH + dzH * dzH;
+            if (distSq > rad * rad) {
+                continue;
+            }
+            const float normalDist =
+                dxH * hp->direction_bed[0] +
+                dyH * hp->direction_bed[1] +
+                dzH * hp->direction_bed[2];
+            const float maxNormalOffset = std::max(2.5f * dx, 0.25f * rad);
+            const float dotDir = dot3(nSurf, hp->direction_bed);
+            if (std::abs(normalDist) <= maxNormalOffset && dotDir >= minDotDir) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::vector<std::uint8_t> isCand(n, 0);
+    std::vector<float> candHBed(n, 0.0f);
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, n, 256),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                if (!domain.isInterior[i] || domain.isSeed[i] ||
+                    domain.tau[i] >= 0.5f * kInfinityTau) {
+                    continue;
+                }
+                if (std::abs(domain.sdf[i]) > 1.35f * dx) {
+                    continue;
+                }
+                const auto& pos = domain.posBed[i];
+                const auto& nSurf = domain.sdfGrad[i];
+                const NozzleBasis baseFrame =
+                    ctx.backend.queryNozzleFrame(pos, {1.0f, 0.0f, 0.0f});
+                const auto& zNoz = baseFrame.nozzle_axis;
+                const float hBed = dot3(pos, zNoz) - domain.minZBed;
+                if (hBed <= minHBed) {
+                    continue;
+                }
+
+                if (matchesHintList(pos, nSurf, excludeHints, 0.80f)) {
+                    continue;
+                }
+                const bool isManual = matchesHintList(pos, nSurf, includeHints, 0.85f);
+                if (!isManual) {
+                    if (!ctx.conformalSkin.auto_enabled || dot3(nSurf, zNoz) < minSlopeCos) {
+                        continue;
+                    }
+                } else if (dot3(nSurf, zNoz) < 0.10f) {
+                    continue;
+                }
+
+                // Require local surface normal coherence across 6-neighbors
+                float sumDot = 0.0f;
+                int cntDot = 0;
+                for (const std::int32_t nb : domain.neighbors6[i]) {
+                    if (nb >= 0) {
+                        sumDot += dot3(nSurf, domain.sdfGrad[static_cast<std::size_t>(nb)]);
+                        ++cntDot;
+                    }
+                }
+                if (cntDot > 0 && (sumDot / static_cast<float>(cntDot)) < 0.85f) {
+                    continue;
+                }
+
+                // Require free air overhead (+2*dx, +4*dx along +nSurf) so enclosed internal arches
+                // are not warped by top-crown slowness softening
+                bool blockedOverhead = false;
+                for (const float stepMult : {2.0f, 4.0f}) {
+                    const float stepMm = stepMult * dx;
+                    const openvdb::Vec3d wpOver(
+                        pos[0] + stepMm * nSurf[0],
+                        pos[1] + stepMm * nSurf[1],
+                        pos[2] + stepMm * nSurf[2]);
+                    const openvdb::Coord cOver =
+                        domain.transform->worldToIndexCellCentered(wpOver);
+                    const std::int32_t overIdx = domain.findVoxelIndex(cOver);
+                    if (overIdx >= 0 &&
+                        domain.isInterior[static_cast<std::size_t>(overIdx)] &&
+                        domain.sdf[static_cast<std::size_t>(overIdx)] <= -0.25f * dx) {
+                        blockedOverhead = true;
+                        break;
+                    }
+                }
+                if (blockedOverhead) {
+                    continue;
+                }
+
+                // Require solid backing below (-2*dx along -nSurf)
+                const float inMm = 2.0f * dx;
+                const openvdb::Vec3d wpIn(
+                    pos[0] - inMm * nSurf[0],
+                    pos[1] - inMm * nSurf[1],
+                    pos[2] - inMm * nSurf[2]);
+                const std::int32_t inIdx =
+                    domain.findVoxelIndex(domain.transform->worldToIndexCellCentered(wpIn));
+                if (inIdx < 0 || !domain.isInterior[static_cast<std::size_t>(inIdx)]) {
+                    continue;
+                }
+
+                isCand[i] = 1;
+                candHBed[i] = hBed;
+            }
+        });
+
+    std::vector<std::int32_t> surfLocalMap(n, -1);
+    std::vector<std::uint8_t> visited(n, 0);
+    std::vector<std::size_t> compQueue;
+    compQueue.reserve(1024);
+
+    for (std::size_t seed = 0; seed < n; ++seed) {
+        if (!isCand[seed] || visited[seed]) {
+            continue;
+        }
+        compQueue.clear();
+        visited[seed] = 1;
+        compQueue.push_back(seed);
+        std::size_t head = 0;
+        while (head < compQueue.size()) {
+            const std::size_t u = compQueue[head++];
+            const openvdb::Coord& cu = domain.coords[u];
+            const auto& nU = domain.sdfGrad[u];
+            const auto& pU = domain.posBed[u];
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dxOff = -1; dxOff <= 1; ++dxOff) {
+                        if (dxOff == 0 && dy == 0 && dz == 0) {
+                            continue;
+                        }
+                        const std::int32_t nb =
+                            domain.findVoxelIndex(cu.offsetBy(dxOff, dy, dz));
+                        if (nb < 0) {
+                            continue;
+                        }
+                        const auto v = static_cast<std::size_t>(nb);
+                        if (!isCand[v] || visited[v]) {
+                            continue;
+                        }
+                        if (dot3(nU, domain.sdfGrad[v]) < 0.88f) {
+                            continue;
+                        }
+                        const std::array<float, 3> diff{
+                            domain.posBed[v][0] - pU[0],
+                            domain.posBed[v][1] - pU[1],
+                            domain.posBed[v][2] - pU[2]};
+                        if (std::abs(dot3(diff, nU)) > 0.90f * dx) {
+                            continue;
+                        }
+                        visited[v] = 1;
+                        compQueue.push_back(v);
+                    }
+                }
+            }
+        }
+
+        if (compQueue.size() < 6) {
+            continue;
+        }
+        std::vector<float> taus;
+        taus.reserve(compQueue.size());
+        double sumH = 0.0;
+        for (const std::size_t v : compQueue) {
+            taus.push_back(domain.tau[v]);
+            sumH += static_cast<double>(candHBed[v]);
+        }
+        std::sort(taus.begin(), taus.end());
+        const float tauP05 = taus[(taus.size() * 5) / 100];
+        const float tauP95 = taus[(taus.size() * 95) / 100];
+        if ((tauP95 - tauP05) < 0.85f * hTarget) {
+            continue;
+        }
+
+        const float meanHBed = static_cast<float>(sumH / static_cast<double>(compQueue.size()));
+        const float minCush = std::max(4.0f * hTarget, 3.0f * dx);
+        const float maxCush = std::max(minCush, 0.45f * meanHBed);
+        const float dCush = std::clamp(
+            (tauP95 - tauP05) / std::max(0.15f, 0.60f * (sMax - sMin)),
+            minCush,
+            maxCush);
+
+        const int patchIdx = static_cast<int>(state.patches.size());
+        CrownPatchData patch{};
+        patch.dCushion = dCush;
+        patch.surfGlobalIdx = compQueue;
+        patch.surfNormals.reserve(compQueue.size());
+        for (std::size_t k = 0; k < compQueue.size(); ++k) {
+            const std::size_t gv = compQueue[k];
+            surfLocalMap[gv] = patchIdx;
+            patch.surfNormals.push_back(domain.sdfGrad[gv]);
+        }
+        patch.colMult.assign(compQueue.size(), 1.0f);
+        patch.surfAdjLocal.resize(compQueue.size());
+
+        std::unordered_map<std::size_t, std::size_t> globalToLocal;
+        globalToLocal.reserve(compQueue.size() * 2);
+        for (std::size_t k = 0; k < compQueue.size(); ++k) {
+            globalToLocal.emplace(compQueue[k], k);
+        }
+        for (std::size_t k = 0; k < compQueue.size(); ++k) {
+            const openvdb::Coord& cu = domain.coords[compQueue[k]];
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dxOff = -1; dxOff <= 1; ++dxOff) {
+                        if (dxOff == 0 && dy == 0 && dz == 0) {
+                            continue;
+                        }
+                        const std::int32_t nb =
+                            domain.findVoxelIndex(cu.offsetBy(dxOff, dy, dz));
+                        if (nb >= 0) {
+                            auto it = globalToLocal.find(static_cast<std::size_t>(nb));
+                            if (it != globalToLocal.end()) {
+                                patch.surfAdjLocal[k].push_back(it->second);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        state.patches.push_back(std::move(patch));
+    }
+
+    if (state.patches.empty()) {
+        return state;
+    }
+
+    // Propagate downward interior cushions from each crown patch without crossing into protruding bosses
+    state.voxelPatchId.assign(n, -1);
+    state.voxelSrcLocalIdx.assign(n, 0);
+    state.voxelCushionWeight.assign(n, 0.0f);
+    std::vector<float> minDist(n, std::numeric_limits<float>::max());
+
+    using CushItem = std::pair<float, std::size_t>;
+    std::priority_queue<CushItem, std::vector<CushItem>, std::greater<CushItem>> pq;
+    for (std::size_t pId = 0; pId < state.patches.size(); ++pId) {
+        const auto& patch = state.patches[pId];
+        for (std::size_t loc = 0; loc < patch.surfGlobalIdx.size(); ++loc) {
+            const std::size_t gv = patch.surfGlobalIdx[loc];
+            state.voxelPatchId[gv] = static_cast<std::int32_t>(pId);
+            state.voxelSrcLocalIdx[gv] = loc;
+            minDist[gv] = 0.0f;
+            pq.push({0.0f, gv});
+        }
+    }
+
+    while (!pq.empty()) {
+        const auto [dCurr, u] = pq.top();
+        pq.pop();
+        if (dCurr > minDist[u] + 1.0e-5f) {
+            continue;
+        }
+        const int pId = state.voxelPatchId[u];
+        const std::size_t srcLoc = state.voxelSrcLocalIdx[u];
+        const auto& patch = state.patches[static_cast<std::size_t>(pId)];
+        const std::size_t srcGlobal = patch.surfGlobalIdx[srcLoc];
+        const auto& srcPos = domain.posBed[srcGlobal];
+        const auto& srcN = patch.surfNormals[srcLoc];
+        const float nextDist = dCurr + dx;
+        if (nextDist > patch.dCushion) {
+            continue;
+        }
+
+        for (const std::int32_t nb : domain.neighbors6[u]) {
+            if (nb < 0) {
+                continue;
+            }
+            const auto v = static_cast<std::size_t>(nb);
+            if (!domain.isInterior[v] || domain.isSeed[v]) {
+                continue;
+            }
+            const std::array<float, 3> rel{
+                domain.posBed[v][0] - srcPos[0],
+                domain.posBed[v][1] - srcPos[1],
+                domain.posBed[v][2] - srcPos[2]};
+            // Never propagate upward above the crown surface into a protruding boss
+            if (dot3(rel, srcN) > 0.35f * dx) {
+                continue;
+            }
+            if (nextDist < minDist[v]) {
+                minDist[v] = nextDist;
+                state.voxelPatchId[v] = pId;
+                state.voxelSrcLocalIdx[v] = srcLoc;
+                pq.push({nextDist, v});
+            }
+        }
+    }
+
+    for (std::size_t i = 0; i < n; ++i) {
+        const int pId = state.voxelPatchId[i];
+        if (pId >= 0) {
+            const float dCush = state.patches[static_cast<std::size_t>(pId)].dCushion;
+            const float u = std::clamp(1.0f - minDist[i] / std::max(dCush, 1.0e-4f), 0.0f, 1.0f);
+            state.voxelCushionWeight[i] = u * u * (3.0f - 2.0f * u);
+        }
+    }
+
+    state.active = true;
+    return state;
+}
+
+void updateCrownSlownessAndDirections(
+    ActiveVolumeDomain& domain,
+    CrownAlignmentState& state)
+{
+    if (!state.active) {
+        return;
+    }
+
+    for (auto& patch : state.patches) {
+        const std::size_t m = patch.surfGlobalIdx.size();
+        if (m == 0) {
+            continue;
+        }
+        std::vector<float> taus;
+        taus.reserve(m);
+        for (const std::size_t gv : patch.surfGlobalIdx) {
+            if (domain.tau[gv] < 0.5f * kInfinityTau) {
+                taus.push_back(domain.tau[gv]);
+            }
+        }
+        if (taus.empty()) {
+            continue;
+        }
+        std::sort(taus.begin(), taus.end());
+        const float tauGoal = taus[taus.size() / 2];
+
+        for (std::size_t k = 0; k < m; ++k) {
+            const float curTau = domain.tau[patch.surfGlobalIdx[k]];
+            if (curTau < 0.5f * kInfinityTau) {
+                const float delta = 0.60f * (tauGoal - curTau) / std::max(patch.dCushion, 1.0e-3f);
+                patch.colMult[k] = std::clamp(patch.colMult[k] + delta, state.sMin, state.sMax);
+            }
+        }
+
+        std::vector<float> nextMult = patch.colMult;
+        for (int pass = 0; pass < 2; ++pass) {
+            for (std::size_t k = 0; k < m; ++k) {
+                float sum = 2.0f * patch.colMult[k];
+                float wSum = 2.0f;
+                for (const std::size_t nbLoc : patch.surfAdjLocal[k]) {
+                    sum += patch.colMult[nbLoc];
+                    wSum += 1.0f;
+                }
+                nextMult[k] = sum / wSum;
+            }
+            patch.colMult.swap(nextMult);
+        }
+    }
+
+    const std::size_t n = domain.coords.size();
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, n, 512),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                const int pId = state.voxelPatchId[i];
+                if (pId < 0) {
+                    continue;
+                }
+                const auto& patch = state.patches[static_cast<std::size_t>(pId)];
+                const std::size_t loc = state.voxelSrcLocalIdx[i];
+                const float mult = patch.colMult[loc];
+                const float w = state.voxelCushionWeight[i];
+                const float sEff = std::clamp(1.0f + w * (mult - 1.0f), state.sMin, state.sMax);
+                domain.baseSlowness[i] = sEff;
+                domain.slowness[i] = sEff;
+
+                const float wDir = 0.80f * w * w;
+                const auto& dCur = domain.targetDir[i];
+                const auto& nSrc = patch.surfNormals[loc];
+                domain.targetDir[i] = normalize3(
+                    {(1.0f - wDir) * dCur[0] + wDir * nSrc[0],
+                     (1.0f - wDir) * dCur[1] + wDir * nSrc[1],
+                     (1.0f - wDir) * dCur[2] + wDir * nSrc[2]},
+                    dCur);
+            }
+        });
+}
+
 } // namespace
 
 EikonalSolveResult solveConstrainedEikonal(
@@ -2338,6 +2797,8 @@ EikonalSolveResult solveConstrainedEikonal(
         iterCtx.outerIteration = 0;
         overhangConstraint.enforceOnField(domain, iterCtx);
 
+        CrownAlignmentState crownState = buildCrownAlignmentState(domain, iterCtx);
+
         // 3. Step B: Outer Iterative Tool-Orientation & Constraint Relaxation Loop
         const std::uint32_t totalIters = std::clamp<std::uint32_t>(baseContext.totalIterations, 1, 16);
         for (std::uint32_t iter = 0; iter < totalIters; ++iter) {
@@ -2353,8 +2814,9 @@ EikonalSolveResult solveConstrainedEikonal(
                 ": Evaluating orientation hints & 5/6-axis tool axes...";
             notifyProgress(iterBaseFrac, msgOrient.c_str());
 
-            // 3a. Initialize targetDir from \nabla \tau + overhang bias, then diffuse soft orientation hints
+            // 3a. Initialize targetDir from \nabla \tau + overhang bias, align crown cushions, then diffuse soft orientation hints
             overhangConstraint.applyPreSweepModifiers(domain, iterCtx);
+            updateCrownSlownessAndDirections(domain, crownState);
             hintConstraint.applyPreSweepModifiers(domain, iterCtx);
 
             // 3b. Update 5/6-axis tool orientation (clamped strictly to tool rotational angle limits)
@@ -2502,6 +2964,15 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
 
     std::vector<float> axialProjections(n, std::numeric_limits<float>::max());
     std::vector<float> coarseTauSampled(n, -1.0f);
+    const bool useCoarseSlowness =
+        !baseContext.heightOnlyOrderField &&
+        (baseContext.conformalSkin.auto_enabled || !baseContext.conformalSkinHints.empty());
+    const float hTargetFine = std::max(0.02f, baseContext.layerHeight.target_mm);
+    const float hMinFine = std::clamp(baseContext.layerHeight.min_mm, 0.01f, hTargetFine);
+    const float hMaxFine = std::max(hTargetFine, baseContext.layerHeight.max_mm);
+    const float fineSMin = std::clamp(hTargetFine / std::max(hMaxFine, 1.0e-3f), 0.45f, 1.0f);
+    const float fineSMax = std::clamp(hTargetFine / std::max(hMinFine, 1.0e-3f), 1.0f, 2.5f);
+    const double coarseDx = coarseSolved.eikonalGrid->transform().voxelSize()[0];
 
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, n, 512),
@@ -2549,6 +3020,33 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
                     std::isfinite(cTauRaw) && (cTauRaw < coarseValidLimit);
                 const float cTau = hasValidCoarseTau ? std::max(0.0f, cTauRaw) : -1.0f;
                 coarseTauSampled[i] = cTau;
+
+                if (useCoarseSlowness && hasValidCoarseTau && (fineSMax - fineSMin) > 0.08f) {
+                    const double hC = 0.5 * coarseDx;
+                    const float txP = coarseEikSampler.wsSample(wp + openvdb::Vec3d(hC, 0.0, 0.0));
+                    const float txM = coarseEikSampler.wsSample(wp - openvdb::Vec3d(hC, 0.0, 0.0));
+                    const float tyP = coarseEikSampler.wsSample(wp + openvdb::Vec3d(0.0, hC, 0.0));
+                    const float tyM = coarseEikSampler.wsSample(wp - openvdb::Vec3d(0.0, hC, 0.0));
+                    const float tzP = coarseEikSampler.wsSample(wp + openvdb::Vec3d(0.0, 0.0, hC));
+                    const float tzM = coarseEikSampler.wsSample(wp - openvdb::Vec3d(0.0, 0.0, hC));
+                    if (std::isfinite(txP) && txP < coarseValidLimit &&
+                        std::isfinite(txM) && txM < coarseValidLimit &&
+                        std::isfinite(tyP) && tyP < coarseValidLimit &&
+                        std::isfinite(tyM) && tyM < coarseValidLimit &&
+                        std::isfinite(tzP) && tzP < coarseValidLimit &&
+                        std::isfinite(tzM) && tzM < coarseValidLimit) {
+                        const float invSpanC = 1.0f / static_cast<float>(2.0 * hC);
+                        const float gxC = (txP - txM) * invSpanC;
+                        const float gyC = (tyP - tyM) * invSpanC;
+                        const float gzC = (tzP - tzM) * invSpanC;
+                        const float gNormC = std::sqrt(gxC * gxC + gyC * gyC + gzC * gzC);
+                        if (gNormC >= 0.25f && gNormC <= 3.5f) {
+                            const float sC = std::clamp(gNormC, fineSMin, fineSMax);
+                            domain.baseSlowness[i] = sC;
+                            domain.slowness[i] = sC;
+                        }
+                    }
+                }
 
                 const bool insideOrBoundary = (domain.sdf[i] <= interiorCutoff);
                 domain.isInterior[i] = insideOrBoundary ? 1 : 0;

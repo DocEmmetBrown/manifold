@@ -8134,8 +8134,9 @@ fn render_process_config_tab(
         });
 
         ui.separator();
+        let mut skin_field_changed = false;
         ui.horizontal_wrapped(|ui| {
-            lh_changed |= ui
+            let auto_changed = ui
                 .checkbox(
                     &mut config.slicing.enable_auto_conformal_skin,
                     "Auto Conformal SDF Top Skin",
@@ -8144,6 +8145,8 @@ fn render_process_config_tab(
                     "Automatically erode N layers of top/exit surfaces where the order field arrives at an oblique angle and slice them conformally along SDF level sets (standing off around rising protrusions).",
                 )
                 .changed();
+            lh_changed |= auto_changed;
+            skin_field_changed |= auto_changed;
             param_help_button(ui, "slicing.enable_auto_conformal_skin");
             lh_changed |= ui
                 .add(
@@ -8177,7 +8180,7 @@ fn render_process_config_tab(
                     .on_hover_text("Minimum angle between the order field gradient (∇τ) and the outward surface normal (∇φ) required to trigger automatic conformal skinning.")
                     .changed();
                 param_help_button(ui, "slicing.conformal_skin_min_oblique_deg");
-                lh_changed |= ui
+                let slope_changed = ui
                     .add(
                         egui::DragValue::new(&mut config.slicing.conformal_skin_max_slope_deg)
                             .speed(0.5)
@@ -8187,6 +8190,8 @@ fn render_process_config_tab(
                     )
                     .on_hover_text("Maximum surface slope relative to the local nozzle axis (ẑ_nozzle) eligible for automatic conformal skinning.")
                     .changed();
+                lh_changed |= slope_changed;
+                skin_field_changed |= slope_changed;
                 param_help_button(ui, "slicing.conformal_skin_max_slope_deg");
             }
         });
@@ -8198,6 +8203,22 @@ fn render_process_config_tab(
             }
             if !is_computing {
                 sync_config_to_backend(config);
+            }
+            if skin_field_changed
+                && has_eikonal
+                && !is_computing
+                && config.eikonal.order_field_mode == OrderFieldMode::ConstrainedNonPlanar
+            {
+                if let Some(&(sel_id, _, ref obj_name, obj_rotation)) = selected_obj_info {
+                    spawn_field_compute_task(
+                        vis_state,
+                        plate,
+                        config,
+                        sel_id,
+                        obj_name,
+                        obj_rotation,
+                    );
+                }
             }
             vis_state.dirty_selected_layers = true;
             vis_state.dirty_toolpaths = true;

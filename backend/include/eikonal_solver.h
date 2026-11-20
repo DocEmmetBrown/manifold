@@ -11,6 +11,7 @@
 #include <openvdb/openvdb.h>
 
 #include "slicer_backend.h"
+#include "manifold-frontend/src/bridge.rs.h"
 
 namespace manifold {
 
@@ -87,6 +88,9 @@ struct ActiveVolumeDomain {
     std::vector<float> tau;
     /// Local isotropic slowness s(x) > 0 for the Eikonal PDE |\nabla \tau| = s(x).
     std::vector<float> slowness;
+    /// Persistent baseline slowness s_0(x) > 0 preserved across pre-sweep constraint passes
+    /// (used by variable-layer-height crown iso-phase alignment).
+    std::vector<float> baseSlowness;
     /// Preferred unit propagation direction \hat{d}_{target}(x) for directional constraints.
     std::vector<std::array<float, 3>> targetDir;
     /// Solved unit tool axis \hat{a}(x) in bed coordinates (pointing opposite to nozzle discharge).
@@ -148,6 +152,8 @@ struct EikonalSolverContext {
     bool enableSupportSeeding = false;
     bool onlySupportUnreachableAndBridges = false;
     bool heightOnlyOrderField = false;
+    ConformalSkinSpec conformalSkin{};
+    std::vector<SpatialOrientationHint> conformalSkinHints;
 };
 
 /// Pluggable strategy for computing and clamping the local 5/6-axis tool orientation

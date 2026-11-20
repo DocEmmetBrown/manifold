@@ -1,7 +1,7 @@
 #include "slicer_backend.h"
+#include "manifold-frontend/src/bridge.rs.h"
 #include "eikonal_solver.h"
 #include "path_generator.h"
-#include "manifold-frontend/src/bridge.rs.h"
 
 #include <algorithm>
 #include <atomic>
@@ -120,6 +120,7 @@ struct ObjectRecord {
     mutable float cachedSelectedLayersAdaptivity = -1.0f;
     mutable LayerHeightSpec cachedSelectedLayersSpec{};
     mutable SelectedIsosurfacesResult cachedSelectedLayers{};
+    mutable openvdb::Vec3SGrid::Ptr cachedSkinToolAxisGrid;
 };
 
 void computeVertexBounds(
@@ -1110,9 +1111,15 @@ void buildObjectScalarFields(
         localSupportSpec.enabled && localSupportSpec.seed_order_field,
         localSupportSpec.only_unreachable_and_long_bridges,
         backend.orderFieldMode() == 1,
+        backend.conformalSkinSpec(),
+        {},
     };
 
     for (const auto& ffiHint : backend.spatialOrientationHints()) {
+        if (ffiHint.kind == 2) {
+            ctx.conformalSkinHints.push_back(ffiHint);
+            continue;
+        }
         if (ffiHint.kind != 0 && ffiHint.kind != 1) {
             continue;
         }
@@ -4182,6 +4189,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         std::abs(rec.cachedSelectedLayersSpec.top_layer_mm - lh.top_layer_mm) < 1.0e-5f) {
         return rec.cachedSelectedLayers;
     }
+    rec.cachedSkinToolAxisGrid.reset();
 
     setFieldProgress(true, 0.05f, "Selecting non-planar slicing isosurfaces...");
 
@@ -5431,11 +5439,13 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         openvdb::Coord ijk;
         openvdb::Vec3f surfPos{0.0f, 0.0f, 0.0f};
         openvdb::Vec3f surfNormal{0.0f, 0.0f, 1.0f};
+        openvdb::Vec3f solvedToolAxis{0.0f, 0.0f, 1.0f};
         float tau = 0.0f;
         float cosOblique = 1.0f;
         int requestedLayers = 0;
         float weight = 1.0f;
         bool isManual = false;
+        bool hasStage2Collision = false;
         int branchId = 0;
         int patchId = -1;
     };
@@ -5450,6 +5460,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         std::int32_t parentBranchId = -1;
         openvdb::Vec3f meanNormal{0.0f, 0.0f, 1.0f};
         std::vector<std::size_t> surfVoxelIndices;
+        std::vector<int> deferredBranches;
     };
 
     std::vector<ConformalSkinPatch> conformalSkinPatches;
@@ -5463,6 +5474,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     skinCorePatchIdGrid.setTransform(fineSdfGrid.transform().copy());
     openvdb::Vec3SGrid skinPatchNormalGrid(openvdb::Vec3s(0.0f, 0.0f, 1.0f));
     skinPatchNormalGrid.setTransform(fineSdfGrid.transform().copy());
+    openvdb::Vec3SGrid::Ptr skinPatchToolAxisGrid;
     float maxConformalSkinDepthMm = 0.0f;
 
     if (anyConformalSkinActive) {
@@ -5630,12 +5642,12 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             }
         }
 
-        const float solidBBoxMinX = rec.minX - 0.75f * voxelSize;
-        const float solidBBoxMaxX = rec.maxX + 0.75f * voxelSize;
-        const float solidBBoxMinY = rec.minY - 0.75f * voxelSize;
-        const float solidBBoxMaxY = rec.maxY + 0.75f * voxelSize;
-        const float solidBBoxMinZ = rec.minZ - 0.75f * voxelSize;
-        const float solidBBoxMaxZ = rec.maxZ + 0.75f * voxelSize;
+        const float solidBBoxMinX = rec.minX - 0.75f * fineVoxelSize;
+        const float solidBBoxMaxX = rec.maxX + 0.75f * fineVoxelSize;
+        const float solidBBoxMinY = rec.minY - 0.75f * fineVoxelSize;
+        const float solidBBoxMaxY = rec.maxY + 0.75f * fineVoxelSize;
+        const float solidBBoxMinZ = rec.minZ - 0.75f * fineVoxelSize;
+        const float solidBBoxMaxZ = rec.maxZ + 0.75f * fineVoxelSize;
 
         auto sampleAnySdfWith = [&](
             const openvdb::Vec3d& wp,
@@ -5781,29 +5793,43 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             }
             const float zSweepMax = std::min(
                 maxZAlongNozzle,
-                std::min(maxToolClearanceHeightMm, 12.0f));
+                std::min(maxToolClearanceHeightMm, skinDepthMm + 3.0f * hTop));
             const float zStart = std::max(0.60f * hTop, 0.50f * fineVoxelSize);
             if (zSweepMax <= zStart) {
                 return false;
             }
 
-            constexpr float kDirs12[12][2] = {
+            constexpr float kDirs24[24][2] = {
                 {1.0f, 0.0f},
+                {0.9659258f, 0.2588190f},
                 {0.8660254f, 0.5f},
+                {0.7071068f, 0.7071068f},
                 {0.5f, 0.8660254f},
+                {0.2588190f, 0.9659258f},
                 {0.0f, 1.0f},
+                {-0.2588190f, 0.9659258f},
                 {-0.5f, 0.8660254f},
+                {-0.7071068f, 0.7071068f},
                 {-0.8660254f, 0.5f},
+                {-0.9659258f, 0.2588190f},
                 {-1.0f, 0.0f},
+                {-0.9659258f, -0.2588190f},
                 {-0.8660254f, -0.5f},
+                {-0.7071068f, -0.7071068f},
                 {-0.5f, -0.8660254f},
+                {-0.2588190f, -0.9659258f},
                 {0.0f, -1.0f},
+                {0.2588190f, -0.9659258f},
                 {0.5f, -0.8660254f},
+                {0.7071068f, -0.7071068f},
                 {0.8660254f, -0.5f},
+                {0.9659258f, -0.2588190f},
             };
 
             const float radialStep = std::max({0.75f * fineVoxelSize, 0.50f * voxelSize, 0.45f});
-            const float nearTipLimit = skinDepthMm + std::max(1.75f * hTop, 1.35f * fineVoxelSize);
+            const float nearTipLimit = skinDepthMm + std::max(1.25f * hTop, 1.0f * fineVoxelSize);
+            const float tipOrificeLimitZ = skinDepthMm + 0.85f * hTop;
+            const float tipOrificeClearR = tipRadiusMm + wallHalfWidthMm + 0.25f * fineVoxelSize;
             const float printTauTol = printTau + 0.65f * hTop;
             const float baseCurvTol = std::max(0.45f * hTop, 0.35f * fineVoxelSize);
 
@@ -5837,8 +5863,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         ? (rClear + std::max(0.65f * fineVoxelSize, 0.85f * hTop))
                         : rClear;
                 const openvdb::Vec3f pAxis = xBase + z * zAxis;
+                const bool allowFutureAtZ = (z <= tipOrificeLimitZ);
                 const float sliceTauLimit =
-                    (z <= nearTipLimit) ? maxPlausibleTau : printTauTol;
+                    allowFutureAtZ ? maxPlausibleTau : printTauTol;
 
                 const float zStep = (z < nearTipLimit + 2.0f * hTop)
                     ? std::max(0.55f * fineVoxelSize, 0.65f * hTop)
@@ -5861,16 +5888,13 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         const float axisSdf = sampleAnySdfWith(
                             wpAxis, localSdfAcc, localSdfSampler, localFineSdfSampler);
                         if (axisSdf <= 0.08f * fineVoxelSize) {
-                            if (z <= nearTipLimit) {
-                                return true;
-                            }
                             const float yTau = sampleTauAtWith(
                                 wpAxis,
                                 localFineEikAcc,
                                 localFineEikSampler,
                                 localMainEikAcc,
                                 localMainEikSampler);
-                            if (yTau <= printTauTol) {
+                            if (yTau <= printTauTol || allowFutureAtZ) {
                                 return true;
                             }
                         }
@@ -5889,8 +5913,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     // Allow slight natural dome convexity without false self-collision
                     const float curvTol = baseCurvTol + 0.03f * r;
                     const bool checkSteepCore = (z > skinDepthMm + 0.75f * hTop);
+                    const bool allowFutureTip = allowFutureAtZ && (r <= tipOrificeClearR);
 
-                    for (const auto& dir : kDirs12) {
+                    for (const auto& dir : kDirs24) {
                         const openvdb::Vec3f rVec = xAxis * dir[0] + yAxis * dir[1];
                         const openvdb::Vec3f yPos = pAxis + r * rVec;
 
@@ -5905,7 +5930,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
 
                         // 2. O(1) flat 3D brick occupancy + \tau filter (zero OpenVDB queries)
                         const float maxAllowedTau =
-                            (aboveSurf && z <= nearTipLimit) ? maxPlausibleTau : printTauTol;
+                            (aboveSurf && allowFutureTip) ? maxPlausibleTau : printTauTol;
                         if (!isBrickPossiblyOccupiedAt(yPos, maxAllowedTau)) {
                             continue;
                         }
@@ -5920,18 +5945,14 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
 
                         bool hitsObstacle = false;
                         if (aboveSurf) {
-                            if (z <= nearTipLimit) {
+                            const float yTau = sampleTauAtWith(
+                                wpY,
+                                localFineEikAcc,
+                                localFineEikSampler,
+                                localMainEikAcc,
+                                localMainEikSampler);
+                            if (yTau <= printTauTol || allowFutureTip) {
                                 hitsObstacle = true;
-                            } else {
-                                const float yTau = sampleTauAtWith(
-                                    wpY,
-                                    localFineEikAcc,
-                                    localFineEikSampler,
-                                    localMainEikAcc,
-                                    localMainEikSampler);
-                                if (yTau <= printTauTol) {
-                                    hitsObstacle = true;
-                                }
                             }
                         } else if (aboveBase && ySdf <= -(skinDepthMm + 0.35f * hTop)) {
                             const float yTau = sampleTauAtWith(
@@ -6167,7 +6188,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         cosObliqueVal =
                             (tx * nSdf.x() + ty * nSdf.y() + tz * nSdf.z()) / tLen;
                         if (cosObliqueVal >= 0.087f &&
-                            (cosObliqueVal <= cosMinOblique || cosNozzle >= 0.95f)) {
+                            (cosObliqueVal <= cosMinOblique || cosNozzle >= cosMaxSlope)) {
                             requestedLayers = std::clamp<int>(
                                 static_cast<int>(skinSpec.default_skin_layers), 1, 12);
                         }
@@ -6620,12 +6641,485 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             }
         }
 
+        // Build a nozzle-frame 3D voxel occupancy table once per object so Stage-2 print-time
+        // clearance uses an exact separable Felzenszwalb-Huttenlocher 2D-slice Euclidean Distance
+        // Transform (eliminating 12-spoke angular aliasing and evaluating 5/6-axis repulsion tilts).
+        const NozzleBasis edtRefNb = queryNozzleFrame(
+            {0.5f * (rec.minX + rec.maxX),
+             0.5f * (rec.minY + rec.maxY),
+             0.5f * (rec.minZ + rec.maxZ)},
+            {1.0f, 0.0f, 0.0f});
+        const openvdb::Vec3f edtUAxis(
+            edtRefNb.travel_axis[0], edtRefNb.travel_axis[1], edtRefNb.travel_axis[2]);
+        const openvdb::Vec3f edtVAxis(
+            edtRefNb.lateral_axis[0], edtRefNb.lateral_axis[1], edtRefNb.lateral_axis[2]);
+        const openvdb::Vec3f edtWAxis(
+            edtRefNb.nozzle_axis[0], edtRefNb.nozzle_axis[1], edtRefNb.nozzle_axis[2]);
+
+        float edtUMin = std::numeric_limits<float>::max();
+        float edtUMax = std::numeric_limits<float>::lowest();
+        float edtVMin = std::numeric_limits<float>::max();
+        float edtVMax = std::numeric_limits<float>::lowest();
+        float edtWMin = std::numeric_limits<float>::max();
+        float edtWMax = std::numeric_limits<float>::lowest();
+        for (int mask = 0; mask < 8; ++mask) {
+            const openvdb::Vec3f cPt(
+                (mask & 1) ? solidBBoxMaxX : solidBBoxMinX,
+                (mask & 2) ? solidBBoxMaxY : solidBBoxMinY,
+                (mask & 4) ? solidBBoxMaxZ : solidBBoxMinZ);
+            edtUMin = std::min(edtUMin, cPt.dot(edtUAxis));
+            edtUMax = std::max(edtUMax, cPt.dot(edtUAxis));
+            edtVMin = std::min(edtVMin, cPt.dot(edtVAxis));
+            edtVMax = std::max(edtVMax, cPt.dot(edtVAxis));
+            edtWMin = std::min(edtWMin, cPt.dot(edtWAxis));
+            edtWMax = std::max(edtWMax, cPt.dot(edtWAxis));
+        }
+
+        const float spanU0 = std::max(voxelSize, edtUMax - edtUMin);
+        const float spanV0 = std::max(voxelSize, edtVMax - edtVMin);
+        const float spanW0 = std::max(voxelSize, edtWMax - edtWMin);
+        const float maxEdtSpan = std::max({spanU0, spanV0, spanW0});
+        float edtStep = std::max({fineVoxelSize, 0.20f, maxEdtSpan / 220.0f});
+        while (true) {
+            const double estCells =
+                (static_cast<double>(spanU0) / edtStep + 4.0) *
+                (static_cast<double>(spanV0) / edtStep + 4.0) *
+                (static_cast<double>(spanW0) / edtStep + 4.0);
+            if (estCells <= 12'000'000.0) {
+                break;
+            }
+            edtStep *= 1.25f;
+        }
+        const float invEdtStep = 1.0f / std::max(edtStep, 1.0e-4f);
+        const float edtU0 = edtUMin - 2.0f * edtStep;
+        const float edtV0 = edtVMin - 2.0f * edtStep;
+        const float edtW0 = edtWMin - 2.0f * edtStep;
+        const int edtNu = std::max(4, static_cast<int>(std::ceil((edtUMax - edtUMin) * invEdtStep)) + 4);
+        const int edtNv = std::max(4, static_cast<int>(std::ceil((edtVMax - edtVMin) * invEdtStep)) + 4);
+        const int edtNw = std::max(4, static_cast<int>(std::ceil((edtWMax - edtWMin) * invEdtStep)) + 4);
+        const std::size_t edtSliceStride =
+            static_cast<std::size_t>(edtNu) * static_cast<std::size_t>(edtNv);
+        const std::size_t edtTotalCells =
+            edtSliceStride * static_cast<std::size_t>(edtNw);
+
+        constexpr float kNoOccTau = 1.0e9f;
+        std::vector<float> edtCellMinTau(edtTotalCells, kNoOccTau);
+        std::vector<float> edtCellSdf(edtTotalCells, 1.0f);
+        std::vector<std::int32_t> edtCellBranch(edtTotalCells, -1);
+
+        if (!surfVoxels.empty()) {
+            const float coarseMaxSdf = useDualGridExtraction
+                ? -std::max(0.35f * voxelSize, 0.50f * fineVoxelSize)
+                : (0.01f * voxelSize);
+            const int coarseSplatR = useDualGridExtraction
+                ? std::max(0, static_cast<int>(std::ceil(0.85f * voxelSize * invEdtStep)))
+                : 0;
+            for (const auto& vx : voxels) {
+                if (vx.sdf > coarseMaxSdf || vx.tau >= validTauLimit) {
+                    continue;
+                }
+                const openvdb::Vec3d wp = eikGrid.transform().indexToWorld(vx.ijk);
+                const openvdb::Vec3f pf(
+                    static_cast<float>(wp.x()),
+                    static_cast<float>(wp.y()),
+                    static_cast<float>(wp.z()));
+                const float pfU = pf.dot(edtUAxis);
+                const float pfV = pf.dot(edtVAxis);
+                const float pfW = pf.dot(edtWAxis);
+                const int iu0 = static_cast<int>(std::floor((pfU - edtU0) * invEdtStep));
+                const int iv0 = static_cast<int>(std::floor((pfV - edtV0) * invEdtStep));
+                const int iw0 = static_cast<int>(std::floor((pfW - edtW0) * invEdtStep));
+                const float tVal = std::max(0.0f, vx.tau);
+                const float safeInsideRadius =
+                    std::max(0.0f, -vx.sdf - 0.10f * fineVoxelSize);
+                const float safeInsideRadiusSq = safeInsideRadius * safeInsideRadius;
+                for (int dw = -coarseSplatR; dw <= coarseSplatR; ++dw) {
+                    const int iw = iw0 + dw;
+                    if (iw < 0 || iw >= edtNw) {
+                        continue;
+                    }
+                    const float cw = edtW0 + (static_cast<float>(iw) + 0.5f) * edtStep;
+                    const float dwMm = cw - pfW;
+                    for (int dv = -coarseSplatR; dv <= coarseSplatR; ++dv) {
+                        const int iv = iv0 + dv;
+                        if (iv < 0 || iv >= edtNv) {
+                            continue;
+                        }
+                        const float cv = edtV0 + (static_cast<float>(iv) + 0.5f) * edtStep;
+                        const float dvMm = cv - pfV;
+                        for (int du = -coarseSplatR; du <= coarseSplatR; ++du) {
+                            const int iu = iu0 + du;
+                            if (iu < 0 || iu >= edtNu) {
+                                continue;
+                            }
+                            if (coarseSplatR > 0) {
+                                const float cu = edtU0 + (static_cast<float>(iu) + 0.5f) * edtStep;
+                                const float duMm = cu - pfU;
+                                // 1-Lipschitz SDF guard: never splat coarse interior outside \phi_sdf < 0
+                                if (duMm * duMm + dvMm * dvMm + dwMm * dwMm > safeInsideRadiusSq) {
+                                    continue;
+                                }
+                            }
+                            const std::size_t idxC =
+                                static_cast<std::size_t>(iw) * edtSliceStride +
+                                static_cast<std::size_t>(iv) * static_cast<std::size_t>(edtNu) +
+                                static_cast<std::size_t>(iu);
+                            if (tVal < edtCellMinTau[idxC]) {
+                                edtCellMinTau[idxC] = tVal;
+                                edtCellBranch[idxC] = vx.branchId;
+                            }
+                            edtCellSdf[idxC] = std::min(edtCellSdf[idxC], vx.sdf);
+                        }
+                    }
+                }
+            }
+
+            if (useDualGridExtraction) {
+                auto localFineEikAcc = fineEikGrid.getConstAccessor();
+                openvdb::tools::GridSampler<
+                    openvdb::FloatGrid::ConstAccessor,
+                    openvdb::tools::BoxSampler>
+                    localFineEikSampler(localFineEikAcc, fineEikGrid.transform());
+                auto localMainEikAcc = eikGrid.getConstAccessor();
+                openvdb::tools::GridSampler<
+                    openvdb::FloatGrid::ConstAccessor,
+                    openvdb::tools::BoxSampler>
+                    localMainEikSampler(localMainEikAcc, eikGrid.transform());
+                auto localBAcc = branchGrid.getConstAccessor();
+                const float fineEikValid =
+                    fineEikGrid.background() - std::max(0.5f * fineVoxelSize, 0.5f);
+
+                for (auto iter = fineSdfGrid.cbeginValueOn(); iter; ++iter) {
+                    const float fSdf = *iter;
+                    if (fSdf > 0.01f * fineVoxelSize) {
+                        continue;
+                    }
+                    const openvdb::Coord c = iter.getCoord();
+                    float fTau = localFineEikAcc.getValue(c);
+                    if (!std::isfinite(fTau) || fTau < 0.0f || fTau >= fineEikValid || fTau > maxPlausibleTau) {
+                        const openvdb::Vec3d wp = fineSdfGrid.transform().indexToWorld(c);
+                        fTau = sampleTauAtWith(
+                            wp,
+                            localFineEikAcc,
+                            localFineEikSampler,
+                            localMainEikAcc,
+                            localMainEikSampler);
+                    }
+                    const openvdb::Vec3d wp = fineSdfGrid.transform().indexToWorld(c);
+                    const openvdb::Vec3f pf(
+                        static_cast<float>(wp.x()),
+                        static_cast<float>(wp.y()),
+                        static_cast<float>(wp.z()));
+                    const int iu = static_cast<int>(std::floor((pf.dot(edtUAxis) - edtU0) * invEdtStep));
+                    const int iv = static_cast<int>(std::floor((pf.dot(edtVAxis) - edtV0) * invEdtStep));
+                    const int iw = static_cast<int>(std::floor((pf.dot(edtWAxis) - edtW0) * invEdtStep));
+                    if (iu < 0 || iu >= edtNu || iv < 0 || iv >= edtNv || iw < 0 || iw >= edtNw) {
+                        continue;
+                    }
+                    const openvdb::Coord cB =
+                        branchGrid.transform().worldToIndexCellCentered(wp);
+                    int bId = localBAcc.getValue(cB);
+                    if (bId < 0) {
+                        for (int dz = -1; dz <= 1 && bId < 0; ++dz) {
+                            for (int dy = -1; dy <= 1 && bId < 0; ++dy) {
+                                for (int dx = -1; dx <= 1 && bId < 0; ++dx) {
+                                    bId = localBAcc.getValue(cB + openvdb::Coord(dx, dy, dz));
+                                }
+                            }
+                        }
+                    }
+                    const std::size_t idxC =
+                        static_cast<std::size_t>(iw) * edtSliceStride +
+                        static_cast<std::size_t>(iv) * static_cast<std::size_t>(edtNu) +
+                        static_cast<std::size_t>(iu);
+                    const float tVal = std::max(0.0f, fTau);
+                    if (tVal < edtCellMinTau[idxC]) {
+                        edtCellMinTau[idxC] = tVal;
+                        edtCellBranch[idxC] = std::max(0, bId);
+                    }
+                    edtCellSdf[idxC] = std::min(edtCellSdf[idxC], fSdf);
+                }
+            }
+        }
+
+        // Exact Felzenszwalb-Huttenlocher separable 2D Euclidean Distance Transform over [iwMin, iwMax]
+        auto compute2DSliceEdtRange = [&](
+            int iwMin,
+            int iwMax,
+            const std::function<bool(std::size_t, float, int, float)>& isObstacleFn,
+            std::vector<float>& outDistMm) {
+            const int numSlices = std::max(0, iwMax - iwMin + 1);
+            outDistMm.assign(
+                static_cast<std::size_t>(numSlices) * edtSliceStride,
+                1.0e5f);
+            if (numSlices == 0) {
+                return;
+            }
+            constexpr float kInfSq = 1.0e12f;
+
+            auto edt1dSq = [](
+                const float* f,
+                int len,
+                float* dOut,
+                std::vector<int>& v,
+                std::vector<float>& z) {
+                v.resize(static_cast<std::size_t>(len));
+                z.resize(static_cast<std::size_t>(len) + 1);
+                int k = 0;
+                v[0] = 0;
+                z[0] = -1.0e20f;
+                z[1] = 1.0e20f;
+                for (int q = 1; q < len; ++q) {
+                    const float fq = f[q] + static_cast<float>(q * q);
+                    float s = (fq - (f[v[k]] + static_cast<float>(v[k] * v[k]))) /
+                              static_cast<float>(2 * (q - v[k]));
+                    while (k > 0 && s <= z[k]) {
+                        --k;
+                        s = (fq - (f[v[k]] + static_cast<float>(v[k] * v[k]))) /
+                            static_cast<float>(2 * (q - v[k]));
+                    }
+                    ++k;
+                    v[static_cast<std::size_t>(k)] = q;
+                    z[static_cast<std::size_t>(k)] = s;
+                    z[static_cast<std::size_t>(k + 1)] = 1.0e20f;
+                }
+                k = 0;
+                for (int q = 0; q < len; ++q) {
+                    while (z[static_cast<std::size_t>(k + 1)] < static_cast<float>(q)) {
+                        ++k;
+                    }
+                    const float diff = static_cast<float>(q - v[static_cast<std::size_t>(k)]);
+                    dOut[q] = diff * diff + f[v[static_cast<std::size_t>(k)]];
+                }
+            };
+
+            tbb::parallel_for(
+                tbb::blocked_range<int>(0, numSlices, 2),
+                [&](const tbb::blocked_range<int>& r) {
+                    std::vector<float> sqU(edtSliceStride, kInfSq);
+                    std::vector<float> rowIn(static_cast<std::size_t>(edtNu));
+                    std::vector<float> rowOut(static_cast<std::size_t>(edtNu));
+                    std::vector<float> colIn(static_cast<std::size_t>(edtNv));
+                    std::vector<float> colOut(static_cast<std::size_t>(edtNv));
+                    std::vector<int> vBuf;
+                    std::vector<float> zBuf;
+
+                    for (int sIdx = r.begin(); sIdx != r.end(); ++sIdx) {
+                        const int iw = iwMin + sIdx;
+                        if (iw < 0 || iw >= edtNw) {
+                            continue;
+                        }
+                        const std::size_t srcBase =
+                            static_cast<std::size_t>(iw) * edtSliceStride;
+                        const std::size_t dstBase =
+                            static_cast<std::size_t>(sIdx) * edtSliceStride;
+
+                        bool anyObs = false;
+                        for (int iv = 0; iv < edtNv; ++iv) {
+                            const std::size_t rowOff =
+                                static_cast<std::size_t>(iv) * static_cast<std::size_t>(edtNu);
+                            bool rowHasObs = false;
+                            for (int iu = 0; iu < edtNu; ++iu) {
+                                const std::size_t cIdx = srcBase + rowOff + static_cast<std::size_t>(iu);
+                                const float cTau = edtCellMinTau[cIdx];
+                                if (cTau < 0.5f * kNoOccTau &&
+                                    isObstacleFn(cIdx, cTau, edtCellBranch[cIdx], edtCellSdf[cIdx])) {
+                                    rowIn[static_cast<std::size_t>(iu)] = 0.0f;
+                                    rowHasObs = true;
+                                    anyObs = true;
+                                } else {
+                                    rowIn[static_cast<std::size_t>(iu)] = kInfSq;
+                                }
+                            }
+                            if (rowHasObs) {
+                                edt1dSq(rowIn.data(), edtNu, sqU.data() + rowOff, vBuf, zBuf);
+                            } else {
+                                std::fill(
+                                    sqU.data() + rowOff,
+                                    sqU.data() + rowOff + edtNu,
+                                    kInfSq);
+                            }
+                        }
+
+                        if (!anyObs) {
+                            continue;
+                        }
+
+                        for (int iu = 0; iu < edtNu; ++iu) {
+                            for (int iv = 0; iv < edtNv; ++iv) {
+                                colIn[static_cast<std::size_t>(iv)] =
+                                    sqU[static_cast<std::size_t>(iv) * static_cast<std::size_t>(edtNu) +
+                                        static_cast<std::size_t>(iu)];
+                            }
+                            edt1dSq(colIn.data(), edtNv, colOut.data(), vBuf, zBuf);
+                            for (int iv = 0; iv < edtNv; ++iv) {
+                                const std::size_t off2 =
+                                    static_cast<std::size_t>(iv) * static_cast<std::size_t>(edtNu) +
+                                    static_cast<std::size_t>(iu);
+                                outDistMm[dstBase + off2] =
+                                    std::sqrt(std::max(0.0f, colOut[static_cast<std::size_t>(iv)])) * edtStep;
+                            }
+                        }
+                    }
+                });
+        };
+
+        auto sampleEdtSliceDist = [&](
+            const std::vector<float>& edtGrid,
+            int iwMin,
+            int iwMax,
+            float uCoord,
+            float vCoord,
+            int iw) -> float {
+            if (iw < iwMin || iw > iwMax || iw < 0 || iw >= edtNw) {
+                return 1.0e5f;
+            }
+            const float fu = (uCoord - edtU0) * invEdtStep - 0.5f;
+            const float fv = (vCoord - edtV0) * invEdtStep - 0.5f;
+            const int iu0 = std::clamp(static_cast<int>(std::floor(fu)), 0, edtNu - 1);
+            const int iv0 = std::clamp(static_cast<int>(std::floor(fv)), 0, edtNv - 1);
+            const int iu1 = std::min(iu0 + 1, edtNu - 1);
+            const int iv1 = std::min(iv0 + 1, edtNv - 1);
+            const float tu = std::clamp(fu - static_cast<float>(iu0), 0.0f, 1.0f);
+            const float tv = std::clamp(fv - static_cast<float>(iv0), 0.0f, 1.0f);
+            const std::size_t sBase =
+                static_cast<std::size_t>(iw - iwMin) * edtSliceStride;
+            const float d00 = edtGrid[sBase + static_cast<std::size_t>(iv0) * edtNu + iu0];
+            const float d10 = edtGrid[sBase + static_cast<std::size_t>(iv0) * edtNu + iu1];
+            const float d01 = edtGrid[sBase + static_cast<std::size_t>(iv1) * edtNu + iu0];
+            const float d11 = edtGrid[sBase + static_cast<std::size_t>(iv1) * edtNu + iu1];
+            return (1.0f - tv) * ((1.0f - tu) * d00 + tu * d10) +
+                   tv * ((1.0f - tu) * d01 + tu * d11);
+        };
+
+        const bool canTiltSkinTool =
+            (impl_->orderFieldMode != 1) &&
+            (activeToolPtr != nullptr) &&
+            activeToolPtr->has_rotational_axes &&
+            (activeToolPtr->max_angle_from_bed_normal_deg > 1.0f);
+        const float userMaxSkinTiltRad = canTiltSkinTool
+            ? (std::clamp(activeToolPtr->max_angle_from_bed_normal_deg, 0.0f, 85.0f) * kDegToRad)
+            : 0.0f;
+
+        auto computeSkinBedSafeMaxTilt = [&](const openvdb::Vec3f& pos) -> float {
+            if (!canTiltSkinTool) {
+                return 0.0f;
+            }
+            const float hBedMm = std::max(0.0f, pos.dot(edtWAxis) - rec.minZ);
+            float gammaMax = userMaxSkinTiltRad;
+            if (activeToolPtr != nullptr) {
+                if (activeToolPtr->clearance_mode == 1) {
+                    const float zTop = std::max(1.0f, activeToolPtr->cone_height_mm);
+                    const float r0 = std::max({activeToolPtr->cone_tip_radius_mm, tipRadiusMm, 0.2f});
+                    const float thetaRad =
+                        std::clamp(activeToolPtr->cone_half_angle_deg, 5.0f, 80.0f) * kDegToRad;
+                    const float rTop = r0 + zTop * std::tan(thetaRad);
+                    if (hBedMm < std::hypot(rTop, zTop)) {
+                        const float phi = std::atan2(zTop, std::max(rTop, 1.0e-5f));
+                        const float ratio =
+                            std::clamp(hBedMm / std::max(std::hypot(rTop, zTop), 1.0e-5f), 0.0f, 1.0f);
+                        gammaMax = std::min(gammaMax, phi + std::asin(ratio));
+                    }
+                } else if (activeToolPtr->clearance_mode == 2) {
+                    const float zTop = std::max(1.0f, activeToolPtr->rect_height_mm);
+                    const float wx0 = std::max({activeToolPtr->rect_tip_half_width_x_mm, tipRadiusMm, 0.2f});
+                    const float wy0 = std::max({activeToolPtr->rect_tip_half_width_y_mm, tipRadiusMm, 0.2f});
+                    const float tx = std::clamp(activeToolPtr->rect_half_angle_x_deg, 5.0f, 80.0f) * kDegToRad;
+                    const float ty = std::clamp(activeToolPtr->rect_half_angle_y_deg, 5.0f, 80.0f) * kDegToRad;
+                    const float rTop = std::max(wx0 + zTop * std::tan(tx), wy0 + zTop * std::tan(ty));
+                    if (hBedMm < std::hypot(rTop, zTop)) {
+                        const float phi = std::atan2(zTop, std::max(rTop, 1.0e-5f));
+                        const float ratio =
+                            std::clamp(hBedMm / std::max(std::hypot(rTop, zTop), 1.0e-5f), 0.0f, 1.0f);
+                        gammaMax = std::min(gammaMax, phi + std::asin(ratio));
+                    }
+                } else {
+                    for (const auto& pt : activeToolPtr->clearance_profile_xz) {
+                        const float r = std::max(0.0f, pt.x_radius_mm);
+                        const float z = std::max(0.0f, pt.z_height_mm);
+                        if (r <= 1.0e-4f || z <= 1.0e-3f) {
+                            continue;
+                        }
+                        const float rho = std::hypot(r, z);
+                        if (hBedMm >= rho) {
+                            continue;
+                        }
+                        const float phi = std::atan2(z, std::max(r, 1.0e-6f));
+                        const float ratio = std::clamp(hBedMm / std::max(rho, 1.0e-5f), 0.0f, 1.0f);
+                        gammaMax = std::min(gammaMax, std::max(0.0f, phi + std::asin(ratio)));
+                    }
+                }
+            }
+            return std::max(0.0f, gammaMax);
+        };
+
+        auto clampVec3fToCone = [](
+            const openvdb::Vec3f& vUnit,
+            const openvdb::Vec3f& coneAxis,
+            float maxAngleRad) -> openvdb::Vec3f {
+            if (maxAngleRad <= 1.0e-6f) {
+                return coneAxis;
+            }
+            const float cosTheta = std::clamp(vUnit.dot(coneAxis), -1.0f, 1.0f);
+            const float theta = std::acos(cosTheta);
+            if (theta <= maxAngleRad) {
+                return vUnit;
+            }
+            const openvdb::Vec3f perp = vUnit - cosTheta * coneAxis;
+            const float perpLen = perp.length();
+            if (perpLen <= 1.0e-6f) {
+                return coneAxis;
+            }
+            openvdb::Vec3f out =
+                std::cos(maxAngleRad) * coneAxis + (std::sin(maxAngleRad) / perpLen) * perp;
+            out.normalize();
+            return out;
+        };
+
+        // Precompute per-branch low-elevation base sample points for fast reverse clearance checks
+        std::vector<std::vector<openvdb::Vec3f>> branchBaseSamples(numBranches);
+        if (multiBranch) {
+            for (std::size_t b = 0; b < numBranches; ++b) {
+                const float tauBaseCutoff = branches[b].tauStart + 1.5f * hTarget;
+                std::vector<openvdb::Vec3f> allBase;
+                for (std::size_t u = 0; u < numBranches; ++u) {
+                    if (!isSubtree[b][u]) {
+                        continue;
+                    }
+                    for (const int vIdx : branches[u].voxelIndices) {
+                        const auto& vx = voxels[static_cast<std::size_t>(vIdx)];
+                        if (vx.sdf <= 0.08f * voxelSize && vx.tau <= tauBaseCutoff) {
+                            const openvdb::Vec3d wp = eikGrid.transform().indexToWorld(vx.ijk);
+                            allBase.emplace_back(
+                                static_cast<float>(wp.x()),
+                                static_cast<float>(wp.y()),
+                                static_cast<float>(wp.z()));
+                        }
+                    }
+                }
+                if (allBase.size() > 128) {
+                    const std::size_t step = std::max<std::size_t>(1, allBase.size() / 128);
+                    branchBaseSamples[b].reserve(128);
+                    for (std::size_t idx = 0; idx < allBase.size(); idx += step) {
+                        branchBaseSamples[b].push_back(allBase[idx]);
+                    }
+                } else {
+                    branchBaseSamples[b] = std::move(allBase);
+                }
+            }
+        }
+
         // Connected-component clustering of conformal skin surface voxels into causal patches,
-        // followed by Stage-2 causal print-time (`tauCompletion`) 3D tool-clearance pruning.
+        // followed by causal boss deferral, Stage-2 exact 2D-slice EDT clearance pruning + 5/6-axis
+        // obstacle avoidance tilt, and geodesic collar regularization.
+        std::vector<int> branchPatchOwner(numBranches, -1);
+        std::vector<std::uint8_t> inCurrentPatchSlab(edtTotalCells, 0);
+
         if (!surfVoxels.empty()) {
             std::vector<int> queue;
             queue.reserve(surfVoxels.size());
             const float maxStepHeight = 0.65f * fineVoxelSize;
+            const openvdb::Vec3f zNozNominal = edtWAxis;
 
             for (std::size_t i = 0; i < surfVoxels.size(); ++i) {
                 if (surfVoxels[i].patchId != -1) {
@@ -6651,14 +7145,11 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     const openvdb::Vec3f patchMeanN =
                         (rnLen > 1.0e-5f) ? (runningNormalSum / rnLen) : cv.surfNormal;
 
-                    // 26-connected neighborhood with coplanar step rejection and mean-normal
-                    // cone check so recessed surfaces never bridge across a vertical step and
-                    // flat top faces never chain-walk onto 45-degree corner chamfers.
                     for (int dz = -1; dz <= 1; ++dz) {
                         for (int dy = -1; dy <= 1; ++dy) {
                             for (int dx = -1; dx <= 1; ++dx) {
                                 if (dx == 0 && dy == 0 && dz == 0) {
-                                     continue;
+                                    continue;
                                 }
                                 const int nbIdx =
                                     surfIdxAcc.getValue(cv.ijk + openvdb::Coord(dx, dy, dz));
@@ -6699,15 +7190,121 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     12);
                 const float patchSkinThicknessMm = static_cast<float>(patchSkinLayers) * hTop;
 
-                // Stage-2 Causal Print-Time Pruning:
-                // Because the conformal skin patch is printed all at once when the core reaches
-                // `tauCompletion` (the maximum \tau across the surviving patch), all core layers
-                // up to `tauCompletion` have ALREADY been printed (including adjacent walls such
-                // as the Benchy cabin and hull sides up to `tauCompletion`). Iteratively prune
-                // any patch voxel whose 3D tool clearance envelope collides at `tauCompletion`.
+                // Determine patch branch & initial tau range for causal boss deferral
+                std::unordered_map<int, int> initBranchVotes;
+                float initTauMin = std::numeric_limits<float>::max();
+                float initTauComp = std::numeric_limits<float>::lowest();
+                for (int idx : queue) {
+                    const auto& sv = surfVoxels[static_cast<std::size_t>(idx)];
+                    initBranchVotes[sv.branchId] += 1;
+                    if (sv.tau > 0.0f && sv.tau <= maxPlausibleTau) {
+                        initTauMin = std::min(initTauMin, sv.tau);
+                        initTauComp = std::max(initTauComp, sv.tau);
+                    }
+                }
+                int initPatchBranch = 0;
+                int initBestVotes = -1;
+                for (const auto& [bId, cnt] : initBranchVotes) {
+                    if (cnt > initBestVotes) {
+                        initBestVotes = cnt;
+                        initPatchBranch = bId;
+                    }
+                }
+                initPatchBranch = std::clamp<int>(
+                    initPatchBranch, 0, static_cast<int>(branches.size()) - 1);
+
+                // Option 2b: Detect upper protruding boss branches (e.g., Benchy smokestack) that
+                // rise above this roof patch and can safely print AFTER the patch via reverse clearance.
+                std::vector<int> deferredBossRoots;
+                std::vector<std::uint8_t> patchDeferredMask(numBranches, 0);
+                if (multiBranch && initTauComp >= initTauMin) {
+                    std::vector<openvdb::Vec3f> patchPts;
+                    const std::size_t pStep = std::max<std::size_t>(1, queue.size() / 512);
+                    patchPts.reserve(std::min<std::size_t>(queue.size(), 512));
+                    for (std::size_t qIdx = 0; qIdx < queue.size(); qIdx += pStep) {
+                        patchPts.push_back(surfVoxels[static_cast<std::size_t>(queue[qIdx])].surfPos);
+                    }
+
+                    for (std::size_t b = 0; b < numBranches; ++b) {
+                        if (static_cast<int>(b) == initPatchBranch ||
+                            isSubtree[b][static_cast<std::size_t>(initPatchBranch)] != 0 ||
+                            branchPatchOwner[b] >= 0) {
+                            continue;
+                        }
+                        if (branches[b].tauStart < initTauMin - 2.0f * hTop ||
+                            branches[b].tauStart > initTauComp + 0.5f * hTop ||
+                            branches[b].tauEnd <= initTauComp + 0.5f * hTop) {
+                            continue;
+                        }
+                        const auto& basePts = branchBaseSamples[b];
+                        if (basePts.empty()) {
+                            continue;
+                        }
+                        bool reverseOk = true;
+                        for (const openvdb::Vec3f& pb : basePts) {
+                            for (const openvdb::Vec3f& pp : patchPts) {
+                                const openvdb::Vec3f diff = pp - pb;
+                                const float dz = diff.dot(edtWAxis);
+                                if (dz > 0.30f) {
+                                    const float rPerp =
+                                        std::sqrt(std::max(0.0f, diff.lengthSqr() - dz * dz));
+                                    if (rPerp <= evalToolClearanceRadiusAtZ(dz)) {
+                                        reverseOk = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!reverseOk) {
+                                break;
+                            }
+                        }
+                        if (reverseOk) {
+                            deferredBossRoots.push_back(static_cast<int>(b));
+                            for (std::size_t u = 0; u < numBranches; ++u) {
+                                if (isSubtree[b][u] != 0) {
+                                    patchDeferredMask[u] = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Compute w-bounds of candidate patch slices
+                float patchWMin = std::numeric_limits<float>::max();
+                float patchWMax = std::numeric_limits<float>::lowest();
+                for (int idx : queue) {
+                    const float pw = surfVoxels[static_cast<std::size_t>(idx)].surfPos.dot(edtWAxis);
+                    patchWMin = std::min(patchWMin, pw);
+                    patchWMax = std::max(patchWMax, pw);
+                }
+                const float maxCheckHeight = std::min(maxToolClearanceHeightMm, 12.0f);
+                const int iwSliceMin = std::clamp(
+                    static_cast<int>(std::floor((patchWMin - patchSkinThicknessMm - edtW0) * invEdtStep)) - 2,
+                    0,
+                    edtNw - 1);
+                const int iwSliceMax = std::clamp(
+                    static_cast<int>(std::ceil((patchWMax + maxCheckHeight - edtW0) * invEdtStep)) + 2,
+                    iwSliceMin,
+                    edtNw - 1);
+                const int iwTipSliceMax = std::clamp(
+                    static_cast<int>(std::ceil((patchWMax + patchSkinThicknessMm + 1.5f * hTop - edtW0) * invEdtStep)) + 2,
+                    iwSliceMin,
+                    edtNw - 1);
+
+                const float deepCoreSdfCutoff = -(patchSkinThicknessMm + 0.35f * hTop);
+                const float tipOrificeKeepoutR = tipRadiusMm + wallHalfWidthMm + 0.25f * edtStep;
+                const float baseCurvTol = std::max(0.45f * hTop, 0.35f * fineVoxelSize);
+                const float marginExtra = std::max(0.65f * fineVoxelSize, 0.85f * hTop);
+                const float nearTipZLimit = patchSkinThicknessMm + std::max(1.25f * hTop, 1.0f * fineVoxelSize);
+                const float zStartSweep = std::max(0.60f * hTop, 0.50f * fineVoxelSize);
+
+                // Stage-2 Causal Print-Time Pruning via Exact 2D-Slice EDT + 5/6-Axis Avoidance Tilt
                 std::vector<int> surviving = queue;
                 float tauMin = 0.0f;
                 float tauCompletion = 0.0f;
+                std::vector<float> edtPrintedSurface;
+                std::vector<float> edtPrintedDeep;
+                std::vector<float> edtDeferredTip;
 
                 for (int pruneIter = 0; pruneIter < 3; ++pruneIter) {
                     std::vector<float> patchTaus;
@@ -6725,13 +7322,329 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     std::sort(patchTaus.begin(), patchTaus.end());
                     tauMin = patchTaus.front();
                     tauCompletion = patchTaus.back();
+                    const float printTauTol = tauCompletion + 0.65f * hTop;
 
-                    std::vector<std::uint32_t> stage2Flags;
-                    evaluateBatchNozzleClearance(
-                        surviving,
-                        patchSkinThicknessMm,
-                        tauCompletion,
-                        stage2Flags);
+                    // Mark cells belonging strictly inside the surviving patch's own eroded skin slab
+                    std::vector<std::size_t> markedSlabCells;
+                    markedSlabCells.reserve(surviving.size() * 6);
+                    const float slabMinT = -std::max(0.25f * edtStep, 0.15f * fineVoxelSize);
+                    const float slabMaxT = patchSkinThicknessMm + 0.50f * hTop;
+                    const float slabStepT = std::max(0.25f * edtStep, 0.10f);
+                    for (int idx : surviving) {
+                        const auto& sv = surfVoxels[static_cast<std::size_t>(idx)];
+                        const openvdb::Vec3f& cNorm = clearanceNormals[static_cast<std::size_t>(idx)];
+                        for (float t = slabMinT; t <= slabMaxT; t += slabStepT) {
+                            const openvdb::Vec3f q = sv.surfPos - t * cNorm;
+                            const int iu = static_cast<int>(std::floor((q.dot(edtUAxis) - edtU0) * invEdtStep));
+                            const int iv = static_cast<int>(std::floor((q.dot(edtVAxis) - edtV0) * invEdtStep));
+                            const int iw = static_cast<int>(std::floor((q.dot(edtWAxis) - edtW0) * invEdtStep));
+                            if (iu >= 0 && iu < edtNu && iv >= 0 && iv < edtNv && iw >= iwSliceMin && iw <= iwSliceMax) {
+                                const std::size_t cIdx =
+                                    static_cast<std::size_t>(iw) * edtSliceStride +
+                                    static_cast<std::size_t>(iv) * static_cast<std::size_t>(edtNu) +
+                                    static_cast<std::size_t>(iu);
+                                if (!inCurrentPatchSlab[cIdx]) {
+                                    inCurrentPatchSlab[cIdx] = 1;
+                                    markedSlabCells.push_back(cIdx);
+                                }
+                            }
+                        }
+                    }
+
+                    compute2DSliceEdtRange(
+                        iwSliceMin,
+                        iwSliceMax,
+                        [&](std::size_t cIdx, float cTau, int bId, float cSdf) {
+                            if (inCurrentPatchSlab[cIdx] || cTau > printTauTol) {
+                                return false;
+                            }
+                            if (bId >= 0 && bId < static_cast<int>(numBranches) && patchDeferredMask[bId]) {
+                                return false;
+                            }
+                            return cSdf <= 0.02f * fineVoxelSize;
+                        },
+                        edtPrintedSurface);
+
+                    compute2DSliceEdtRange(
+                        iwSliceMin,
+                        iwSliceMax,
+                        [&](std::size_t cIdx, float cTau, int bId, float cSdf) {
+                            if (inCurrentPatchSlab[cIdx] || cTau > printTauTol) {
+                                return false;
+                            }
+                            if (bId >= 0 && bId < static_cast<int>(numBranches) && patchDeferredMask[bId]) {
+                                return false;
+                            }
+                            return cSdf <= deepCoreSdfCutoff;
+                        },
+                        edtPrintedDeep);
+
+                    if (!deferredBossRoots.empty()) {
+                        compute2DSliceEdtRange(
+                            iwSliceMin,
+                            iwTipSliceMax,
+                            [&](std::size_t cIdx, float /*cTau*/, int bId, float cSdf) {
+                                if (inCurrentPatchSlab[cIdx]) {
+                                    return false;
+                                }
+                                return bId >= 0 &&
+                                       bId < static_cast<int>(numBranches) &&
+                                       patchDeferredMask[bId] &&
+                                       cSdf <= -0.15f * fineVoxelSize;
+                            },
+                            edtDeferredTip);
+                    }
+
+                    for (const std::size_t cIdx : markedSlabCells) {
+                        inCurrentPatchSlab[cIdx] = 0;
+                    }
+
+                    std::vector<std::uint8_t> candColFlag(surviving.size(), 0);
+                    std::vector<openvdb::Vec3f> candAxisOut(surviving.size(), edtWAxis);
+
+                    auto evalAxisEdtMargin = [&](
+                        const openvdb::Vec3f& xSurf,
+                        const openvdb::Vec3f& cNorm,
+                        const openvdb::Vec3f& axis,
+                        float& outGradU,
+                        float& outGradV) -> float {
+                        outGradU = 0.0f;
+                        outGradV = 0.0f;
+                        const openvdb::Vec3f xBase = xSurf - patchSkinThicknessMm * cNorm;
+                        const float surfW = xSurf.dot(edtWAxis);
+                        const float maxZBox = std::max({
+                            (solidBBoxMaxX - xBase.x()) * axis.x(), 0.0f}) + maxCheckHeight;
+                        (void)maxZBox;
+                        float maxZAlong = 0.0f;
+                        for (int mask = 0; mask < 8; ++mask) {
+                            const openvdb::Vec3f corner(
+                                (mask & 1) ? solidBBoxMaxX : solidBBoxMinX,
+                                (mask & 2) ? solidBBoxMaxY : solidBBoxMinY,
+                                (mask & 4) ? solidBBoxMaxZ : solidBBoxMinZ);
+                            maxZAlong = std::max(maxZAlong, (corner - xBase).dot(axis));
+                        }
+                        const float zSweepMax = std::min(maxZAlong, maxCheckHeight);
+                        if (zSweepMax <= zStartSweep) {
+                            return 1.0e4f;
+                        }
+
+                        const float cosA = std::clamp(axis.dot(edtWAxis), -1.0f, 1.0f);
+                        const float sinA = std::sqrt(std::max(0.0f, 1.0f - cosA * cosA));
+                        const bool isTilted = (sinA > 0.03f);
+                        openvdb::Vec3f diskX(1.0f, 0.0f, 0.0f);
+                        openvdb::Vec3f diskY(0.0f, 1.0f, 0.0f);
+                        if (isTilted) {
+                            openvdb::Vec3f tPerp = edtWAxis - axis * cosA;
+                            if (tPerp.lengthSqr() > 1.0e-8f) {
+                                tPerp.normalize();
+                            } else {
+                                tPerp = edtUAxis;
+                            }
+                            diskX = tPerp;
+                            diskY = axis.cross(diskX);
+                            diskY.normalize();
+                        }
+
+                        float worstMargin = 1.0e4f;
+                        float worstU = xBase.dot(edtUAxis);
+                        float worstV = xBase.dot(edtVAxis);
+                        int worstIw = iwSliceMin;
+
+                        for (float z = zStartSweep; z <= zSweepMax;) {
+                            const float rClear = evalToolClearanceRadiusAtZ(z);
+                            const openvdb::Vec3f pAxis = xBase + z * axis;
+                            const float pu = pAxis.dot(edtUAxis);
+                            const float pv = pAxis.dot(edtVAxis);
+                            const float pw = pAxis.dot(edtWAxis);
+                            const float zStep = (z < nearTipZLimit + 2.0f * hTop)
+                                ? std::max(0.55f * fineVoxelSize, 0.65f * hTop)
+                                : std::max(0.95f * fineVoxelSize, 0.65f);
+
+                            if (!isTilted) {
+                                const int iw = static_cast<int>(std::floor((pw - edtW0) * invEdtStep));
+                                const float sliceWMin = edtW0 + static_cast<float>(iw) * edtStep;
+                                if (sliceWMin > surfW + baseCurvTol) {
+                                    const float dSurf = sampleEdtSliceDist(
+                                        edtPrintedSurface, iwSliceMin, iwSliceMax, pu, pv, iw);
+                                    const float mSurf = dSurf - (rClear + 0.25f * edtStep);
+                                    if (mSurf < worstMargin) {
+                                        worstMargin = mSurf;
+                                        worstU = pu;
+                                        worstV = pv;
+                                        worstIw = iw;
+                                    }
+                                }
+                                if (z > patchSkinThicknessMm + 0.75f * hTop) {
+                                    const float dDeep = sampleEdtSliceDist(
+                                        edtPrintedDeep, iwSliceMin, iwSliceMax, pu, pv, iw);
+                                    const float mDeep = dDeep - (rClear + 0.25f * edtStep);
+                                    if (mDeep < worstMargin) {
+                                        worstMargin = mDeep;
+                                        worstU = pu;
+                                        worstV = pv;
+                                        worstIw = iw;
+                                    }
+                                }
+                                if (!deferredBossRoots.empty() && z <= patchSkinThicknessMm + 1.0f * hTop) {
+                                    const float dTip = sampleEdtSliceDist(
+                                        edtDeferredTip, iwSliceMin, iwTipSliceMax, pu, pv, iw);
+                                    const float mTip = dTip - tipOrificeKeepoutR;
+                                    if (mTip < worstMargin) {
+                                        worstMargin = mTip;
+                                        worstU = pu;
+                                        worstV = pv;
+                                        worstIw = iw;
+                                    }
+                                }
+                            } else {
+                                constexpr int kAz = 16;
+                                const int numRings = std::clamp(
+                                    static_cast<int>(std::ceil(rClear / std::max(1.5f, 4.0f * edtStep))),
+                                    1,
+                                    5);
+                                const float sphereCoverR = 0.35f * edtStep;
+                                for (int ri = 0; ri <= numRings; ++ri) {
+                                    const float r = (ri == 0)
+                                        ? 0.0f
+                                        : (static_cast<float>(ri) / static_cast<float>(numRings)) * rClear;
+                                    const int nAng = (ri == 0) ? 1 : kAz;
+                                    const float curvTol = baseCurvTol + 0.03f * r;
+                                    for (int a = 0; a < nAng; ++a) {
+                                        const float ang =
+                                            (2.0f * 3.14159265358979323846f * static_cast<float>(a)) /
+                                            static_cast<float>(nAng);
+                                        const openvdb::Vec3f q =
+                                            pAxis + r * (std::cos(ang) * diskX + std::sin(ang) * diskY);
+                                        const float qu = q.dot(edtUAxis);
+                                        const float qv = q.dot(edtVAxis);
+                                        const float qw = q.dot(edtWAxis);
+                                        const int qiw = static_cast<int>(
+                                            std::floor((qw - edtW0) * invEdtStep));
+                                        const float qSliceWMin = edtW0 + static_cast<float>(qiw) * edtStep;
+                                        const float hAboveSurf = (q - xSurf).dot(cNorm);
+                                        const float hAboveBase = hAboveSurf + patchSkinThicknessMm;
+                                        const bool aboveSurf =
+                                            (hAboveSurf > curvTol) &&
+                                            (cNorm.dot(edtWAxis) < 0.85f || qSliceWMin > surfW + baseCurvTol);
+                                        const bool aboveBase =
+                                            (z > patchSkinThicknessMm + 0.75f * hTop) &&
+                                            (hAboveBase > curvTol);
+                                        if (!aboveSurf && !aboveBase) {
+                                            continue;
+                                        }
+                                        if (aboveSurf) {
+                                            const float dS = sampleEdtSliceDist(
+                                                edtPrintedSurface, iwSliceMin, iwSliceMax, qu, qv, qiw);
+                                            const float mS = (dS - sphereCoverR) + (rClear - r);
+                                            if (mS < worstMargin) {
+                                                worstMargin = mS;
+                                                worstU = qu;
+                                                worstV = qv;
+                                                worstIw = qiw;
+                                            }
+                                            if (!deferredBossRoots.empty() &&
+                                                z <= patchSkinThicknessMm + 1.0f * hTop &&
+                                                r <= tipOrificeKeepoutR) {
+                                                const float dT = sampleEdtSliceDist(
+                                                    edtDeferredTip, iwSliceMin, iwTipSliceMax, qu, qv, qiw);
+                                                const float mT = (dT - sphereCoverR) + (tipOrificeKeepoutR - r);
+                                                if (mT < worstMargin) {
+                                                    worstMargin = mT;
+                                                    worstU = qu;
+                                                    worstV = qv;
+                                                    worstIw = qiw;
+                                                }
+                                            }
+                                        } else {
+                                            const float dD = sampleEdtSliceDist(
+                                                edtPrintedDeep, iwSliceMin, iwSliceMax, qu, qv, qiw);
+                                            const float mD = (dD - sphereCoverR) + (rClear - r);
+                                            if (mD < worstMargin) {
+                                                worstMargin = mD;
+                                                worstU = qu;
+                                                worstV = qv;
+                                                worstIw = qiw;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            z += zStep;
+                        }
+
+                        const float dU = sampleEdtSliceDist(edtPrintedSurface, iwSliceMin, iwSliceMax, worstU + edtStep, worstV, worstIw) -
+                                         sampleEdtSliceDist(edtPrintedSurface, iwSliceMin, iwSliceMax, worstU - edtStep, worstV, worstIw);
+                        const float dV = sampleEdtSliceDist(edtPrintedSurface, iwSliceMin, iwSliceMax, worstU, worstV + edtStep, worstIw) -
+                                         sampleEdtSliceDist(edtPrintedSurface, iwSliceMin, iwSliceMax, worstU, worstV - edtStep, worstIw);
+                        outGradU = dU;
+                        outGradV = dV;
+                        return worstMargin;
+                    };
+
+                    tbb::parallel_for(
+                        tbb::blocked_range<std::size_t>(0, surviving.size(), 64),
+                        [&](const tbb::blocked_range<std::size_t>& r) {
+                            for (std::size_t k = r.begin(); k != r.end(); ++k) {
+                                const int svIdx = surviving[k];
+                                const auto& sv = surfVoxels[static_cast<std::size_t>(svIdx)];
+                                const openvdb::Vec3f& cNorm = clearanceNormals[static_cast<std::size_t>(svIdx)];
+                                const float bedSafeTilt = computeSkinBedSafeMaxTilt(sv.surfPos);
+                                openvdb::Vec3f bestAxis = canTiltSkinTool
+                                    ? clampVec3fToCone(cNorm, edtWAxis, bedSafeTilt)
+                                    : edtWAxis;
+
+                                float gU = 0.0f;
+                                float gV = 0.0f;
+                                float bestMargin = evalAxisEdtMargin(sv.surfPos, cNorm, bestAxis, gU, gV);
+
+                                // Option 3: Active 5/6-axis obstacle-avoidance tilt (first test nominal 0-deg axis, then +grad(EDT))
+                                if (canTiltSkinTool && bestMargin < marginExtra) {
+                                    if (bestAxis.dot(edtWAxis) < 0.9999f) {
+                                        float gU0 = 0.0f;
+                                        float gV0 = 0.0f;
+                                        const float mW =
+                                            evalAxisEdtMargin(sv.surfPos, cNorm, edtWAxis, gU0, gV0);
+                                        if (mW > bestMargin) {
+                                            bestMargin = mW;
+                                            bestAxis = edtWAxis;
+                                            gU = gU0;
+                                            gV = gV0;
+                                        }
+                                    }
+                                    if (bestMargin < marginExtra && bedSafeTilt > 0.02f) {
+                                        const float gLenSq = gU * gU + gV * gV;
+                                        if (gLenSq > 1.0e-8f) {
+                                            const float invG = 1.0f / std::sqrt(gLenSq);
+                                            const openvdb::Vec3f repulseDir =
+                                                (gU * invG) * edtUAxis + (gV * invG) * edtVAxis;
+                                            for (const float frac : {0.25f, 0.50f, 0.75f, 1.0f}) {
+                                                const float theta = frac * bedSafeTilt;
+                                                openvdb::Vec3f candAxis =
+                                                    std::cos(theta) * edtWAxis + std::sin(theta) * repulseDir;
+                                                candAxis.normalize();
+                                                float dummyU = 0.0f, dummyV = 0.0f;
+                                                const float candM =
+                                                    evalAxisEdtMargin(sv.surfPos, cNorm, candAxis, dummyU, dummyV);
+                                                if (candM > bestMargin) {
+                                                    bestMargin = candM;
+                                                    bestAxis = candAxis;
+                                                }
+                                                if (candM >= marginExtra) {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                candAxisOut[k] = bestAxis;
+                                if (bestMargin < 0.0f) {
+                                    candColFlag[k] = 1u;
+                                } else if (bestMargin < marginExtra) {
+                                    candColFlag[k] = 2u;
+                                }
+                            }
+                        });
 
                     std::vector<int> nextSurviving;
                     nextSurviving.reserve(surviving.size());
@@ -6739,12 +7652,14 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     for (std::size_t k = 0; k < surviving.size(); ++k) {
                         const int idx = surviving[k];
                         auto& sv = surfVoxels[static_cast<std::size_t>(idx)];
-                        if ((stage2Flags[k] & 1u) != 0u) {
+                        sv.solvedToolAxis = candAxisOut[k];
+                        if (candColFlag[k] == 1u) {
                             sv.patchId = -2;
                             sv.weight = 0.0f;
+                            sv.hasStage2Collision = true;
                             anyPruned = true;
                         } else {
-                            if ((stage2Flags[k] & 2u) != 0u) {
+                            if (candColFlag[k] == 2u) {
                                 sv.weight = std::min(sv.weight, 0.55f);
                             }
                             nextSurviving.push_back(idx);
@@ -6753,6 +7668,234 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     surviving = std::move(nextSurviving);
                     if (!anyPruned) {
                         break;
+                    }
+                }
+
+                // Option 2c: Geodesic morphological opening & collar smoothing strictly along internal
+                // collision boundaries (`patchId == -2`), leaving sharp exterior CAD edges untouched.
+                if (surviving.size() >= minPatchVoxels) {
+                    std::vector<int> patchColSeeds;
+                    std::unordered_map<int, std::size_t> qSlotMap;
+                    qSlotMap.reserve(queue.size() * 2);
+                    for (std::size_t qk = 0; qk < queue.size(); ++qk) {
+                        qSlotMap.emplace(queue[qk], qk);
+                    }
+                    std::vector<std::uint8_t> stage2Valid(queue.size(), 0);
+                    for (int idx : surviving) {
+                        stage2Valid[qSlotMap[idx]] = 1;
+                    }
+                    std::vector<float> dFromColl(queue.size(), std::numeric_limits<float>::max());
+                    using MorphPQItem = std::pair<float, std::size_t>;
+                    std::priority_queue<MorphPQItem, std::vector<MorphPQItem>, std::greater<MorphPQItem>> morphPq;
+
+                    bool anyColAdj = false;
+                    for (std::size_t qk = 0; qk < queue.size(); ++qk) {
+                        const int svIdx = queue[qk];
+                        const auto& sv = surfVoxels[static_cast<std::size_t>(svIdx)];
+                        if (!stage2Valid[qk]) {
+                            dFromColl[qk] = 0.0f;
+                            morphPq.push({0.0f, qk});
+                            anyColAdj = true;
+                            continue;
+                        }
+                        bool touchesNeg2 = false;
+                        for (int dz = -1; dz <= 1 && !touchesNeg2; ++dz) {
+                            for (int dy = -1; dy <= 1 && !touchesNeg2; ++dy) {
+                                for (int dx = -1; dx <= 1 && !touchesNeg2; ++dx) {
+                                    const int nbIdx = surfIdxAcc.getValue(sv.ijk + openvdb::Coord(dx, dy, dz));
+                                    if (nbIdx >= 0) {
+                                        const auto& nbSv = surfVoxels[static_cast<std::size_t>(nbIdx)];
+                                        if (nbSv.patchId == -2 &&
+                                            nbSv.surfNormal.dot(sv.surfNormal) >= 0.85f &&
+                                            (nbSv.surfPos - sv.surfPos).dot(sv.surfNormal) >= -0.25f * fineVoxelSize) {
+                                            touchesNeg2 = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (touchesNeg2) {
+                            dFromColl[qk] = fineVoxelSize;
+                            morphPq.push({fineVoxelSize, qk});
+                            anyColAdj = true;
+                        }
+                    }
+
+                    if (anyColAdj) {
+                        while (!morphPq.empty()) {
+                            const auto [dCurr, uSlot] = morphPq.top();
+                            morphPq.pop();
+                            if (dCurr > dFromColl[uSlot] + 1.0e-5f) {
+                                continue;
+                            }
+                            const auto& svU = surfVoxels[static_cast<std::size_t>(queue[uSlot])];
+                            for (int dz = -1; dz <= 1; ++dz) {
+                                for (int dy = -1; dy <= 1; ++dy) {
+                                    for (int dx = -1; dx <= 1; ++dx) {
+                                        if (dx == 0 && dy == 0 && dz == 0) {
+                                            continue;
+                                        }
+                                        const int nbIdx = surfIdxAcc.getValue(svU.ijk + openvdb::Coord(dx, dy, dz));
+                                        if (nbIdx < 0) {
+                                            continue;
+                                        }
+                                        auto itS = qSlotMap.find(nbIdx);
+                                        if (itS == qSlotMap.end()) {
+                                            continue;
+                                        }
+                                        const std::size_t vSlot = itS->second;
+                                        const float edgeLen =
+                                            (surfVoxels[static_cast<std::size_t>(nbIdx)].surfPos - svU.surfPos).length();
+                                        if (dCurr + edgeLen < dFromColl[vSlot]) {
+                                            dFromColl[vSlot] = dCurr + edgeLen;
+                                            morphPq.push({dFromColl[vSlot], vSlot});
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        const float rMorph = std::max(
+                            1.1f * impl_->shellPathSpec.outer_wall_width.target_mm,
+                            1.6f * fineVoxelSize);
+                        std::vector<std::uint8_t> opened(queue.size(), 0);
+                        for (std::size_t qk = 0; qk < queue.size(); ++qk) {
+                            if (stage2Valid[qk] && dFromColl[qk] > rMorph) {
+                                opened[qk] = 1;
+                            }
+                        }
+
+                        // Drop tiny disconnected islands (< minPatchVoxels) inside eroded mask
+                        std::vector<std::uint8_t> openVis(queue.size(), 0);
+                        std::size_t keptOpenedCount = 0;
+                        for (std::size_t qk = 0; qk < queue.size(); ++qk) {
+                            if (!opened[qk] || openVis[qk]) {
+                                continue;
+                            }
+                            std::vector<std::size_t> comp;
+                            comp.push_back(qk);
+                            openVis[qk] = 1;
+                            for (std::size_t ch = 0; ch < comp.size(); ++ch) {
+                                const auto& svU = surfVoxels[static_cast<std::size_t>(queue[comp[ch]])];
+                                for (int dz = -1; dz <= 1; ++dz) {
+                                    for (int dy = -1; dy <= 1; ++dy) {
+                                        for (int dx = -1; dx <= 1; ++dx) {
+                                            const int nbIdx = surfIdxAcc.getValue(svU.ijk + openvdb::Coord(dx, dy, dz));
+                                            if (nbIdx >= 0) {
+                                                auto itS = qSlotMap.find(nbIdx);
+                                                if (itS != qSlotMap.end()) {
+                                                    const std::size_t vS = itS->second;
+                                                    if (opened[vS] && !openVis[vS]) {
+                                                        openVis[vS] = 1;
+                                                        comp.push_back(vS);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (comp.size() < minPatchVoxels) {
+                                for (const std::size_t s : comp) {
+                                    opened[s] = 0;
+                                }
+                            } else {
+                                keptOpenedCount += comp.size();
+                            }
+                        }
+
+                        if (keptOpenedCount >= minPatchVoxels) {
+                            std::vector<float> dDilate(queue.size(), std::numeric_limits<float>::max());
+                            std::priority_queue<MorphPQItem, std::vector<MorphPQItem>, std::greater<MorphPQItem>> dilPq;
+                            for (std::size_t qk = 0; qk < queue.size(); ++qk) {
+                                if (opened[qk]) {
+                                    dDilate[qk] = 0.0f;
+                                    dilPq.push({0.0f, qk});
+                                }
+                            }
+                            while (!dilPq.empty()) {
+                                const auto [dCurr, uSlot] = dilPq.top();
+                                dilPq.pop();
+                                if (dCurr > dDilate[uSlot] + 1.0e-5f || dCurr > rMorph) {
+                                    continue;
+                                }
+                                const auto& svU = surfVoxels[static_cast<std::size_t>(queue[uSlot])];
+                                for (int dz = -1; dz <= 1; ++dz) {
+                                    for (int dy = -1; dy <= 1; ++dy) {
+                                        for (int dx = -1; dx <= 1; ++dx) {
+                                            if (dx == 0 && dy == 0 && dz == 0) {
+                                                continue;
+                                            }
+                                            const int nbIdx = surfIdxAcc.getValue(svU.ijk + openvdb::Coord(dx, dy, dz));
+                                            if (nbIdx >= 0) {
+                                                auto itS = qSlotMap.find(nbIdx);
+                                                if (itS != qSlotMap.end()) {
+                                                    const std::size_t vSlot = itS->second;
+                                                    if (stage2Valid[vSlot]) {
+                                                        const float edgeLen =
+                                                            (surfVoxels[static_cast<std::size_t>(nbIdx)].surfPos - svU.surfPos).length();
+                                                        if (dCurr + edgeLen < dDilate[vSlot] && dCurr + edgeLen <= rMorph + 0.1f * fineVoxelSize) {
+                                                            dDilate[vSlot] = dCurr + edgeLen;
+                                                            dilPq.push({dDilate[vSlot], vSlot});
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            std::vector<std::uint8_t> regValid(queue.size(), 0);
+                            for (std::size_t qk = 0; qk < queue.size(); ++qk) {
+                                if (stage2Valid[qk] && dDilate[qk] <= rMorph + 0.1f * fineVoxelSize) {
+                                    regValid[qk] = 1;
+                                }
+                            }
+                            for (int sPass = 0; sPass < 2; ++sPass) {
+                                std::vector<std::uint8_t> nextReg = regValid;
+                                for (std::size_t qk = 0; qk < queue.size(); ++qk) {
+                                    if (!stage2Valid[qk] || dFromColl[qk] > rMorph + 1.5f * fineVoxelSize) {
+                                        continue;
+                                    }
+                                    const auto& svU = surfVoxels[static_cast<std::size_t>(queue[qk])];
+                                    int onCnt = 0;
+                                    int totCnt = 0;
+                                    for (int dz = -1; dz <= 1; ++dz) {
+                                        for (int dy = -1; dy <= 1; ++dy) {
+                                            for (int dx = -1; dx <= 1; ++dx) {
+                                                const int nbIdx = surfIdxAcc.getValue(svU.ijk + openvdb::Coord(dx, dy, dz));
+                                                if (nbIdx >= 0) {
+                                                    auto itS = qSlotMap.find(nbIdx);
+                                                    if (itS != qSlotMap.end()) {
+                                                        ++totCnt;
+                                                        if (regValid[itS->second]) {
+                                                            ++onCnt;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (totCnt > 0) {
+                                        nextReg[qk] = (onCnt * 2 >= totCnt) ? 1 : 0;
+                                    }
+                                }
+                                regValid.swap(nextReg);
+                            }
+
+                            surviving.clear();
+                            for (std::size_t qk = 0; qk < queue.size(); ++qk) {
+                                auto& sv = surfVoxels[static_cast<std::size_t>(queue[qk])];
+                                if (regValid[qk]) {
+                                    surviving.push_back(queue[qk]);
+                                } else {
+                                    sv.patchId = -2;
+                                    sv.weight = 0.0f;
+                                    sv.hasStage2Collision = true;
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -6770,6 +7913,8 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 openvdb::Vec3f sumNormal(0.0f, 0.0f, 0.0f);
                 std::unordered_map<int, int> branchVotes;
                 std::size_t obliqueVoxelCount = 0;
+                float minNozzleProj = std::numeric_limits<float>::max();
+                float maxNozzleProj = std::numeric_limits<float>::lowest();
                 for (int idx : surviving) {
                     const auto& sv = surfVoxels[static_cast<std::size_t>(idx)];
                     if (sv.tau > 0.0f && sv.tau <= maxPlausibleTau) {
@@ -6778,6 +7923,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     if (sv.cosOblique <= cosMinOblique) {
                         ++obliqueVoxelCount;
                     }
+                    const float nProj = sv.surfPos.dot(zNozNominal);
+                    minNozzleProj = std::min(minNozzleProj, nProj);
+                    maxNozzleProj = std::max(maxNozzleProj, nProj);
                     sumNormal += sv.surfNormal;
                     branchVotes[sv.branchId] += 1;
                 }
@@ -6788,6 +7936,17 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     }
                     continue;
                 }
+                const float nLen = sumNormal.length();
+                const openvdb::Vec3f patchMeanNormal = (nLen > 1.0e-5f)
+                    ? (sumNormal / nLen)
+                    : openvdb::Vec3f(0.0f, 0.0f, 1.0f);
+                float patchMinNormalDotMean = 1.0f;
+                for (int idx : surviving) {
+                    patchMinNormalDotMean = std::min(
+                        patchMinNormalDotMean,
+                        surfVoxels[static_cast<std::size_t>(idx)].surfNormal.dot(patchMeanNormal));
+                }
+
                 std::sort(finalTaus.begin(), finalTaus.end());
                 tauMin = finalTaus.front();
                 tauCompletion = finalTaus.back();
@@ -6798,7 +7957,11 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 const bool hasStairStepTauSpan =
                     (tauP95 - tauP05) >= 0.35f * hTop ||
                     (tauCompletion - tauMin) >= 0.75f * hTop;
-                if (!hasAnyManual && !hasObliqueSurface && !hasStairStepTauSpan) {
+                const bool hasCurvedOrSlopedCrown =
+                    (patchMinNormalDotMean < 0.985f) ||
+                    ((maxNozzleProj - minNozzleProj) >= 0.85f * hTop &&
+                     patchMeanNormal.dot(zNozNominal) < 0.996f);
+                if (!hasAnyManual && !hasObliqueSurface && !hasStairStepTauSpan && !hasCurvedOrSlopedCrown) {
                     for (int idx : surviving) {
                         surfVoxels[static_cast<std::size_t>(idx)].patchId = -2;
                         surfVoxels[static_cast<std::size_t>(idx)].weight = 0.0f;
@@ -6816,6 +7979,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 }
                 bestBranch = std::clamp<int>(
                     bestBranch, 0, static_cast<int>(branches.size()) - 1);
+                if (branchPatchOwner[static_cast<std::size_t>(bestBranch)] < 0) {
+                    branchPatchOwner[static_cast<std::size_t>(bestBranch)] = candidatePatchId;
+                }
 
                 ConformalSkinPatch patch{};
                 patch.patchId = candidatePatchId;
@@ -6826,10 +7992,8 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 patch.branchId = static_cast<std::uint32_t>(bestBranch);
                 patch.parentBranchId = static_cast<std::int32_t>(
                     branches[static_cast<std::size_t>(bestBranch)].primaryParentId);
-                const float nLen = sumNormal.length();
-                patch.meanNormal = (nLen > 1.0e-5f)
-                    ? (sumNormal / nLen)
-                    : openvdb::Vec3f(0.0f, 0.0f, 1.0f);
+                patch.meanNormal = patchMeanNormal;
+                patch.deferredBranches = std::move(deferredBossRoots);
                 patch.surfVoxelIndices.reserve(surviving.size());
                 for (int idx : surviving) {
                     patch.surfVoxelIndices.push_back(static_cast<std::size_t>(idx));
@@ -6839,23 +8003,22 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             }
         }
 
-        // Smooth surface weights on each conformal skin patch:
-        // - `sv.weight` tapers at all patch boundaries (including outer edges and inner cutout
-        //   rims) so Section 5c (`skinTargetThicknessGrid`) clips `volumeToMesh` cleanly at 90-degree
-        //   side-wall corners and keeps each conformal skin layer a flat/conformal sheet.
-        // - `coreWeights` stays at 1.0 up to open outer/cutout edges and only tapers adjacent to
-        //   collision-pruned obstacles (`patchId == -2`) so Section 5b (`skinErodeDepthGrid`) erodes
-        //   underlying core layers completely through the 90-degree perimeter rim.
+        // Smooth surface weights on each conformal skin patch (without tapering at sharp exterior rims):
+        // Both `sv.weight` and `coreWeights` remain at 1.0 up to open outer CAD rims and only taper
+        // adjacent to collision-pruned obstacles (`patchId == -2`), keeping inner skin layers flush with walls.
         if (!conformalSkinPatches.empty()) {
             std::vector<float> coreWeights(surfVoxels.size(), 0.0f);
+            std::vector<openvdb::Vec3f> smoothedToolAxes(surfVoxels.size(), edtWAxis);
             for (std::size_t i = 0; i < surfVoxels.size(); ++i) {
                 if (surfVoxels[i].patchId >= 0) {
                     coreWeights[i] = 1.0f;
+                    smoothedToolAxes[i] = surfVoxels[i].solvedToolAxis;
                 }
             }
             for (int pass = 0; pass < 2; ++pass) {
                 std::vector<float> nextWeights(surfVoxels.size(), 0.0f);
                 std::vector<float> nextCoreWeights(surfVoxels.size(), 0.0f);
+                std::vector<openvdb::Vec3f> nextToolAxes(surfVoxels.size(), edtWAxis);
                 for (std::size_t i = 0; i < surfVoxels.size(); ++i) {
                     const auto& sv = surfVoxels[i];
                     if (sv.patchId < 0) {
@@ -6865,6 +8028,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     float cntW = 2.0f;
                     float sumCoreW = 2.0f * coreWeights[i];
                     float cntCoreW = 2.0f;
+                    openvdb::Vec3f sumAxis = 2.0f * smoothedToolAxes[i];
                     for (int dz = -1; dz <= 1; ++dz) {
                         for (int dy = -1; dy <= 1; ++dy) {
                             for (int dx = -1; dx <= 1; ++dx) {
@@ -6879,29 +8043,40 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                     cntW += 1.0f;
                                     sumCoreW += coreWeights[static_cast<std::size_t>(nbIdx)];
                                     cntCoreW += 1.0f;
-                                } else {
-                                    const float nbSdf = fineSdfAcc.getValue(nbCoord);
-                                    if (nbSdf >= -0.85f * fineVoxelSize &&
-                                        nbSdf <= 0.55f * fineVoxelSize) {
-                                        cntW += 1.0f;
-                                    }
-                                    if (nbIdx >= 0 &&
-                                        surfVoxels[static_cast<std::size_t>(nbIdx)].patchId == -2) {
-                                        cntCoreW += 1.0f;
-                                    }
+                                    sumAxis += smoothedToolAxes[static_cast<std::size_t>(nbIdx)];
+                                } else if (nbIdx >= 0 &&
+                                           surfVoxels[static_cast<std::size_t>(nbIdx)].patchId == -2 &&
+                                           surfVoxels[static_cast<std::size_t>(nbIdx)].surfNormal.dot(sv.surfNormal) >= 0.85f &&
+                                           (surfVoxels[static_cast<std::size_t>(nbIdx)].surfPos - sv.surfPos)
+                                                   .dot(sv.surfNormal) >= -0.25f * fineVoxelSize) {
+                                    cntW += 1.0f;
+                                    cntCoreW += 1.0f;
                                 }
                             }
                         }
                     }
                     nextWeights[i] = std::clamp(sumW / cntW, 0.0f, 1.0f);
                     nextCoreWeights[i] = std::clamp(sumCoreW / cntCoreW, 0.0f, 1.0f);
+                    if (sumAxis.lengthSqr() > 1.0e-6f) {
+                        sumAxis.normalize();
+                        nextToolAxes[i] = sumAxis;
+                    } else {
+                        nextToolAxes[i] = smoothedToolAxes[i];
+                    }
                 }
                 for (std::size_t i = 0; i < surfVoxels.size(); ++i) {
                     if (surfVoxels[i].patchId >= 0) {
                         surfVoxels[i].weight = nextWeights[i];
                         coreWeights[i] = nextCoreWeights[i];
+                        smoothedToolAxes[i] = nextToolAxes[i];
                     }
                 }
+            }
+
+            if (canTiltSkinTool) {
+                skinPatchToolAxisGrid = openvdb::Vec3SGrid::create(
+                    openvdb::Vec3s(0.0f, 0.0f, 0.0f));
+                skinPatchToolAxisGrid->setTransform(fineSdfGrid.transform().copy());
             }
 
             auto erodeAcc = skinErodeDepthGrid.getAccessor();
@@ -6909,6 +8084,10 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             auto patchIdAcc = skinPatchIdGrid.getAccessor();
             auto corePatchIdAcc = skinCorePatchIdGrid.getAccessor();
             auto patchNormAcc = skinPatchNormalGrid.getAccessor();
+            std::optional<openvdb::Vec3SGrid::Accessor> patchToolAxisAcc;
+            if (skinPatchToolAxisGrid) {
+                patchToolAxisAcc.emplace(skinPatchToolAxisGrid->getAccessor());
+            }
             const float minBandSdf = -(maxConformalSkinDepthMm + 2.5f * fineVoxelSize);
             const float maxBandSdf = 1.5f * fineVoxelSize;
             const float maxProjDistSq = (2.15f * fineVoxelSize) * (2.15f * fineVoxelSize);
@@ -7028,7 +8207,11 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             const int nbIdx =
                                 surfIdxAcc.getValue(sv.ijk + openvdb::Coord(dx, dy, dz));
                             if (nbIdx >= 0 &&
-                                surfVoxels[static_cast<std::size_t>(nbIdx)].patchId >= 0) {
+                                surfVoxels[static_cast<std::size_t>(nbIdx)].patchId >= 0 &&
+                                sv.surfNormal.dot(surfVoxels[static_cast<std::size_t>(nbIdx)].surfNormal) >= 0.85f &&
+                                (sv.surfPos - surfVoxels[static_cast<std::size_t>(nbIdx)].surfPos)
+                                        .dot(surfVoxels[static_cast<std::size_t>(nbIdx)].surfNormal) >=
+                                    -0.25f * fineVoxelSize) {
                                 nearValidPatch = true;
                             }
                         }
@@ -7081,6 +8264,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 int bestSkinPatchId = -1;
                 int bestCorePatchId = -1;
                 openvdb::Vec3f bestNormal(0.0f, 0.0f, 1.0f);
+                openvdb::Vec3f bestToolAxis = edtWAxis;
 
                 openvdb::Vec3f nSdf(0.0f, 0.0f, 1.0f);
                 if (sampleSdfGradUnit(wp, nSdf)) {
@@ -7098,6 +8282,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     int nearestSurfPatchId = -1;
                     float nearestSurfDistSq = std::numeric_limits<float>::max();
                     openvdb::Vec3f sumSurfNormal(0.0f, 0.0f, 0.0f);
+                    openvdb::Vec3f sumSurfToolAxis(0.0f, 0.0f, 0.0f);
 
                     for (int dz = -2; dz <= 2; ++dz) {
                         for (int dy = -2; dy <= 2; ++dy) {
@@ -7109,7 +8294,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                 }
                                 const auto& sv = surfVoxels[static_cast<std::size_t>(svIdx)];
                                 const float dotN = nSdf.dot(sv.surfNormal);
-                                if (dotN < 0.55f) {
+                                if (dotN < 0.45f) {
                                     continue;
                                 }
                                 const float dSq = (xSurf - sv.surfPos).lengthSqr();
@@ -7124,10 +8309,12 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                     nearestSurfPatchId = sv.patchId;
                                 }
                                 if (sv.patchId >= 0) {
-                                    sumWeight += wDist * sv.weight * dotN;
+                                    sumWeight += wDist * sv.weight;
                                     sumCoreWeight +=
                                         wDist * coreWeights[static_cast<std::size_t>(svIdx)];
                                     sumSurfNormal += sv.surfNormal * wDist;
+                                    sumSurfToolAxis +=
+                                        smoothedToolAxes[static_cast<std::size_t>(svIdx)] * wDist;
                                 }
                             }
                         }
@@ -7149,6 +8336,10 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             const float snLen = sumSurfNormal.length();
                             if (snLen > 1.0e-5f) {
                                 bestNormal = sumSurfNormal / snLen;
+                            }
+                            const float axLen = sumSurfToolAxis.length();
+                            if (axLen > 1.0e-5f) {
+                                bestToolAxis = sumSurfToolAxis / axLen;
                             }
                         }
                         if (coreTEff > 1.0e-4f) {
@@ -7195,6 +8386,11 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     patchNormAcc.setValue(
                         ijk,
                         openvdb::Vec3s(bestNormal.x(), bestNormal.y(), bestNormal.z()));
+                    if (patchToolAxisAcc) {
+                        patchToolAxisAcc->setValue(
+                            ijk,
+                            openvdb::Vec3s(bestToolAxis.x(), bestToolAxis.y(), bestToolAxis.z()));
+                    }
                 }
             }
         }
@@ -8269,14 +9465,11 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         constexpr int kLeafDim = static_cast<int>(SdfLeafType::DIM);
 
         std::vector<openvdb::FloatGrid::Ptr> patchSdfGrids(conformalSkinPatches.size());
-        struct SkinLayerExtractionJob {
-            std::size_t patchIdx;
-            int m;
-        };
-        std::vector<SkinLayerExtractionJob> skinJobs;
-
         for (std::size_t pIdx = 0; pIdx < conformalSkinPatches.size(); ++pIdx) {
             const auto& patch = conformalSkinPatches[pIdx];
+            if (patch.skinLayers <= 0) {
+                continue;
+            }
             openvdb::FloatGrid::Ptr patchSdfGrid =
                 openvdb::FloatGrid::create(fineSdfGrid.background());
             patchSdfGrid->setTransform(fineSdfGrid.transform().copy());
@@ -8310,20 +9503,18 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 }
             }
 
-            if (patchTree.leafCount() == 0) {
-                continue;
-            }
-            patchSdfGrids[pIdx] = patchSdfGrid;
-            for (int m = 1; m <= patch.skinLayers; ++m) {
-                skinJobs.push_back(SkinLayerExtractionJob{pIdx, m});
+            if (patchTree.leafCount() > 0) {
+                patchSdfGrids[pIdx] = patchSdfGrid;
             }
         }
 
-        std::vector<SelectedLayerInfo> skinJobResults(skinJobs.size());
-        std::vector<std::uint8_t> skinJobValid(skinJobs.size(), 0);
+        // Option 2a: Extract a single reference outer surface mesh M_top per patch and generate all
+        // conformal skin layers m = 1..N_p via smooth internal-collar fairing and wall-sliding offset
+        // d_slide, preventing dropped inner perimeters beneath the outermost surface.
+        std::vector<std::vector<SelectedLayerInfo>> perPatchSkinLayers(conformalSkinPatches.size());
 
         tbb::parallel_for(
-            tbb::blocked_range<std::size_t>(0, skinJobs.size()),
+            tbb::blocked_range<std::size_t>(0, conformalSkinPatches.size()),
             [&](const tbb::blocked_range<std::size_t>& r) {
                 auto fineSdfAcc = fineSdfGrid.getConstAccessor();
                 openvdb::tools::GridSampler<
@@ -8363,20 +9554,39 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     return true;
                 };
 
-                for (std::size_t jIdx = r.begin(); jIdx != r.end(); ++jIdx) {
-                    const auto& job = skinJobs[jIdx];
-                    const auto& patch = conformalSkinPatches[job.patchIdx];
-                    const int m = job.m;
-                    const auto& patchSdfGrid = *patchSdfGrids[job.patchIdx];
+                auto isPointNearPatch = [&](const openvdb::Vec3d& wp, int targetPatchId) -> bool {
+                    const openvdb::Coord cFine =
+                        fineSdfGrid.transform().worldToIndexCellCentered(wp);
+                    if (skinPatchIdAcc.getValue(cFine) == targetPatchId) {
+                        return true;
+                    }
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                if (dx == 0 && dy == 0 && dz == 0) {
+                                    continue;
+                                }
+                                if (skinPatchIdAcc.getValue(
+                                        cFine + openvdb::Coord(dx, dy, dz)) == targetPatchId) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    return false;
+                };
 
-                    // Target SDF level set from innermost (m = 1) to outermost (m = N_p):
-                    // \phi_m = -(N_p - m + 0.15) * hTop
-                    const float targetDepthMm =
-                        (static_cast<float>(patch.skinLayers - m) + 0.15f) * hTop;
-                    const float phiTarget = -targetDepthMm;
-                    const float requiredErodeMm =
-                        (static_cast<float>(patch.skinLayers - m) + 0.25f) * hTop;
+                for (std::size_t pIdx = r.begin(); pIdx != r.end(); ++pIdx) {
+                    if (!patchSdfGrids[pIdx]) {
+                        continue;
+                    }
+                    const auto& patch = conformalSkinPatches[pIdx];
+                    if (patch.skinLayers <= 0) {
+                        continue;
+                    }
+                    const auto& patchSdfGrid = *patchSdfGrids[pIdx];
 
+                    const float phiRef = -0.15f * hTop;
                     std::vector<openvdb::Vec3s> points;
                     std::vector<openvdb::Vec3I> triangles;
                     std::vector<openvdb::Vec4I> quads;
@@ -8385,7 +9595,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         points,
                         triangles,
                         quads,
-                        static_cast<double>(phiTarget),
+                        static_cast<double>(phiRef),
                         0.0,
                         true);
 
@@ -8394,17 +9604,15 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     }
 
                     std::vector<RenderVertex> verts(points.size());
-                    std::vector<float> clipDist(points.size(), 1.0f);
+                    std::vector<float> clipDist(points.size(), 0.50f * patch.skinThicknessMm);
                     for (std::size_t i = 0; i < points.size(); ++i) {
                         openvdb::Vec3d wp(points[i].x(), points[i].y(), points[i].z());
                         openvdb::Vec3f nSdf = patch.meanNormal;
                         sampleFineSdfGradUnit(wp, nSdf);
 
-                        // 1 Newton projection step onto exact \phi_sdf(x) = phiTarget
                         const float curSdf = fineSdfSampler.wsSample(wp);
-                        const float err = curSdf - phiTarget;
                         const float step =
-                            std::clamp(err, -0.35f * fineVoxelSize, 0.35f * fineVoxelSize);
+                            std::clamp(curSdf - phiRef, -0.35f * fineVoxelSize, 0.35f * fineVoxelSize);
                         wp -= openvdb::Vec3d(
                             step * nSdf.x(), step * nSdf.y(), step * nSdf.z());
                         sampleFineSdfGradUnit(wp, nSdf);
@@ -8416,25 +9624,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         verts[i].ny = nSdf.y();
                         verts[i].nz = nSdf.z();
 
-                        // Check patch membership and normal alignment with the generating surface
-                        const openvdb::Coord cFine =
-                            fineSdfGrid.transform().worldToIndexCellCentered(wp);
-                        int pId = skinPatchIdAcc.getValue(cFine);
-                        if (pId != patch.patchId) {
-                            for (int dz = -1; dz <= 1 && pId != patch.patchId; ++dz) {
-                                for (int dy = -1; dy <= 1 && pId != patch.patchId; ++dy) {
-                                    for (int dx = -1; dx <= 1 && pId != patch.patchId; ++dx) {
-                                        const int nbP = skinPatchIdAcc.getValue(
-                                            cFine + openvdb::Coord(dx, dy, dz));
-                                        if (nbP == patch.patchId) {
-                                            pId = nbP;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if (pId == patch.patchId) {
+                        if (isPointNearPatch(wp, patch.patchId)) {
                             const openvdb::Vec3s pNormS = skinPatchNormSampler.wsSample(wp);
                             openvdb::Vec3f pNorm(pNormS.x(), pNormS.y(), pNormS.z());
                             const float pNormLen = pNorm.length();
@@ -8443,12 +9633,12 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             } else {
                                 pNorm = patch.meanNormal;
                             }
-                            const float alignFactor =
-                                std::clamp((nSdf.dot(pNorm) - 0.65f) / 0.20f, 0.0f, 1.0f);
-                            const float effErode = skinErodeSampler.wsSample(wp) * alignFactor;
-                            clipDist[i] = requiredErodeMm - effErode;
+                            const float align =
+                                std::clamp((nSdf.dot(pNorm) - 0.60f) / 0.16f, 0.0f, 1.0f);
+                            const float rawThick = skinErodeSampler.wsSample(wp);
+                            clipDist[i] = 0.50f * patch.skinThicknessMm - rawThick * align;
                         } else {
-                            clipDist[i] = requiredErodeMm;
+                            clipDist[i] = 0.50f * patch.skinThicknessMm;
                         }
                     }
 
@@ -8481,27 +9671,16 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         pushOrientedTri(q[0], q[3], q[2]);
                     }
 
-                    SelectedLayerInfo skinInfo{};
-                    skinInfo.branch_id = patch.branchId;
-                    skinInfo.parent_branch_id = patch.parentBranchId;
-                    skinInfo.branch_layer_index = static_cast<std::uint32_t>(m - 1);
-                    skinInfo.branch_layer_count = static_cast<std::uint32_t>(patch.skinLayers);
-                    skinInfo.isovalue =
-                        patch.tauCompletion + static_cast<float>(m) * 1.0e-3f;
-                    skinInfo.mean_thickness_mm = hTop;
-                    skinInfo.min_thickness_mm = hTop;
-                    skinInfo.max_thickness_mm = hTop;
-                    skinInfo.is_first_layer = false;
-                    skinInfo.is_top_layer = true;
-
+                    std::vector<RenderVertex> topVerts;
+                    std::vector<std::uint32_t> topInds;
                     std::vector<std::int32_t> vertexRemap(verts.size(), -1);
                     std::unordered_map<std::uint64_t, std::uint32_t> edgeCutRemap;
                     auto emitSkinVertex = [&](std::uint32_t oldIdx) -> std::uint32_t {
                         if (vertexRemap[oldIdx] >= 0) {
                             return static_cast<std::uint32_t>(vertexRemap[oldIdx]);
                         }
-                        const auto newIdx = static_cast<std::uint32_t>(skinInfo.vertices.size());
-                        skinInfo.vertices.push_back(verts[oldIdx]);
+                        const auto newIdx = static_cast<std::uint32_t>(topVerts.size());
+                        topVerts.push_back(verts[oldIdx]);
                         vertexRemap[oldIdx] = static_cast<std::int32_t>(newIdx);
                         return newIdx;
                     };
@@ -8522,7 +9701,6 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             ? std::clamp(-dLo / denom, 0.0f, 1.0f)
                             : 0.5f;
                         RenderVertex cv = lerpSkinVertex(verts[lo], verts[hi], t);
-                        // Ensure cut rim vertex stays strictly inside \phi_sdf <= 0
                         const openvdb::Vec3d wpC(cv.x, cv.y, cv.z);
                         const float cSdf = fineSdfSampler.wsSample(wpC);
                         if (cSdf > -0.02f * hTop) {
@@ -8531,8 +9709,8 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             cv.y -= pushIn * cv.ny;
                             cv.z -= pushIn * cv.nz;
                         }
-                        const auto newIdx = static_cast<std::uint32_t>(skinInfo.vertices.size());
-                        skinInfo.vertices.push_back(cv);
+                        const auto newIdx = static_cast<std::uint32_t>(topVerts.size());
+                        topVerts.push_back(cv);
                         edgeCutRemap.emplace(key, newIdx);
                         return newIdx;
                     };
@@ -8557,9 +9735,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             const std::uint32_t n0 = emitSkinVertex(i0);
                             const std::uint32_t n1 = emitSkinVertex(i1);
                             const std::uint32_t n2 = emitSkinVertex(i2);
-                            skinInfo.indices.push_back(n0);
-                            skinInfo.indices.push_back(n1);
-                            skinInfo.indices.push_back(n2);
+                            topInds.push_back(n0);
+                            topInds.push_back(n1);
+                            topInds.push_back(n2);
                             continue;
                         }
 
@@ -8578,49 +9756,292 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
 
                         const std::uint32_t vAB = emitSkinCutVertex(idxA, idxB, dA, dB);
                         const std::uint32_t vAC = emitSkinCutVertex(idxA, idxC, dA, dC);
-                        const auto& p0 = skinInfo.vertices[vAB];
-                        const auto& p1 = skinInfo.vertices[vAC];
-                        skinInfo.contour_segments.push_back(p0.x);
-                        skinInfo.contour_segments.push_back(p0.y);
-                        skinInfo.contour_segments.push_back(p0.z);
-                        skinInfo.contour_segments.push_back(p1.x);
-                        skinInfo.contour_segments.push_back(p1.y);
-                        skinInfo.contour_segments.push_back(p1.z);
 
                         if (soloInside) {
                             const std::uint32_t nA = emitSkinVertex(idxA);
-                            skinInfo.indices.push_back(nA);
-                            skinInfo.indices.push_back(vAB);
-                            skinInfo.indices.push_back(vAC);
+                            topInds.push_back(nA);
+                            topInds.push_back(vAB);
+                            topInds.push_back(vAC);
                         } else {
                             const std::uint32_t nB = emitSkinVertex(idxB);
                             const std::uint32_t nC = emitSkinVertex(idxC);
-                            skinInfo.indices.push_back(vAB);
-                            skinInfo.indices.push_back(nB);
-                            skinInfo.indices.push_back(nC);
-                            skinInfo.indices.push_back(vAB);
-                            skinInfo.indices.push_back(nC);
-                            skinInfo.indices.push_back(vAC);
+                            topInds.push_back(vAB);
+                            topInds.push_back(nB);
+                            topInds.push_back(nC);
+                            topInds.push_back(vAB);
+                            topInds.push_back(nC);
+                            topInds.push_back(vAC);
                         }
                     }
 
-                    if (!skinInfo.vertices.empty() && skinInfo.indices.size() >= 3) {
-                        skinJobResults[jIdx] = std::move(skinInfo);
-                        skinJobValid[jIdx] = 1;
+                    if (topVerts.empty() || topInds.size() < 3) {
+                        continue;
+                    }
+
+                    const std::size_t numTopVerts = topVerts.size();
+                    std::unordered_map<std::uint64_t, int> edgeUseCount;
+                    edgeUseCount.reserve(topInds.size());
+                    auto addUndirEdge = [&](std::uint32_t u, std::uint32_t v) {
+                        if (u == v) {
+                            return;
+                        }
+                        const std::uint32_t lo = std::min(u, v);
+                        const std::uint32_t hi = std::max(u, v);
+                        const std::uint64_t key =
+                            (static_cast<std::uint64_t>(lo) << 32) | static_cast<std::uint64_t>(hi);
+                        edgeUseCount[key] += 1;
+                    };
+                    for (std::size_t t = 0; t + 2 < topInds.size(); t += 3) {
+                        const std::uint32_t a = topInds[t + 0];
+                        const std::uint32_t b = topInds[t + 1];
+                        const std::uint32_t c = topInds[t + 2];
+                        addUndirEdge(a, b);
+                        addUndirEdge(b, c);
+                        addUndirEdge(c, a);
+                    }
+
+                    std::vector<std::vector<std::uint32_t>> vertNbrs(numTopVerts);
+                    std::vector<std::vector<std::uint32_t>> boundaryNbrs(numTopVerts);
+                    std::vector<std::pair<std::uint32_t, std::uint32_t>> boundaryEdges;
+                    for (const auto& [key, count] : edgeUseCount) {
+                        const auto lo = static_cast<std::uint32_t>(key >> 32);
+                        const auto hi = static_cast<std::uint32_t>(key & 0xFFFFFFFFu);
+                        vertNbrs[lo].push_back(hi);
+                        vertNbrs[hi].push_back(lo);
+                        if (count == 1) {
+                            boundaryNbrs[lo].push_back(hi);
+                            boundaryNbrs[hi].push_back(lo);
+                            boundaryEdges.emplace_back(lo, hi);
+                        }
+                    }
+
+                    std::vector<openvdb::Vec3f> pTop(numTopVerts);
+                    for (std::size_t v = 0; v < numTopVerts; ++v) {
+                        pTop[v] = openvdb::Vec3f(topVerts[v].x, topVerts[v].y, topVerts[v].z);
+                    }
+
+                    // Internal-collar boundary fairing (3 passes): smooth collision-collar curves inside the
+                    // solid while preserving exterior CAD edges (`fineSdf >= -1.25 * fineVoxelSize`).
+                    for (int pass = 0; pass < 3; ++pass) {
+                        std::vector<openvdb::Vec3f> nextPos = pTop;
+                        for (std::size_t v = 0; v < numTopVerts; ++v) {
+                            if (boundaryNbrs[v].size() != 2) {
+                                continue;
+                            }
+                            const openvdb::Vec3d wp(pTop[v].x(), pTop[v].y(), pTop[v].z());
+                            if (fineSdfSampler.wsSample(wp) >= -1.25f * fineVoxelSize) {
+                                continue;
+                            }
+                            const openvdb::Vec3f relaxed =
+                                0.60f * pTop[v] +
+                                0.20f * (pTop[boundaryNbrs[v][0]] + pTop[boundaryNbrs[v][1]]);
+                            openvdb::Vec3d rw(relaxed.x(), relaxed.y(), relaxed.z());
+                            openvdb::Vec3f nProj(
+                                topVerts[v].nx, topVerts[v].ny, topVerts[v].nz);
+                            sampleFineSdfGradUnit(rw, nProj);
+                            const float step = std::clamp(
+                                fineSdfSampler.wsSample(rw) - phiRef,
+                                -0.35f * fineVoxelSize,
+                                0.35f * fineVoxelSize);
+                            rw -= openvdb::Vec3d(
+                                step * nProj.x(), step * nProj.y(), step * nProj.z());
+                            nextPos[v] = openvdb::Vec3f(
+                                static_cast<float>(rw.x()),
+                                static_cast<float>(rw.y()),
+                                static_cast<float>(rw.z()));
+                        }
+                        pTop.swap(nextPos);
+                    }
+
+                    // Smoothed patch normal nPatch (2 passes)
+                    std::vector<openvdb::Vec3f> nPatch(numTopVerts, patch.meanNormal);
+                    for (std::size_t v = 0; v < numTopVerts; ++v) {
+                        const openvdb::Vec3d wp(pTop[v].x(), pTop[v].y(), pTop[v].z());
+                        openvdb::Vec3f baseN(topVerts[v].nx, topVerts[v].ny, topVerts[v].nz);
+                        if (isPointNearPatch(wp, patch.patchId)) {
+                            const openvdb::Vec3s pNormS = skinPatchNormSampler.wsSample(wp);
+                            const openvdb::Vec3f pNorm(pNormS.x(), pNormS.y(), pNormS.z());
+                            if (pNorm.lengthSqr() > 1.0e-8f) {
+                                baseN = pNorm;
+                                baseN.normalize();
+                            }
+                        } else if (baseN.dot(patch.meanNormal) < 0.60f) {
+                            baseN = patch.meanNormal;
+                        }
+                        if (baseN.lengthSqr() > 1.0e-8f) {
+                            baseN.normalize();
+                            nPatch[v] = baseN;
+                        }
+                    }
+                    for (int pass = 0; pass < 2; ++pass) {
+                        std::vector<openvdb::Vec3f> nextNorm = nPatch;
+                        for (std::size_t v = 0; v < numTopVerts; ++v) {
+                            openvdb::Vec3f sumN = 2.0f * nPatch[v];
+                            for (const std::uint32_t nb : vertNbrs[v]) {
+                                sumN += nPatch[nb];
+                            }
+                            if (sumN.lengthSqr() > 1.0e-8f) {
+                                sumN.normalize();
+                                nextNorm[v] = sumN;
+                            }
+                        }
+                        nPatch.swap(nextNorm);
+                    }
+
+                    // Wall-sliding unit-depth vector dSlide
+                    std::vector<openvdb::Vec3f> dSlide(numTopVerts);
+                    for (std::size_t v = 0; v < numTopVerts; ++v) {
+                        const openvdb::Vec3d wp(pTop[v].x(), pTop[v].y(), pTop[v].z());
+                        const float fSdf = fineSdfSampler.wsSample(wp);
+                        openvdb::Vec3f nWall = nPatch[v];
+                        sampleFineSdfGradUnit(wp, nWall);
+
+                        const openvdb::Vec3d wpBelow(
+                            wp.x() - static_cast<double>(0.60f * hTop * nPatch[v].x()),
+                            wp.y() - static_cast<double>(0.60f * hTop * nPatch[v].y()),
+                            wp.z() - static_cast<double>(0.60f * hTop * nPatch[v].z()));
+                        openvdb::Vec3f nBelow;
+                        if (fineSdfSampler.wsSample(wpBelow) > -1.10f * fineVoxelSize &&
+                            sampleFineSdfGradUnit(wpBelow, nBelow) &&
+                            std::abs(nBelow.dot(nPatch[v])) < std::abs(nWall.dot(nPatch[v]))) {
+                            nWall = nBelow;
+                        }
+
+                        const float c = nPatch[v].dot(nWall);
+                        if (fSdf > -1.25f * fineVoxelSize && std::abs(c) <= 0.78f) {
+                            dSlide[v] = (-nPatch[v] + c * nWall) / (1.0f - c * c);
+                        } else {
+                            dSlide[v] = -nPatch[v];
+                        }
+                    }
+                    for (int pass = 0; pass < 3; ++pass) {
+                        std::vector<openvdb::Vec3f> nextSlide = dSlide;
+                        for (std::size_t v = 0; v < numTopVerts; ++v) {
+                            openvdb::Vec3f sumD = 2.0f * dSlide[v];
+                            const float denom = 2.0f + static_cast<float>(vertNbrs[v].size());
+                            for (const std::uint32_t nb : vertNbrs[v]) {
+                                sumD += dSlide[nb];
+                            }
+                            nextSlide[v] = sumD / denom;
+                        }
+                        dSlide.swap(nextSlide);
+                    }
+                    for (std::size_t v = 0; v < numTopVerts; ++v) {
+                        const float depthProj =
+                            std::clamp(-dSlide[v].dot(nPatch[v]), 0.55f, 1.85f);
+                        dSlide[v] /= depthProj;
+                        const float dLen = dSlide[v].length();
+                        if (dLen > 1.85f) {
+                            dSlide[v] *= (1.85f / dLen);
+                        }
+                    }
+
+                    // Emit layers m = 1..skinLayers by translating M_top along dSlide
+                    auto& patchLayers = perPatchSkinLayers[pIdx];
+                    patchLayers.reserve(static_cast<std::size_t>(patch.skinLayers));
+                    for (int m = 1; m <= patch.skinLayers; ++m) {
+                        const float deltaDepthMm =
+                            static_cast<float>(patch.skinLayers - m) * hTop;
+                        SelectedLayerInfo skinInfo{};
+                        skinInfo.branch_id = patch.branchId;
+                        skinInfo.parent_branch_id = patch.parentBranchId;
+                        skinInfo.branch_layer_index = static_cast<std::uint32_t>(m - 1);
+                        skinInfo.branch_layer_count = static_cast<std::uint32_t>(patch.skinLayers);
+                        skinInfo.isovalue =
+                            patch.tauCompletion + static_cast<float>(m) * 1.0e-3f;
+                        skinInfo.mean_thickness_mm = hTop;
+                        skinInfo.min_thickness_mm = hTop;
+                        skinInfo.max_thickness_mm = hTop;
+                        skinInfo.is_first_layer = false;
+                        skinInfo.is_top_layer = true;
+                        skinInfo.vertices.reserve(numTopVerts);
+
+                        for (std::size_t v = 0; v < numTopVerts; ++v) {
+                            openvdb::Vec3f p = pTop[v] + deltaDepthMm * dSlide[v];
+                            const openvdb::Vec3d wp(p.x(), p.y(), p.z());
+                            const float cSdf = fineSdfSampler.wsSample(wp);
+                            if (cSdf > -0.04f * hTop) {
+                                openvdb::Vec3f nOut = nPatch[v];
+                                sampleFineSdfGradUnit(wp, nOut);
+                                const float pushIn = cSdf + 0.05f * hTop;
+                                p -= pushIn * nOut;
+                            }
+                            RenderVertex rv{};
+                            rv.x = p.x();
+                            rv.y = p.y();
+                            rv.z = p.z();
+                            rv.nx = nPatch[v].x();
+                            rv.ny = nPatch[v].y();
+                            rv.nz = nPatch[v].z();
+                            skinInfo.vertices.push_back(rv);
+                        }
+
+                        skinInfo.indices.reserve(topInds.size());
+                        for (const std::uint32_t idx : topInds) {
+                            skinInfo.indices.push_back(idx);
+                        }
+                        skinInfo.contour_segments.reserve(boundaryEdges.size() * 6);
+                        for (const auto& [b0, b1] : boundaryEdges) {
+                            const auto& p0 = skinInfo.vertices[b0];
+                            const auto& p1 = skinInfo.vertices[b1];
+                            skinInfo.contour_segments.push_back(p0.x);
+                            skinInfo.contour_segments.push_back(p0.y);
+                            skinInfo.contour_segments.push_back(p0.z);
+                            skinInfo.contour_segments.push_back(p1.x);
+                            skinInfo.contour_segments.push_back(p1.y);
+                            skinInfo.contour_segments.push_back(p1.z);
+                        }
+
+                        if (!skinInfo.vertices.empty() && skinInfo.indices.size() >= 3) {
+                            patchLayers.push_back(std::move(skinInfo));
+                        }
                     }
                 }
             });
 
         std::vector<SelectedLayerInfo> conformalSkinLayers;
-        conformalSkinLayers.reserve(skinJobs.size());
-        for (std::size_t jIdx = 0; jIdx < skinJobs.size(); ++jIdx) {
-            if (skinJobValid[jIdx]) {
-                conformalSkinLayers.push_back(std::move(skinJobResults[jIdx]));
+        for (auto& patchLayers : perPatchSkinLayers) {
+            for (auto& layer : patchLayers) {
+                conformalSkinLayers.push_back(std::move(layer));
             }
         }
 
         if (!conformalSkinLayers.empty()) {
-            // Merge non-empty core layers with conformal skin layers and sort causally by isovalue
+            // Option 2b: Shift the sort schedule key of deferred upper boss branches past the
+            // completion of the roof conformal skin patch while preserving true `layer.isovalue`.
+            const std::size_t nBranches = branches.size();
+            std::vector<float> deferredBranchTauShift(nBranches, 0.0f);
+            for (std::size_t pIdx = 0; pIdx < conformalSkinPatches.size(); ++pIdx) {
+                if (perPatchSkinLayers[pIdx].empty()) {
+                    continue;
+                }
+                const auto& patch = conformalSkinPatches[pIdx];
+                const float afterSkinTau =
+                    patch.tauCompletion + static_cast<float>(patch.skinLayers + 1) * 1.0e-3f;
+                for (const int rootB : patch.deferredBranches) {
+                    if (rootB < 0 || static_cast<std::size_t>(rootB) >= nBranches) {
+                        continue;
+                    }
+                    const float shift = std::max(
+                        0.0f,
+                        afterSkinTau - branches[static_cast<std::size_t>(rootB)].tauStart);
+                    for (std::size_t u = 0; u < nBranches; ++u) {
+                        if (isSubtree[static_cast<std::size_t>(rootB)][u] != 0) {
+                            deferredBranchTauShift[u] =
+                                std::max(deferredBranchTauShift[u], shift);
+                        }
+                    }
+                }
+            }
+
+            auto scheduleKey = [&](const SelectedLayerInfo& layer) -> float {
+                if (layer.branch_id < nBranches) {
+                    return layer.isovalue + deferredBranchTauShift[layer.branch_id];
+                }
+                return layer.isovalue;
+            };
+
+            // Merge non-empty core layers with conformal skin layers and sort causally
             std::vector<SelectedLayerInfo> mergedLayers;
             mergedLayers.reserve(extractedLayers.size() + conformalSkinLayers.size());
             for (auto& layer : extractedLayers) {
@@ -8634,9 +10055,11 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             std::stable_sort(
                 mergedLayers.begin(),
                 mergedLayers.end(),
-                [](const SelectedLayerInfo& a, const SelectedLayerInfo& b) {
-                    if (std::abs(a.isovalue - b.isovalue) > 1.0e-5f) {
-                        return a.isovalue < b.isovalue;
+                [&](const SelectedLayerInfo& a, const SelectedLayerInfo& b) {
+                    const float ka = scheduleKey(a);
+                    const float kb = scheduleKey(b);
+                    if (std::abs(ka - kb) > 1.0e-5f) {
+                        return ka < kb;
                     }
                     return a.branch_id < b.branch_id;
                 });
@@ -8655,6 +10078,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     }
 
     rec.cachedSelectedLayers = result;
+    rec.cachedSkinToolAxisGrid = skinPatchToolAxisGrid;
     rec.cachedSelectedLayersAdaptivity = adaptivity;
     rec.cachedSelectedLayersSpec = lh;
     rec.hasCachedSelectedLayers = true;
@@ -8840,7 +10264,8 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
         minAxialBed,
         filamentSlotPtr,
         coarseFilamentSlotPtr,
-        impl_->bedTiltsWithRotaryAxes);
+        impl_->bedTiltsWithRotaryAxes,
+        rec.cachedSkinToolAxisGrid.get());
 
     // Step 2: Generate Support Base (`feature_kind = 7`) and Support Interface (`feature_kind = 8`)
     // toolpaths for unreachable order-field regions projected along gravity `+\hat{g}_{bed}`
@@ -9312,14 +10737,17 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
             std::vector<float> uniqueLayerIsos;
             uniqueLayerIsos.reserve(res.layers.size());
             for (const auto& lyr : res.layers) {
-                if (lyr.isovalue <= 0.0f) {
-                    continue;
-                }
-                if (uniqueLayerIsos.empty() ||
-                    std::abs(lyr.isovalue - uniqueLayerIsos.back()) >= 1.0e-3f) {
+                if (lyr.isovalue > 0.0f) {
                     uniqueLayerIsos.push_back(lyr.isovalue);
                 }
             }
+            std::sort(uniqueLayerIsos.begin(), uniqueLayerIsos.end());
+            uniqueLayerIsos.erase(
+                std::unique(
+                    uniqueLayerIsos.begin(),
+                    uniqueLayerIsos.end(),
+                    [](float a, float b) { return std::abs(a - b) < 1.0e-3f; }),
+                uniqueLayerIsos.end());
             const float firstSupportIso =
                 uniqueLayerIsos.empty() ? targetLayerH : uniqueLayerIsos.front();
 

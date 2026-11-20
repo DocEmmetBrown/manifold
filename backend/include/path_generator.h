@@ -44,6 +44,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     float objectMinAxialBed = 0.0f,
     const openvdb::FloatGrid* filamentSlotGrid = nullptr,
     const openvdb::FloatGrid* coarseFilamentSlotGrid = nullptr,
-    bool bedTiltsWithRotaryAxes = false);
+    bool bedTiltsWithRotaryAxes = false,
+    const openvdb::Vec3SGrid* skinToolAxisGrid = nullptr);
 
 } // namespace manifold
