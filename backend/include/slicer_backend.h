@@ -172,6 +172,12 @@ public:
     /// Updates the gravity direction vector in bed coordinates.
     void setGravityDirectionBed(const std::array<float, 3>& gravityBed) noexcept;
 
+    /// Enables or disables dynamic bed-tilt gravity coupling (`g_bed(x) = -toolAxis(x)`).
+    void setBedTiltsWithRotaryAxes(bool enabled) noexcept;
+
+    /// Returns whether dynamic bed-tilt gravity coupling is enabled.
+    bool bedTiltsWithRotaryAxes() const noexcept;
+
     /// Replaces the machine's tool list and sets the active tool index.
     void setMachineTools(const std::vector<ToolSpec>& tools, std::uint32_t activeToolIndex);
 
@@ -324,6 +330,8 @@ NozzleBasis query_nozzle_frame(
 std::array<float, 3> query_gravity_direction(std::array<float, 3> position_bed);
 void set_nozzle_axis_bed(std::array<float, 3> axis_bed);
 void set_gravity_direction_bed(std::array<float, 3> gravity_bed);
+void set_bed_tilts_with_rotary_axes(bool enabled);
+bool get_bed_tilts_with_rotary_axes();
 void set_machine_tools(rust::Slice<const ToolSpec> tools, std::uint32_t active_tool_index);
 rust::Vec<ToolSpec> get_machine_tools();
 std::uint32_t get_active_tool_index();

@@ -1640,6 +1640,7 @@ struct SlicerBackend::Impl {
     // 5/6-axis kinematics state in bed coordinates
     std::array<float, 3> nozzleAxisBed{0.0f, 0.0f, 1.0f};
     std::array<float, 3> gravityDirectionBed{0.0f, 0.0f, -1.0f};
+    bool bedTiltsWithRotaryAxes = false;
 
     // Multi-tool registry & variable layer height configuration
     std::vector<ToolSpec> tools{
@@ -3184,6 +3185,7 @@ bool SlicerBackend::recomputeObjectFields(
 
         snapshotBackend.impl_->nozzleAxisBed = impl_->nozzleAxisBed;
         snapshotBackend.impl_->gravityDirectionBed = impl_->gravityDirectionBed;
+        snapshotBackend.impl_->bedTiltsWithRotaryAxes = impl_->bedTiltsWithRotaryAxes;
         snapshotBackend.impl_->tools = impl_->tools;
         snapshotBackend.impl_->activeToolIndex = impl_->activeToolIndex;
         snapshotBackend.impl_->sliceLayerHeight = impl_->sliceLayerHeight;
@@ -3994,6 +3996,14 @@ void SlicerBackend::setGravityDirectionBed(const std::array<float, 3>& gravityBe
     } else {
         impl_->gravityDirectionBed = {0.0f, 0.0f, -1.0f};
     }
+}
+
+void SlicerBackend::setBedTiltsWithRotaryAxes(bool enabled) noexcept {
+    impl_->bedTiltsWithRotaryAxes = enabled;
+}
+
+bool SlicerBackend::bedTiltsWithRotaryAxes() const noexcept {
+    return impl_->bedTiltsWithRotaryAxes;
 }
 
 void SlicerBackend::setMachineTools(
@@ -8829,7 +8839,8 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
         &activeTool,
         minAxialBed,
         filamentSlotPtr,
-        coarseFilamentSlotPtr);
+        coarseFilamentSlotPtr,
+        impl_->bedTiltsWithRotaryAxes);
 
     // Step 2: Generate Support Base (`feature_kind = 7`) and Support Interface (`feature_kind = 8`)
     // toolpaths for unreachable order-field regions projected along gravity `+\hat{g}_{bed}`
@@ -11834,6 +11845,16 @@ void set_nozzle_axis_bed(std::array<float, 3> axis_bed) {
 void set_gravity_direction_bed(std::array<float, 3> gravity_bed) {
     std::lock_guard<std::mutex> lock(g_backendMutex);
     globalBackend().setGravityDirectionBed(gravity_bed);
+}
+
+void set_bed_tilts_with_rotary_axes(bool enabled) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    globalBackend().setBedTiltsWithRotaryAxes(enabled);
+}
+
+bool get_bed_tilts_with_rotary_axes() {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().bedTiltsWithRotaryAxes();
 }
 
 void set_machine_tools(rust::Slice<const ToolSpec> tools, std::uint32_t active_tool_index) {

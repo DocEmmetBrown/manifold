@@ -2721,10 +2721,7 @@ impl FieldVisualizationState {
                             });
                         let frame_bed =
                             NozzleFrame::from_nozzle_and_travel(nozzle_axis_bed, travel_dir_bed);
-                        let gravity_bed = if config.machine.kinematics_mode
-                            == crate::config::FiveAxisKinematicsMode::FiveAxisBC
-                            && config.machine.bed_tilts_with_b
-                        {
+                        let gravity_bed = if config.machine.gravity_couples_to_bed_tilt() {
                             config.machine.gravity_bed_at_bc(seg.b1_deg, seg.c1_deg)
                         } else {
                             config.query_gravity_bed(tip_bed)
@@ -2811,10 +2808,7 @@ impl FieldVisualizationState {
                                     0.0,
                                     config.slicing.max_nonplanar_slope_deg,
                                 );
-                                let gravity_bed = if config.machine.kinematics_mode
-                                    == crate::config::FiveAxisKinematicsMode::FiveAxisBC
-                                    && config.machine.bed_tilts_with_b
-                                {
+                                let gravity_bed = if config.machine.gravity_couples_to_bed_tilt() {
                                     config.machine.gravity_bed_at_bc(b_deg, c_deg)
                                 } else {
                                     config.query_gravity_bed(tip_bed)
@@ -2904,10 +2898,7 @@ impl FieldVisualizationState {
                             0.0,
                             config.slicing.max_nonplanar_slope_deg,
                         );
-                        let gravity_bed = if config.machine.kinematics_mode
-                            == crate::config::FiveAxisKinematicsMode::FiveAxisBC
-                            && config.machine.bed_tilts_with_b
-                        {
+                        let gravity_bed = if config.machine.gravity_couples_to_bed_tilt() {
                             config.machine.gravity_bed_at_bc(b_deg, c_deg)
                         } else {
                             config.query_gravity_bed(tip_bed)

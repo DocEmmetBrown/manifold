@@ -758,9 +758,10 @@ fn render_layer_and_move_scrub_controls(
                 } else {
                     "IsoNorm"
                 };
+                let (rot_l1, rot_l2) = config.machine.kinematics_mode.rotary_axis_letters();
                 ui.small(
                     egui::RichText::new(format!(
-                        "L#{} M{}/{} [{}] T{} | Pos=({:+.1},{:+.1},{:+.1}) | B={:+.1}° C={:+.1}° | θ_iso={:.1}° ({}) | g_bed=({:+.2},{:+.2},{:+.2}){}",
+                        "L#{} M{}/{} [{}] T{} | Pos=({:+.1},{:+.1},{:+.1}) | {}={:+.1}° {}={:+.1}° | θ_iso={:.1}° ({}) | g_bed=({:+.2},{:+.2},{:+.2}){}",
                         pose.layer_index,
                         pose.move_index,
                         pose.total_layer_moves,
@@ -769,7 +770,9 @@ fn render_layer_and_move_scrub_controls(
                         pose.tip_bed.x,
                         pose.tip_bed.y,
                         pose.tip_bed.z,
+                        rot_l1,
                         pose.b_deg,
+                        rot_l2,
                         pose.c_deg,
                         pose.tool_iso_angle_deg,
                         norm_source,
@@ -4627,7 +4630,7 @@ fn render_printer_config_tab(
         ui.horizontal_wrapped(|ui| {
             ui.label("Kinematics:");
             for mode in FiveAxisKinematicsMode::ALL {
-                dirty_gcode |= ui
+                let clicked = ui
                     .selectable_value(
                         &mut config.machine.kinematics_mode,
                         mode,
@@ -4635,11 +4638,137 @@ fn render_printer_config_tab(
                     )
                     .on_hover_text(mode.label())
                     .changed();
+                if clicked {
+                    if mode == FiveAxisKinematicsMode::FiveAxisTiltingBedAB
+                        && config.machine.b_min_deg >= 0.0
+                    {
+                        config.machine.b_min_deg = -45.0;
+                        config.machine.b_max_deg = 45.0;
+                    }
+                    dirty_gcode = true;
+                    dirty_backend = true;
+                }
             }
             param_help_button(ui, "machine.kinematics_mode");
         });
 
-        if config.machine.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC {
+        if config.machine.kinematics_mode == FiveAxisKinematicsMode::FiveAxisTiltingBedAB {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("A Tilt Range (Rx °):");
+                let a_min_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.a_min_deg)
+                            .speed(0.5)
+                            .range(-90.0..=0.0)
+                            .prefix("Min: ")
+                            .suffix("°"),
+                    )
+                    .changed();
+                let a_max_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.a_max_deg)
+                            .speed(0.5)
+                            .range(0.0..=90.0)
+                            .prefix("Max: ")
+                            .suffix("°"),
+                    )
+                    .changed();
+                dirty_gcode |= a_min_changed || a_max_changed;
+                dirty_backend |= a_min_changed || a_max_changed;
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("B Tilt Range (Ry °):");
+                let b_min_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.b_min_deg)
+                            .speed(0.5)
+                            .range(-90.0..=0.0)
+                            .prefix("Min: ")
+                            .suffix("°"),
+                    )
+                    .changed();
+                let b_max_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.b_max_deg)
+                            .speed(0.5)
+                            .range(0.0..=90.0)
+                            .prefix("Max: ")
+                            .suffix("°"),
+                    )
+                    .changed();
+                dirty_gcode |= b_min_changed || b_max_changed;
+                dirty_backend |= b_min_changed || b_max_changed;
+                param_help_button(ui, "machine.five_axis_bc_limits");
+            });
+            ui.horizontal(|ui| {
+                dirty_gcode |= ui
+                    .checkbox(&mut config.machine.invert_a, "Invert A")
+                    .changed();
+                dirty_gcode |= ui
+                    .checkbox(&mut config.machine.invert_b, "Invert B")
+                    .changed();
+                ui.small("• Gravity dynamically tracks A & B bed tilt");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Max A / B Speed (°/s):");
+                dirty_gcode |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.max_a_speed_deg_s)
+                            .speed(1.0)
+                            .range(1.0..=720.0)
+                            .prefix("A: "),
+                    )
+                    .changed();
+                dirty_gcode |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.max_b_speed_deg_s)
+                            .speed(1.0)
+                            .range(1.0..=720.0)
+                            .prefix("B: "),
+                    )
+                    .changed();
+                param_help_button(ui, "machine.five_axis_bc_dynamics");
+            });
+            ui.horizontal(|ui| {
+                ui.label("A / B Accel (°/s²):");
+                dirty_gcode |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.a_accel_deg_s2)
+                            .speed(10.0)
+                            .range(10.0..=10000.0)
+                            .prefix("A: "),
+                    )
+                    .changed();
+                dirty_gcode |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.b_accel_deg_s2)
+                            .speed(10.0)
+                            .range(10.0..=10000.0)
+                            .prefix("B: "),
+                    )
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                dirty_gcode |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut config.machine.orientation_smoothing_window_mm,
+                            0.0..=15.0,
+                        )
+                        .text("Orientation Smoothing Window (mm)"),
+                    )
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                dirty_gcode |= ui
+                    .checkbox(
+                        &mut config.machine.use_inverse_time_feedrate_g93,
+                        "Use G93 Inverse-Time Feedrate (1/min)",
+                    )
+                    .changed();
+            });
+            ui.separator();
+        } else if config.machine.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC {
             ui.horizontal_wrapped(|ui| {
                 ui.label("B Tilt Range (°):");
                 dirty_gcode |= ui
@@ -10157,11 +10286,44 @@ fn render_view_and_inspection_panel(
 pub fn sync_config_to_backend(config: &SlicerConfig) {
     ffi::set_nozzle_axis_bed(config.machine.nozzle_axis_bed);
     ffi::set_gravity_direction_bed(config.machine.gravity_direction_bed);
+    ffi::set_bed_tilts_with_rotary_axes(config.machine.gravity_couples_to_bed_tilt());
+
+    let is_five_axis = config.machine.kinematics_mode.is_five_axis();
+    let machine_max_tilt_deg = match config.machine.kinematics_mode {
+        FiveAxisKinematicsMode::FiveAxisTiltingBedAB => config
+            .machine
+            .a_min_deg
+            .abs()
+            .max(config.machine.a_max_deg.abs())
+            .max(config.machine.b_min_deg.abs())
+            .max(config.machine.b_max_deg.abs()),
+        FiveAxisKinematicsMode::FiveAxisBC => config
+            .machine
+            .b_min_deg
+            .abs()
+            .max(config.machine.b_max_deg.abs()),
+        FiveAxisKinematicsMode::ThreeAxis => 0.0,
+    };
 
     let ffi_tools: Vec<ffi::ToolSpec> = config
         .tools
         .iter()
-        .map(ToolConfig::to_ffi_tool_spec)
+        .map(|tool| {
+            let mut spec = tool.to_ffi_tool_spec();
+            // On a 5-axis machine (e.g. a 5-axis tilting-bed printer where the bed tilts by A and B
+            // while the gantry remains stationary), the rotary axes tilt every tool relative to bed
+            // coordinates even if the toolhead preset itself is a 3-axis gantry toolhead.
+            if is_five_axis && machine_max_tilt_deg > 1.0e-3 {
+                spec.has_rotational_axes = true;
+                if !tool.has_rotational_axes || spec.max_angle_from_bed_normal_deg <= 1.0e-3 {
+                    spec.max_angle_from_bed_normal_deg = machine_max_tilt_deg;
+                } else {
+                    spec.max_angle_from_bed_normal_deg =
+                        spec.max_angle_from_bed_normal_deg.min(machine_max_tilt_deg);
+                }
+            }
+            spec
+        })
         .collect();
     ffi::set_machine_tools(&ffi_tools, config.active_tool_index as u32);
 

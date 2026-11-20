@@ -1686,7 +1686,8 @@ pub(crate) fn assign_five_axis_bc_postures_and_rotary_limits(
     if n == 0 {
         return;
     }
-    let is_five_axis = machine.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC;
+    let is_five_axis = machine.kinematics_mode.is_five_axis();
+    let is_bc_polar = machine.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC;
     if !is_five_axis && max_tool_tilt_deg <= 1.0e-4 {
         let b_const = *curr_b_deg;
         let c_const = *curr_c_deg;
@@ -1699,18 +1700,28 @@ pub(crate) fn assign_five_axis_bc_postures_and_rotary_limits(
         return;
     }
 
-    let max_b_spd = machine.max_b_speed_deg_s.max(1.0);
-    let max_c_spd = machine.max_c_speed_deg_s.max(1.0);
-    let max_b_acc = machine.b_accel_deg_s2.max(10.0);
-    let max_c_acc = machine.c_accel_deg_s2.max(10.0);
+    let (max_rot1_spd, max_rot2_spd, max_rot1_acc, max_rot2_acc) = match machine.kinematics_mode {
+        FiveAxisKinematicsMode::FiveAxisTiltingBedAB => (
+            machine.max_a_speed_deg_s.max(1.0),
+            machine.max_b_speed_deg_s.max(1.0),
+            machine.a_accel_deg_s2.max(10.0),
+            machine.b_accel_deg_s2.max(10.0),
+        ),
+        FiveAxisKinematicsMode::ThreeAxis | FiveAxisKinematicsMode::FiveAxisBC => (
+            machine.max_b_speed_deg_s.max(1.0),
+            machine.max_c_speed_deg_s.max(1.0),
+            machine.b_accel_deg_s2.max(10.0),
+            machine.c_accel_deg_s2.max(10.0),
+        ),
+    };
 
     for i in 0..n {
         let mut solved_by_lookahead = false;
-        // Zenith azimuth lookahead pre-positioning during non-extruding Travel moves:
+        // Zenith azimuth lookahead pre-positioning during non-extruding Travel moves (`FiveAxisBC` only):
         // If we are on a Travel move and the nozzle is vertical (B ~ 0), look ahead to the
         // first tilted extruding segment in the upcoming chain (up to 8 extruding segments,
         // stopping before the next Travel move) and pre-align C during the Travel move.
-        if segments[i].kind == PlannedMoveKind::Travel {
+        if is_bc_polar && segments[i].kind == PlannedMoveKind::Travel {
             let (b_start_check, _, _) = machine.nozzle_axis_to_bc_deg(
                 segments[i].nozzle_bed_0,
                 *curr_b_deg,
@@ -1806,7 +1817,7 @@ pub(crate) fn assign_five_axis_bc_postures_and_rotary_limits(
             let db = (seg.b1_deg - seg.b0_deg).abs();
             let dc = (seg.c1_deg - seg.c0_deg).abs();
             if db > 1.0e-4 || dc > 1.0e-4 {
-                let t_rot_spd = (db / max_b_spd).max(dc / max_c_spd);
+                let t_rot_spd = (db / max_rot1_spd).max(dc / max_rot2_spd);
                 if t_rot_spd > 1.0e-5 {
                     let v_rot_cap = (seg.length_mm / t_rot_spd).max(0.5);
                     seg.nominal_speed_mms = seg.nominal_speed_mms.min(v_rot_cap);
@@ -1817,11 +1828,11 @@ pub(crate) fn assign_five_axis_bc_postures_and_rotary_limits(
                         .max((seg.length_mm / seg.nominal_speed_mms.max(0.5)).max(1.0e-4));
                 }
                 if db > 0.05 {
-                    let a_b_lin = (max_b_acc * (seg.length_mm / db)).max(50.0);
+                    let a_b_lin = (max_rot1_acc * (seg.length_mm / db)).max(50.0);
                     seg.accel_mms2 = seg.accel_mms2.min(a_b_lin);
                 }
                 if dc > 0.05 {
-                    let a_c_lin = (max_c_acc * (seg.length_mm / dc)).max(50.0);
+                    let a_c_lin = (max_rot2_acc * (seg.length_mm / dc)).max(50.0);
                     seg.accel_mms2 = seg.accel_mms2.min(a_c_lin);
                 }
             }
@@ -4367,12 +4378,26 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
     let nozzle_temp_c = active_tool
         .map(|t| t.temperature_celsius)
         .unwrap_or(215.0);
-    let is_five_axis_bc = mcfg.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC;
-    let max_bs_bound = mcfg.b_min_deg.abs().max(mcfg.b_max_deg.abs());
+    let is_five_axis_bc = mcfg.kinematics_mode.is_five_axis();
+    let max_bs_bound = match mcfg.kinematics_mode {
+        FiveAxisKinematicsMode::FiveAxisTiltingBedAB => mcfg
+            .a_min_deg
+            .abs()
+            .max(mcfg.a_max_deg.abs())
+            .max(mcfg.b_min_deg.abs())
+            .max(mcfg.b_max_deg.abs()),
+        FiveAxisKinematicsMode::ThreeAxis | FiveAxisKinematicsMode::FiveAxisBC => {
+            mcfg.b_min_deg.abs().max(mcfg.b_max_deg.abs())
+        }
+    };
     let max_tool_tilt_deg = active_tool
         .map(|t| {
-            if t.has_rotational_axes {
-                t.max_angle_from_bed_normal_deg
+            if t.has_rotational_axes && t.max_angle_from_bed_normal_deg > 1.0e-3 {
+                if is_five_axis_bc {
+                    t.max_angle_from_bed_normal_deg.min(max_bs_bound)
+                } else {
+                    t.max_angle_from_bed_normal_deg
+                }
             } else if is_five_axis_bc {
                 max_bs_bound
             } else {
@@ -4392,8 +4417,12 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
         .unwrap_or(nozzle_temp_c);
     let support_max_tool_tilt_deg = support_tool
         .map(|t| {
-            if t.has_rotational_axes {
-                t.max_angle_from_bed_normal_deg
+            if t.has_rotational_axes && t.max_angle_from_bed_normal_deg > 1.0e-3 {
+                if is_five_axis_bc {
+                    t.max_angle_from_bed_normal_deg.min(max_bs_bound)
+                } else {
+                    t.max_angle_from_bed_normal_deg
+                }
             } else if is_five_axis_bc {
                 max_bs_bound
             } else {
@@ -4413,8 +4442,12 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
         .unwrap_or(support_nozzle_temp_c);
     let support_iface_max_tool_tilt_deg = support_iface_tool
         .map(|t| {
-            if t.has_rotational_axes {
-                t.max_angle_from_bed_normal_deg
+            if t.has_rotational_axes && t.max_angle_from_bed_normal_deg > 1.0e-3 {
+                if is_five_axis_bc {
+                    t.max_angle_from_bed_normal_deg.min(max_bs_bound)
+                } else {
+                    t.max_angle_from_bed_normal_deg
+                }
             } else if is_five_axis_bc {
                 max_bs_bound
             } else {
@@ -4526,8 +4559,12 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
         .map(|t| {
             let t_gcfg = tool_gcfg_for(Some(t));
             let t_fluid = FluidDynamicsModel::from_config(&t_gcfg, t.temperature_celsius);
-            let t_max_tilt = if t.has_rotational_axes {
-                t.max_angle_from_bed_normal_deg
+            let t_max_tilt = if t.has_rotational_axes && t.max_angle_from_bed_normal_deg > 1.0e-3 {
+                if is_five_axis_bc {
+                    t.max_angle_from_bed_normal_deg.min(max_bs_bound)
+                } else {
+                    t.max_angle_from_bed_normal_deg
+                }
             } else if is_five_axis_bc {
                 max_bs_bound
             } else {
@@ -6142,7 +6179,8 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
         format_pressure_advance_cmd(gcfg.gcode_dialect, tool_id, init_pa_s)
     );
 
-    let is_five_axis = mcfg.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC;
+    let is_five_axis = mcfg.kinematics_mode.is_five_axis();
+    let (rot_axis_1, rot_axis_2) = mcfg.kinematics_mode.rotary_axis_letters();
     let use_g93 = is_five_axis && mcfg.use_inverse_time_feedrate_g93;
     let mut in_g93_mode = false;
     let mut emitted_accel = -1.0f32;
@@ -6487,11 +6525,13 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                     let inv_time_f = (60.0 / seg.duration_s.max(1.0e-4)).clamp(0.1, 600_000.0);
                     let _ = writeln!(
                         gcode,
-                        "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6} F{:.2}",
+                        "G1 X{:.4} Y{:.4} Z{:.4} {}{:.3} {}{:.3} E{:.6} F{:.2}",
                         seg.p1_bed.x,
                         seg.p1_bed.y,
                         seg.p1_bed.z,
+                        rot_axis_1,
                         seg.b1_deg,
+                        rot_axis_2,
                         seg.c1_deg,
                         e_emitted,
                         inv_time_f
@@ -6515,11 +6555,13 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                         if emit_f {
                             let _ = writeln!(
                                 gcode,
-                                "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6} F{:.1}",
+                                "G1 X{:.4} Y{:.4} Z{:.4} {}{:.3} {}{:.3} E{:.6} F{:.1}",
                                 seg.p1_bed.x,
                                 seg.p1_bed.y,
                                 seg.p1_bed.z,
+                                rot_axis_1,
                                 seg.b1_deg,
+                                rot_axis_2,
                                 seg.c1_deg,
                                 e_emitted,
                                 feed_mm_min
@@ -6528,11 +6570,13 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                         } else {
                             let _ = writeln!(
                                 gcode,
-                                "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6}",
+                                "G1 X{:.4} Y{:.4} Z{:.4} {}{:.3} {}{:.3} E{:.6}",
                                 seg.p1_bed.x,
                                 seg.p1_bed.y,
                                 seg.p1_bed.z,
+                                rot_axis_1,
                                 seg.b1_deg,
+                                rot_axis_2,
                                 seg.c1_deg,
                                 e_emitted
                             );
@@ -6562,11 +6606,13 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                     let inv_time_f = (60.0 / seg.duration_s.max(1.0e-4)).clamp(0.1, 600_000.0);
                     let _ = writeln!(
                         gcode,
-                        "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} F{:.2}",
+                        "G0 X{:.4} Y{:.4} Z{:.4} {}{:.3} {}{:.3} F{:.2}",
                         seg.p1_bed.x,
                         seg.p1_bed.y,
                         seg.p1_bed.z,
+                        rot_axis_1,
                         seg.b1_deg,
+                        rot_axis_2,
                         seg.c1_deg,
                         inv_time_f
                     );
@@ -6586,11 +6632,13 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                         if emit_f {
                             let _ = writeln!(
                                 gcode,
-                                "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} F{:.1}",
+                                "G0 X{:.4} Y{:.4} Z{:.4} {}{:.3} {}{:.3} F{:.1}",
                                 seg.p1_bed.x,
                                 seg.p1_bed.y,
                                 seg.p1_bed.z,
+                                rot_axis_1,
                                 seg.b1_deg,
+                                rot_axis_2,
                                 seg.c1_deg,
                                 feed_mm_min
                             );
@@ -6598,11 +6646,13 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                         } else {
                             let _ = writeln!(
                                 gcode,
-                                "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3}",
+                                "G0 X{:.4} Y{:.4} Z{:.4} {}{:.3} {}{:.3}",
                                 seg.p1_bed.x,
                                 seg.p1_bed.y,
                                 seg.p1_bed.z,
+                                rot_axis_1,
                                 seg.b1_deg,
+                                rot_axis_2,
                                 seg.c1_deg
                             );
                         }

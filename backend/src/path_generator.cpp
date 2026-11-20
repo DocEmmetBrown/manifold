@@ -2752,7 +2752,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     const ToolSpec* activeTool,
     float objectMinAxialBed,
     const openvdb::FloatGrid* filamentSlotGrid,
-    const openvdb::FloatGrid* coarseFilamentSlotGrid)
+    const openvdb::FloatGrid* coarseFilamentSlotGrid,
+    bool bedTiltsWithRotaryAxes)
 {
     ObjectToolpathsResult result{};
     result.valid = false;
@@ -2944,6 +2945,14 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 return fallbackNozzle;
             };
 
+            auto sampleGravityDir = [&](const Vec3f& p) -> Vec3f {
+                if (bedTiltsWithRotaryAxes) {
+                    const Vec3f nz = sampleNozzleAxis(p);
+                    return normalize3({-nz.x, -nz.y, -nz.z}, gravityDirBed);
+                }
+                return gravityDirBed;
+            };
+
             auto computeBedSafeMaxTiltRad = [&](const Vec3f& p) -> float {
                 if (!toolHasRotationalAxes || activeTool == nullptr) {
                     return 0.0f;
@@ -2978,18 +2987,20 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     return std::max(0.0f, gammaMax);
                 }
                 for (const auto& pt : activeTool->clearance_profile_xz) {
-                    const float r = pt.x_radius_mm;
-                    const float z = pt.z_height_mm;
-                    if (r <= 1.0e-5f && z <= 1.0e-5f) {
+                    const float r = std::max(0.0f, pt.x_radius_mm);
+                    const float z = std::max(0.0f, pt.z_height_mm);
+                    // Skip the z=0 nozzle tip orifice flat so the tip itself can tilt on lower layers;
+                    // upper clearance profile stages (z > 0) constrain bed collision as a function of hBedMm.
+                    if (r <= 1.0e-4f || z <= 1.0e-3f) {
                         continue;
                     }
-                    const float rho = std::sqrt(r * r + z * z);
+                    const float rho = std::hypot(r, z);
                     if (hBedMm >= rho) {
                         continue;
                     }
                     const float phi = std::atan2(z, std::max(r, 1.0e-6f));
-                    const float ratio = std::clamp(-hBedMm / rho, -1.0f, 1.0f);
-                    const float allowed = std::max(0.0f, std::asin(ratio) + phi);
+                    const float ratio = std::clamp(hBedMm / std::max(rho, 1.0e-5f), 0.0f, 1.0f);
+                    const float allowed = std::max(0.0f, phi + std::asin(ratio));
                     gammaMax = std::min(gammaMax, allowed);
                 }
                 return std::max(0.0f, gammaMax);
@@ -3049,18 +3060,32 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
             auto computeIsosurfaceNozzleAxis = [&](const Vec3f& p,
                                                    const Vec3f& meshIsoNormal,
                                                    bool isConformalSkin) -> Vec3f {
+                const Vec3f solvedAxis = sampleNozzleAxis(p);
                 if (!toolHasRotationalAxes) {
-                    return sampleNozzleAxis(p);
+                    return solvedAxis;
                 }
                 Vec3f nIso = normalize3(meshIsoNormal, fallbackNozzle);
                 if (dot3(nIso, fallbackNozzle) < 0.0f) {
                     nIso = nIso * -1.0f;
                 }
                 const float gammaMax = computeBedSafeMaxTiltRad(p);
-                if (isConformalSkin || orientOuterSurfacesToNormal) {
+                if (isConformalSkin) {
                     return clampVecToCone(nIso, fallbackNozzle, gammaMax);
                 }
-                return sampleNozzleAxis(p);
+                if (orientOuterSurfacesToNormal) {
+                    // Use whichever of the local layer isosurface normal `nIso` and the solved 3D
+                    // tool orientation field `solvedAxis` tilts more strongly (e.g. from overhang
+                    // guidance or orientation hints), clamped to bed-safe clearance `gammaMax`.
+                    const Vec3f isoClamped = clampVecToCone(nIso, fallbackNozzle, gammaMax);
+                    const Vec3f solvedClamped = clampVecToCone(solvedAxis, fallbackNozzle, gammaMax);
+                    const float cosIso = dot3(isoClamped, fallbackNozzle);
+                    const float cosSolved = dot3(solvedClamped, fallbackNozzle);
+                    if (cosSolved + 1.0e-4f < cosIso) {
+                        return solvedClamped;
+                    }
+                    return isoClamped;
+                }
+                return clampVecToCone(solvedAxis, fallbackNozzle, gammaMax);
             };
 
             auto computeOuterSurfaceNozzleAxis = [&](const Vec3f& p,
@@ -3070,18 +3095,19 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 if (outUsedSurfaceNormal != nullptr) {
                     *outUsedSurfaceNormal = false;
                 }
+                const Vec3f solvedAxis = sampleNozzleAxis(p);
                 if (!toolHasRotationalAxes) {
-                    return sampleNozzleAxis(p);
+                    return solvedAxis;
                 }
                 Vec3f nIso = normalize3(meshIsoNormal, fallbackNozzle);
                 if (dot3(nIso, fallbackNozzle) < 0.0f) {
                     nIso = nIso * -1.0f;
                 }
                 const float gammaMax = computeBedSafeMaxTiltRad(p);
-                const Vec3f isoAxis = clampVecToCone(nIso, fallbackNozzle, gammaMax);
+                const Vec3f isoAxis = computeIsosurfaceNozzleAxis(p, nIso, isConformalSkin);
 
                 if (!orientOuterSurfacesToNormal) {
-                    return isConformalSkin ? isoAxis : sampleNozzleAxis(p);
+                    return isoAxis;
                 }
 
                 const Vec3f nSurf = sampleOutwardSdfNormal(p, nIso, isConformalSkin);
@@ -3352,7 +3378,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         if (!layerInfo.is_first_layer && d > shellThicknessMm) {
                             const float hStep = std::max(1.20f * baseMesh.verts[i].layerHeightMm, 1.15f * meanLayerH);
                             const Vec3f p = baseMesh.verts[i].pos;
-                            const float sdfDownGrav = sampleSdf(p + (gravityDirBed * hStep)) - sdfZeroShift;
+                            const Vec3f localGrav = sampleGravityDir(p);
+                            const float sdfDownGrav = sampleSdf(p + (localGrav * hStep)) - sdfZeroShift;
                             if (sdfDownGrav > -0.20f * outerW.min_mm) {
                                 d = std::min(d, 0.5f * shellThicknessMm);
                             }
@@ -3887,14 +3914,15 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         const float hStep = (hBedMm > 0.35f * meanLayerH)
                             ? std::min(rawHStep, std::max(0.25f * meanLayerH, hBedMm - 0.25f * meanLayerH))
                             : rawHStep;
+                        const Vec3f localGrav = sampleGravityDir(p);
                         const float phiCurr = sampleSdf(p) - sdfZeroShift;
                         const float sdfDownNoz = sampleSdf(p - (zNoz * hStep)) - sdfZeroShift;
-                        const float sdfDownGrav = sampleSdf(p + (gravityDirBed * hStep)) - sdfZeroShift;
+                        const float sdfDownGrav = sampleSdf(p + (localGrav * hStep)) - sdfZeroShift;
                         const float phiBelow = std::max(sdfDownNoz, sdfDownGrav);
                         const float downwardSlope = (phiBelow - phiCurr) / std::max(hStep, 1.0e-4f);
                         const float ov = std::min(
                             sampleOverhang(p),
-                            sampleOverhang(p + (gravityDirBed * (0.5f * hStep))));
+                            sampleOverhang(p + (localGrav * (0.5f * hStep))));
                         const bool exceedsOverhangAngle =
                             (ov <= -sinOverhangThresh) || (downwardSlope >= sinOverhangThresh);
 

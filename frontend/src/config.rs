@@ -1684,17 +1684,37 @@ pub enum FiveAxisKinematicsMode {
     /// Standard 3-axis Cartesian / CoreXY / Delta (`X Y Z E`).
     #[default]
     ThreeAxis,
+    /// 5-axis tilting build plate with `A` (roll/pitch around X) and `B` (pitch/roll around Y)
+    /// tilt axes (`X Y Z A B E`), where the bed tilts relative to world gravity and gravity
+    /// dynamically tracks the `(A, B)` bed orientation in bed coordinates (Klipper & RRF).
+    FiveAxisTiltingBedAB,
     /// 5-axis machine with `B` (polar tilt) and `C` (azimuthal rotation) rotary axes (`X Y Z B C E`)
     /// and firmware RTCP / work-coordinate tracking relative to the bed center.
     FiveAxisBC,
 }
 
 impl FiveAxisKinematicsMode {
-    pub const ALL: [Self; 2] = [Self::ThreeAxis, Self::FiveAxisBC];
+    pub const ALL: [Self; 3] = [
+        Self::ThreeAxis,
+        Self::FiveAxisTiltingBedAB,
+        Self::FiveAxisBC,
+    ];
+
+    pub const fn is_five_axis(self) -> bool {
+        matches!(self, Self::FiveAxisTiltingBedAB | Self::FiveAxisBC)
+    }
+
+    pub const fn rotary_axis_letters(self) -> (&'static str, &'static str) {
+        match self {
+            Self::FiveAxisTiltingBedAB => ("A", "B"),
+            Self::ThreeAxis | Self::FiveAxisBC => ("B", "C"),
+        }
+    }
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::ThreeAxis => "3-Axis (X Y Z)",
+            Self::FiveAxisTiltingBedAB => "5-Axis Tilting Bed (X Y Z + A B)",
             Self::FiveAxisBC => "5-Axis Circular Bed (X Y Z + B C)",
         }
     }
@@ -1702,7 +1722,8 @@ impl FiveAxisKinematicsMode {
     pub const fn short_label(self) -> &'static str {
         match self {
             Self::ThreeAxis => "3-Axis (X Y Z)",
-            Self::FiveAxisBC => "5-Axis (X Y Z + B C)",
+            Self::FiveAxisTiltingBedAB => "5-Axis Tilting Bed (X Y Z + A B)",
+            Self::FiveAxisBC => "5-Axis Circular (X Y Z + B C)",
         }
     }
 }
@@ -1712,7 +1733,7 @@ impl FiveAxisKinematicsMode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MachineKinematicsConfig {
-    /// Active G-code kinematics mode (`ThreeAxis` or `FiveAxisBC`).
+    /// Active G-code kinematics mode (`ThreeAxis`, `FiveAxisTiltingBedAB`, or `FiveAxisBC`).
     pub kinematics_mode: FiveAxisKinematicsMode,
     /// Unit vector pointing opposite to the nozzle discharge direction in bed coordinates.
     /// Currently defaults to `[0.0, 0.0, 1.0]` (parallel to +Z), but will vary dynamically.
@@ -1720,13 +1741,23 @@ pub struct MachineKinematicsConfig {
     /// Unit vector pointing in the direction of gravity in bed coordinates.
     /// Defaults to `[0.0, 0.0, -1.0]`, and rotates as the machine tilts the bed.
     pub gravity_direction_bed: [f32; 3],
-    /// Bed tilt around the bed X axis (degrees) for 5-axis bed-tilt kinematics.
+    /// Bed tilt around the bed X axis (degrees) for 5-axis bed-tilt kinematics (`A` axis).
     pub bed_tilt_rx_deg: f32,
-    /// Bed tilt around the bed Y axis (degrees) for 5-axis bed-tilt kinematics.
+    /// Bed tilt around the bed Y axis (degrees) for 5-axis bed-tilt kinematics (`B` axis).
     pub bed_tilt_ry_deg: f32,
-    /// Minimum allowed `B` polar tilt angle (degrees). Set `< 0.0` (e.g. `-60.0`) if the `B` axis can tilt bilaterally.
+    /// Minimum allowed `A` tilt angle around X (degrees) for `FiveAxisTiltingBedAB`.
+    pub a_min_deg: f32,
+    /// Maximum allowed `A` tilt angle around X (degrees) for `FiveAxisTiltingBedAB`.
+    pub a_max_deg: f32,
+    /// Invert the sign of the emitted `A` tilt axis (`FiveAxisTiltingBedAB`).
+    pub invert_a: bool,
+    /// Maximum angular speed of the `A` tilt axis (`deg/s`).
+    pub max_a_speed_deg_s: f32,
+    /// Maximum angular acceleration of the `A` tilt axis (`deg/s²`).
+    pub a_accel_deg_s2: f32,
+    /// Minimum allowed `B` polar/Y tilt angle (degrees). Set `< 0.0` (e.g. `-45.0` or `-60.0`) if `B` can tilt bilaterally.
     pub b_min_deg: f32,
-    /// Maximum allowed `B` polar tilt angle (degrees, e.g. `60.0`).
+    /// Maximum allowed `B` polar/Y tilt angle (degrees, e.g. `45.0` or `60.0`).
     pub b_max_deg: f32,
     /// Whether the `C` rotary axis can rotate continuously past `±180°` without cable wind-up.
     /// When `false`, `C` wraps within `[-180°, +180°]`.
@@ -1746,12 +1777,12 @@ pub struct MachineKinematicsConfig {
     pub b_accel_deg_s2: f32,
     /// Maximum angular acceleration of the `C` rotary axis (`deg/s²`).
     pub c_accel_deg_s2: f32,
-    /// Arc-length smoothing window (mm) applied to toolpath nozzle axes before 5-axis `(B, C)` IK.
+    /// Arc-length smoothing window (mm) applied to toolpath nozzle axes before 5-axis IK.
     pub orientation_smoothing_window_mm: f32,
-    /// Whether the physical `B` axis tilts the build plate relative to world gravity (trunnion bed),
-    /// dynamically rotating `gravity_direction_bed` with `(B, C)` per AGENTS.md Rule 2.
+    /// Whether the physical rotary axes tilt the build plate relative to world gravity,
+    /// dynamically rotating `gravity_direction_bed` with `(A, B)` or `(B, C)` per AGENTS.md Rule 2.
     pub bed_tilts_with_b: bool,
-    /// Emit `G93` inverse-time feedrates (`F = 60 / dt_sec`) on synchronized 5-axis `XYZBC` moves
+    /// Emit `G93` inverse-time feedrates (`F = 60 / dt_sec`) on synchronized 5-axis moves
     /// instead of `G94` units-per-minute feedrates.
     pub use_inverse_time_feedrate_g93: bool,
     /// Whether to draw the active tool's nozzle frame, XZ clearance profile, and gravity
@@ -1767,6 +1798,11 @@ impl Default for MachineKinematicsConfig {
             gravity_direction_bed: [0.0, 0.0, -1.0],
             bed_tilt_rx_deg: 0.0,
             bed_tilt_ry_deg: 0.0,
+            a_min_deg: -45.0,
+            a_max_deg: 45.0,
+            invert_a: false,
+            max_a_speed_deg_s: 60.0,
+            a_accel_deg_s2: 300.0,
             b_min_deg: 0.0,
             b_max_deg: 60.0,
             c_continuous: true,
@@ -1797,6 +1833,13 @@ pub fn wrap_deg_180(deg: f32) -> f32 {
 
 impl MachineKinematicsConfig {
     pub fn sanitize(&mut self) {
+        self.a_min_deg = self.a_min_deg.clamp(-120.0, 0.0);
+        self.a_max_deg = self.a_max_deg.clamp(0.0, 120.0);
+        if self.a_max_deg < self.a_min_deg {
+            std::mem::swap(&mut self.a_min_deg, &mut self.a_max_deg);
+        }
+        self.max_a_speed_deg_s = self.max_a_speed_deg_s.clamp(1.0, 720.0);
+        self.a_accel_deg_s2 = self.a_accel_deg_s2.clamp(10.0, 20000.0);
         self.b_min_deg = self.b_min_deg.clamp(-120.0, 0.0);
         self.b_max_deg = self.b_max_deg.clamp(0.0, 120.0);
         if self.b_max_deg < self.b_min_deg {
@@ -1811,9 +1854,22 @@ impl MachineKinematicsConfig {
             self.orientation_smoothing_window_mm.clamp(0.0, 25.0);
     }
 
-    /// Updates `gravity_direction_bed` from the 5-axis bed tilt angles (`bed_tilt_rx_deg`, `bed_tilt_ry_deg`).
+    /// Returns `true` when the active kinematics mode physically tilts the build plate relative to
+    /// world gravity so that $\hat{\mathbf{g}}_{\text{bed}} = -\hat{\mathbf{z}}_{\text{nozzle}}$
+    /// dynamically tracks the instantaneous rotary axes (`AGENTS.md` Rule 2).
+    pub const fn gravity_couples_to_bed_tilt(&self) -> bool {
+        match self.kinematics_mode {
+            FiveAxisKinematicsMode::ThreeAxis => false,
+            FiveAxisKinematicsMode::FiveAxisTiltingBedAB => true,
+            FiveAxisKinematicsMode::FiveAxisBC => self.bed_tilts_with_b,
+        }
+    }
+
+    /// Updates `gravity_direction_bed` (and `nozzle_axis_bed`, since the gantry remains stationary in the
+    /// world frame while the bed tilts underneath it) from the 5-axis bed tilt angles (`bed_tilt_rx_deg`, `bed_tilt_ry_deg`).
     /// When the bed tilts by $R_{\text{bed}}$, the world gravity vector $(0, 0, -1)$ expressed in
-    /// bed coordinates becomes $R_{\text{bed}}^{-1} (0, 0, -1)$.
+    /// bed coordinates becomes $R_{\text{bed}}^{-1} (0, 0, -1)$, and the world-vertical gantry nozzle axis
+    /// $(0, 0, 1)$ expressed in bed coordinates becomes $R_{\text{bed}}^{-1} (0, 0, 1) = -\hat{\mathbf{g}}_{\text{bed}}$.
     pub fn update_gravity_from_bed_tilt(&mut self) {
         let rx = self.bed_tilt_rx_deg.to_radians();
         let ry = self.bed_tilt_ry_deg.to_radians();
@@ -1825,18 +1881,66 @@ impl MachineKinematicsConfig {
             -Vec3::Z
         };
         self.gravity_direction_bed = g.to_array();
+        self.nozzle_axis_bed = (-g).to_array();
     }
 
     /// Maps a target unit nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}} = (n_x, n_y, n_z)$ in bed coordinates
-    /// to `(b_deg, c_deg, clamped_nozzle_axis_bed)` for a 5-axis `(B, C)` machine.
+    /// to `(a_deg, b_deg, clamped_nozzle_axis_bed)` for a `FiveAxisTiltingBedAB` (`X Y Z A B`) machine.
     ///
-    /// - Enforces both `max_tool_tilt_deg` and `[b_min_deg, b_max_deg]`.
-    /// - Locks `C` at `prev_c_deg` near the zenith singularity ($\theta < 0.25^\circ$, where $\sqrt{n_x^2 + n_y^2} \approx 0$)
-    ///   so the rotary axis never whips on horizontal regions.
-    /// - Unwraps `C` continuously relative to `prev_c_deg` when `c_continuous == true`, or wraps within
-    ///   `[-180°, +180°]` when `c_continuous == false`.
-    /// - Evaluates both $(+B, C)$ and $(-B, C + 180^\circ)$ when bilateral `B` (`b_min_deg < 0`) is available,
-    ///   selecting the posture that minimizes angular travel from `(prev_b_deg, prev_c_deg)`.
+    /// On a tilting-bed printer (`R_bed = R_x(A) * R_y(B)`), the world-vertical nozzle expressed in bed
+    /// coordinates is $R_{\text{bed}}^{-1}(0, 0, 1) = (-\sin B,\; \sin A \cos B,\; \cos A \cos B)$,
+    /// and world gravity $(0, 0, -1)$ in bed coordinates is $-\hat{\mathbf{z}}_{\text{nozzle}}$.
+    pub fn nozzle_axis_to_ab_deg(
+        &self,
+        nozzle_axis_bed: Vec3,
+        max_tool_tilt_deg: f32,
+    ) -> (f32, f32, Vec3) {
+        let mut n = nozzle_axis_bed.try_normalize().unwrap_or(Vec3::Z);
+        if n.z < 0.0 {
+            n = Vec3::new(n.x, n.y, 0.0).try_normalize().unwrap_or(Vec3::Z);
+        }
+        // Clamp overall cone angle against max_tool_tilt_deg first
+        let max_cone_deg = max_tool_tilt_deg.clamp(0.0, 85.0);
+        let raw_cone_deg = n.z.clamp(-1.0, 1.0).acos().to_degrees();
+        if raw_cone_deg > max_cone_deg && raw_cone_deg > 1.0e-4 {
+            let target_rad = max_cone_deg.to_radians();
+            let r_xy = (n.x * n.x + n.y * n.y).sqrt().max(1.0e-6);
+            let s = target_rad.sin() / r_xy;
+            n = Vec3::new(n.x * s, n.y * s, target_rad.cos()).normalize_or_zero();
+        }
+
+        // Exact Euler XYZ bed-tilt inverse kinematics:
+        // n_x = -sin(ry), n_y = sin(rx) * cos(ry), n_z = cos(rx) * cos(ry)
+        let ry_deg = (-n.x).clamp(-1.0, 1.0).asin().to_degrees();
+        let rx_deg = n.y.atan2(n.z.max(1.0e-5)).to_degrees();
+
+        let a_raw = if self.invert_a { -rx_deg } else { rx_deg };
+        let b_raw = if self.invert_b { -ry_deg } else { ry_deg };
+
+        let a_clamped = a_raw.clamp(self.a_min_deg, self.a_max_deg);
+        let b_clamped = b_raw.clamp(self.b_min_deg, self.b_max_deg);
+        let clamped_axis = self.ab_deg_to_nozzle_axis(a_clamped, b_clamped);
+        (a_clamped, b_clamped, clamped_axis)
+    }
+
+    /// Forward kinematics for `FiveAxisTiltingBedAB`: maps `(a_deg, b_deg)` bed-tilt angles to the
+    /// unit nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$ in bed coordinates.
+    pub fn ab_deg_to_nozzle_axis(&self, a_deg: f32, b_deg: f32) -> Vec3 {
+        let rx_deg = if self.invert_a { -a_deg } else { a_deg };
+        let ry_deg = if self.invert_b { -b_deg } else { b_deg };
+        let rx = rx_deg.to_radians();
+        let ry = ry_deg.to_radians();
+        let (sin_x, cos_x) = rx.sin_cos();
+        let (sin_y, cos_y) = ry.sin_cos();
+        Vec3::new(-sin_y, sin_x * cos_y, cos_x * cos_y)
+            .try_normalize()
+            .unwrap_or(Vec3::Z)
+    }
+
+    /// Unified 5-axis inverse kinematics: maps a target unit nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$
+    /// in bed coordinates to the active machine's two rotary coordinates `(rot1_deg, rot2_deg, clamped_nozzle_axis_bed)`:
+    /// - For `FiveAxisTiltingBedAB`: returns `(a_deg, b_deg, clamped_axis)`.
+    /// - For `FiveAxisBC` (or `ThreeAxis`): returns `(b_deg, c_deg, clamped_axis)`.
     pub fn nozzle_axis_to_bc_deg(
         &self,
         nozzle_axis_bed: Vec3,
@@ -1844,6 +1948,9 @@ impl MachineKinematicsConfig {
         prev_c_deg: f32,
         max_tool_tilt_deg: f32,
     ) -> (f32, f32, Vec3) {
+        if self.kinematics_mode == FiveAxisKinematicsMode::FiveAxisTiltingBedAB {
+            return self.nozzle_axis_to_ab_deg(nozzle_axis_bed, max_tool_tilt_deg);
+        }
         let mut n = nozzle_axis_bed.try_normalize().unwrap_or(Vec3::Z);
         if n.z < 0.0 {
             n = Vec3::new(n.x, n.y, 0.0).try_normalize().unwrap_or(Vec3::Z);
@@ -1906,9 +2013,12 @@ impl MachineKinematicsConfig {
         (b_final, c_final, clamped_axis)
     }
 
-    /// Forward kinematics: maps `(b_deg, c_deg)` rotary angles back to the unit nozzle axis
-    /// $\hat{\mathbf{z}}_{\text{nozzle}}$ in bed coordinates.
+    /// Forward kinematics: maps `(rot1_deg, rot2_deg)` rotary angles (`(A, B)` for `FiveAxisTiltingBedAB`
+    /// or `(B, C)` for `FiveAxisBC`) back to the unit nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$ in bed coordinates.
     pub fn bc_deg_to_nozzle_axis(&self, b_deg: f32, c_deg: f32) -> Vec3 {
+        if self.kinematics_mode == FiveAxisKinematicsMode::FiveAxisTiltingBedAB {
+            return self.ab_deg_to_nozzle_axis(b_deg, c_deg);
+        }
         let theta_deg = if self.invert_b { -b_deg } else { b_deg };
         let phi_deg = if self.invert_c {
             -(c_deg - self.c_zero_offset_deg)
@@ -1925,9 +2035,10 @@ impl MachineKinematicsConfig {
     }
 
     /// Computes the unit gravity direction vector $\hat{\mathbf{g}}_{\text{bed}}$ in bed coordinates
-    /// for a given `(b_deg, c_deg)` posture, respecting `bed_tilts_with_b` (AGENTS.md Rule 2).
+    /// for a given `(rot1_deg, rot2_deg)` posture (`(A, B)` for `FiveAxisTiltingBedAB` or `(B, C)` for
+    /// `FiveAxisBC`), respecting bed-tilt gravity coupling (`AGENTS.md` Rule 2).
     pub fn gravity_bed_at_bc(&self, b_deg: f32, c_deg: f32) -> Vec3 {
-        if self.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC && self.bed_tilts_with_b {
+        if self.gravity_couples_to_bed_tilt() {
             -self.bc_deg_to_nozzle_axis(b_deg, c_deg)
         } else {
             self.query_gravity_bed(Vec3::ZERO)
@@ -4965,5 +5076,41 @@ mod tests {
             g_tilted.x.abs() > 0.45 && (g_tilted.z - (-30.0_f32.to_radians().cos())).abs() < 1.0e-4,
             "Expected tilted gravity vector in bed frame, got {g_tilted:?}"
         );
+    }
+
+    #[test]
+    fn test_five_axis_tilting_bed_ab_ik_fk_and_gravity_tracking() {
+        let mut mcfg = MachineKinematicsConfig {
+            kinematics_mode: FiveAxisKinematicsMode::FiveAxisTiltingBedAB,
+            a_min_deg: -45.0,
+            a_max_deg: 45.0,
+            b_min_deg: -45.0,
+            b_max_deg: 45.0,
+            invert_a: false,
+            invert_b: false,
+            ..Default::default()
+        };
+        mcfg.sanitize();
+        assert!(mcfg.gravity_couples_to_bed_tilt());
+        assert_eq!(mcfg.kinematics_mode.rotary_axis_letters(), ("A", "B"));
+
+        for &a_in in &[-30.0f32, -15.0, 0.0, 12.5, 28.0] {
+            for &b_in in &[-25.0f32, -10.0, 0.0, 18.0, 32.0] {
+                let u_fk = mcfg.ab_deg_to_nozzle_axis(a_in, b_in);
+                let (a_out, b_out, u_clamped) = mcfg.nozzle_axis_to_bc_deg(u_fk, 0.0, 0.0, 60.0);
+                assert!(
+                    (a_out - a_in).abs() < 1.0e-3 && (b_out - b_in).abs() < 1.0e-3,
+                    "AB IK->FK mismatch: in=({a_in}, {b_in}), out=({a_out}, {b_out})"
+                );
+                assert!((u_clamped - u_fk).length() < 1.0e-4);
+
+                // Verify gravity dynamically tracks -(nozzle_axis_bed) as the bed tilts (AGENTS.md Rule 2)
+                let g_bed = mcfg.gravity_bed_at_bc(a_out, b_out);
+                assert!(
+                    (g_bed + u_fk).length() < 1.0e-4,
+                    "Expected gravity_bed = -u_fk in tilting-bed frame, got g={g_bed:?}, u={u_fk:?}"
+                );
+            }
+        }
     }
 }

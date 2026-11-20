@@ -43,6 +43,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     const ToolSpec* activeTool = nullptr,
     float objectMinAxialBed = 0.0f,
     const openvdb::FloatGrid* filamentSlotGrid = nullptr,
-    const openvdb::FloatGrid* coarseFilamentSlotGrid = nullptr);
+    const openvdb::FloatGrid* coarseFilamentSlotGrid = nullptr,
+    bool bedTiltsWithRotaryAxes = false);
 
 } // namespace manifold

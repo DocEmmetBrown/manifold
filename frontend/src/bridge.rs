@@ -507,6 +507,13 @@ pub mod ffi {
         /// Sets the active gravity direction vector in bed coordinates (e.g. when a 5-axis machine tilts the bed).
         pub fn set_gravity_direction_bed(gravity_bed: [f32; 3]);
 
+        /// Enables or disables dynamic bed-tilt gravity coupling (`g_bed(x) = -toolAxis(x)`),
+        /// where tilting the build plate rotates the gravity vector in bed coordinates with the solved tool axis.
+        pub fn set_bed_tilts_with_rotary_axes(enabled: bool);
+
+        /// Returns whether dynamic bed-tilt gravity coupling is enabled in the C++ backend.
+        pub fn get_bed_tilts_with_rotary_axes() -> bool;
+
         /// Synchronizes the machine's tool list and active tool index into the C++ backend.
         pub fn set_machine_tools(tools: &[ToolSpec], active_tool_index: u32);
 

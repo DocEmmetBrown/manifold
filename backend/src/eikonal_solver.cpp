@@ -1281,24 +1281,30 @@ void OverhangIslandConstraint::applyPreSweepModifiers(
                     (nrmCount > 0) ? (sumNrmDot / static_cast<float>(nrmCount)) : 1.0f;
 
                 // Also probe inward along -n_surf to verify that this surface is backed by solid
-                // interior rather than a thin fin/arch tip where opposite walls would fight each other.
+                // interior rather than a 1-voxel razor fin where opposite walls would fight each other.
                 const int probeSteps =
-                    std::clamp<int>(static_cast<int>(std::lround(1.5f / dx)), 3, 6);
+                    std::clamp<int>(static_cast<int>(std::lround(1.0f / dx)), 2, 4);
                 const openvdb::Coord probeCoord = domain.coords[i].offsetBy(
                     static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[0])),
                     static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[1])),
                     static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[2])));
                 const std::int32_t probeIdx = domain.findVoxelIndex(probeCoord);
+                float probeFactor = 1.0f;
                 if (probeIdx < 0 || !domain.isInterior[static_cast<std::size_t>(probeIdx)]) {
-                    continue;
+                    probeFactor = 0.35f;
+                } else {
+                    const float probeDot =
+                        dot3(nSurf, domain.sdfGrad[static_cast<std::size_t>(probeIdx)]);
+                    // Allow thin structural walls (e.g. 1.2..2.0 mm hull/cabin walls) whose local
+                    // 6-neighbor surface normal is coherent even if the inward probe crosses the
+                    // wall's medial plane.
+                    probeFactor = std::max(0.45f, smoothstep01(0.25f, 0.75f, probeDot));
                 }
-                const float probeDot =
-                    dot3(nSurf, domain.sdfGrad[static_cast<std::size_t>(probeIdx)]);
 
                 const float coherenceFactor =
-                    smoothstep01(0.75f, 0.94f, avgNrmDot) *
-                    smoothstep01(0.35f, 0.80f, minNrmDot) *
-                    smoothstep01(0.55f, 0.85f, probeDot);
+                    smoothstep01(0.70f, 0.92f, avgNrmDot) *
+                    smoothstep01(0.25f, 0.75f, minNrmDot) *
+                    probeFactor;
                 if (coherenceFactor <= 1.0e-4f) {
                     continue;
                 }
@@ -1312,17 +1318,21 @@ void OverhangIslandConstraint::applyPreSweepModifiers(
                     continue;
                 }
 
-                const std::array<float, 3> gravityDir =
+                // Always evaluate the driving overhang bias against the nominal bed gravity
+                // `baseGravityDir = queryGravityDirection(pos)` so the solver maintains a steady
+                // restoring tilt that keeps the bed/tool tilted to support the overhang across
+                // outer iterations; the residual post-tilt overhang relative to `-domain.toolAxis[i]`
+                // is evaluated in `evaluateSupportNeededAndSeedOrderField` once `toolAxis` converges.
+                const std::array<float, 3> baseGravityDir =
                     ctx.backend.queryGravityDirection(domain.posBed[i]);
                 const std::array<float, 3> upDir{
-                    -gravityDir[0],
-                    -gravityDir[1],
-                    -gravityDir[2]};
+                    -baseGravityDir[0],
+                    -baseGravityDir[1],
+                    -baseGravityDir[2]};
 
-                // `domain.overhang[i]` is o_i = -n_surf \cdot g_bed = n_surf \cdot u_up \in [-1, 1].
                 // Signed overhang angle relative to vertical (0°):
                 //   \theta_ovh = arcsin(-o_i) \in [-90° (flat top), +90° (flat overhang ceiling)]
-                const float ovh = std::clamp(domain.overhang[i], -1.0f, 1.0f);
+                const float ovh = std::clamp(dot3(nSurf, upDir), -1.0f, 1.0f);
                 const float signedOverhangDeg =
                     std::asin(std::clamp(-ovh, -1.0f, 1.0f)) * kRadToDeg;
 
@@ -1758,14 +1768,25 @@ void evaluateSupportNeededAndSeedOrderField(
     std::vector<float> gravHeight(n, 0.0f);
     float minGravProj = std::numeric_limits<float>::max();
     std::vector<std::array<float, 3>> upDirs(n, {0.0f, 0.0f, 1.0f});
+    const bool bedTiltsWithRotary = ctx.backend.bedTiltsWithRotaryAxes();
 
     for (std::size_t i = 0; i < n; ++i) {
         const auto& pos = domain.posBed[i];
-        const std::array<float, 3> gDir =
+        const std::array<float, 3> baseG =
             normalize3(ctx.backend.queryGravityDirection(pos), {0.0f, 0.0f, -1.0f});
+        const std::array<float, 3> gDir = bedTiltsWithRotary
+            ? normalize3(
+                  {-domain.toolAxis[i][0], -domain.toolAxis[i][1], -domain.toolAxis[i][2]},
+                  baseG)
+            : baseG;
         const std::array<float, 3> uUp{-gDir[0], -gDir[1], -gDir[2]};
         upDirs[i] = uUp;
-        const float proj = dot3(pos, uUp);
+        if (bedTiltsWithRotary) {
+            domain.overhang[i] = std::clamp(dot3(domain.sdfGrad[i], uUp), -1.0f, 1.0f);
+        }
+        // Keep causal reachability height monotonic along the nominal build-plate anti-gravity axis
+        const std::array<float, 3> nomUp{-baseG[0], -baseG[1], -baseG[2]};
+        const float proj = dot3(pos, nomUp);
         gravHeight[i] = proj;
         if (domain.isInterior[i] && domain.sdf[i] <= 0.0f) {
             minGravProj = std::min(minGravProj, proj);
@@ -2511,15 +2532,19 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
                 const std::array<float, 3> gravityDir =
                     baseContext.backend.queryGravityDirection(pos);
 
-                const float antiGravityProj = -dot3(domain.sdfGrad[i], gravityDir);
-                domain.overhang[i] = std::clamp(antiGravityProj, -1.0f, 1.0f);
-
                 const openvdb::Vec3s sampledAxis = coarseAxisSampler.wsSample(wp);
                 const std::array<float, 3> unitAxis = normalize3(
                     {sampledAxis.x(), sampledAxis.y(), sampledAxis.z()},
                     nozzleFrame.nozzle_axis);
                 domain.toolAxis[i] = unitAxis;
                 domain.targetDir[i] = unitAxis;
+
+                const std::array<float, 3> effGravityDir =
+                    baseContext.backend.bedTiltsWithRotaryAxes()
+                        ? normalize3({-unitAxis[0], -unitAxis[1], -unitAxis[2]}, gravityDir)
+                        : gravityDir;
+                const float antiGravityProj = -dot3(domain.sdfGrad[i], effGravityDir);
+                domain.overhang[i] = std::clamp(antiGravityProj, -1.0f, 1.0f);
 
                 const float cosTilt =
                     std::clamp(dot3(unitAxis, nozzleFrame.nozzle_axis), -1.0f, 1.0f);

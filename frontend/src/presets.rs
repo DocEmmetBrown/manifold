@@ -105,6 +105,11 @@ pub struct PrinterPreset {
     pub gravity_direction_bed: [f32; 3],
     pub bed_tilt_rx_deg: f32,
     pub bed_tilt_ry_deg: f32,
+    pub a_min_deg: f32,
+    pub a_max_deg: f32,
+    pub invert_a: bool,
+    pub max_a_speed_deg_s: f32,
+    pub a_accel_deg_s2: f32,
     pub b_min_deg: f32,
     pub b_max_deg: f32,
     pub c_continuous: bool,
@@ -175,6 +180,11 @@ impl PrinterPreset {
             gravity_direction_bed: cfg.machine.gravity_direction_bed,
             bed_tilt_rx_deg: cfg.machine.bed_tilt_rx_deg,
             bed_tilt_ry_deg: cfg.machine.bed_tilt_ry_deg,
+            a_min_deg: cfg.machine.a_min_deg,
+            a_max_deg: cfg.machine.a_max_deg,
+            invert_a: cfg.machine.invert_a,
+            max_a_speed_deg_s: cfg.machine.max_a_speed_deg_s,
+            a_accel_deg_s2: cfg.machine.a_accel_deg_s2,
             b_min_deg: cfg.machine.b_min_deg,
             b_max_deg: cfg.machine.b_max_deg,
             c_continuous: cfg.machine.c_continuous,
@@ -225,6 +235,11 @@ impl PrinterPreset {
         cfg.machine.gravity_direction_bed = self.gravity_direction_bed;
         cfg.machine.bed_tilt_rx_deg = self.bed_tilt_rx_deg;
         cfg.machine.bed_tilt_ry_deg = self.bed_tilt_ry_deg;
+        cfg.machine.a_min_deg = self.a_min_deg;
+        cfg.machine.a_max_deg = self.a_max_deg;
+        cfg.machine.invert_a = self.invert_a;
+        cfg.machine.max_a_speed_deg_s = self.max_a_speed_deg_s;
+        cfg.machine.a_accel_deg_s2 = self.a_accel_deg_s2;
         cfg.machine.b_min_deg = self.b_min_deg;
         cfg.machine.b_max_deg = self.b_max_deg;
         cfg.machine.c_continuous = self.c_continuous;
@@ -302,6 +317,11 @@ impl PrinterPreset {
             && approx_eq_vec3(self.gravity_direction_bed, cfg.machine.gravity_direction_bed)
             && approx_eq(self.bed_tilt_rx_deg, cfg.machine.bed_tilt_rx_deg)
             && approx_eq(self.bed_tilt_ry_deg, cfg.machine.bed_tilt_ry_deg)
+            && approx_eq(self.a_min_deg, cfg.machine.a_min_deg)
+            && approx_eq(self.a_max_deg, cfg.machine.a_max_deg)
+            && self.invert_a == cfg.machine.invert_a
+            && approx_eq(self.max_a_speed_deg_s, cfg.machine.max_a_speed_deg_s)
+            && approx_eq(self.a_accel_deg_s2, cfg.machine.a_accel_deg_s2)
             && approx_eq(self.b_min_deg, cfg.machine.b_min_deg)
             && approx_eq(self.b_max_deg, cfg.machine.b_max_deg)
             && self.c_continuous == cfg.machine.c_continuous
@@ -1496,10 +1516,74 @@ impl PresetLibrary {
         p_5axis.depth_y = 210.0;
         p_5axis.height_z = 220.0;
         p_5axis.gcode_origin_at_bed_center = true;
+        p_5axis.kinematics_mode = FiveAxisKinematicsMode::FiveAxisTiltingBedAB;
+        p_5axis.a_min_deg = -45.0;
+        p_5axis.a_max_deg = 45.0;
+        p_5axis.b_min_deg = -45.0;
+        p_5axis.b_max_deg = 45.0;
+        p_5axis.max_a_speed_deg_s = 60.0;
+        p_5axis.max_b_speed_deg_s = 60.0;
+        p_5axis.a_accel_deg_s2 = 300.0;
+        p_5axis.b_accel_deg_s2 = 300.0;
+        p_5axis.bed_tilts_with_b = true;
         p_5axis.outer_wall_accel_mms2 = 2000.0;
         p_5axis.inner_wall_accel_mms2 = 3500.0;
         p_5axis.infill_accel_mms2 = 5000.0;
         p_5axis.travel_accel_mms2 = 7500.0;
+        p_5axis.start_gcode_template = concat!(
+            "; --- Manifold2 5-Axis Tilting Bed (XYZ + AB) Print Start ---\n",
+            "; Print Bounds: X[{bbox_min_x}..{bbox_max_x}] Y[{bbox_min_y}..{bbox_max_y}] Z[{bbox_min_z}..{bbox_max_z}]\n",
+            "G90 ; Absolute positioning\n",
+            "M83 ; Relative extrusion\n",
+            "M140 S{bed_temp} ; Set bed temperature\n",
+            "M104 S{nozzle_temp} T{tool_id} ; Set nozzle temperature\n",
+            "G28 ; Home all axes (X Y Z A B)\n",
+            "T{tool_id} ; Select active tool\n",
+            "M190 S{bed_temp} ; Wait for bed temperature\n",
+            "M109 S{nozzle_temp} T{tool_id} ; Wait for nozzle temperature\n",
+            "G1 X0 Y0 Z15 A0 B0 F3000 ; Move to neutral level-bed 5-axis posture\n",
+            "G92 E0 ; Reset extruder"
+        )
+        .to_string();
+        p_5axis.end_gcode_template = concat!(
+            "; --- Manifold2 5-Axis Tilting Bed (XYZ + AB) Print End ---\n",
+            "M400 ; Wait for moves to finish\n",
+            "G1 A0 B0 F1800 ; Level tilting bed axes\n",
+            "M104 S0 ; Turn off hotend\n",
+            "M140 S0 ; Turn off bed\n",
+            "M107 ; Turn off part cooling fan\n",
+            "G28 X Y ; Park toolhead\n",
+            "M84 ; Disable steppers"
+        )
+        .to_string();
+
+        let mut p_trident_5axis_ab = PrinterPreset::from_config(
+            "Voron Trident 5-Axis Tilting Bed (300³ A/B)",
+            &base_cfg,
+            true,
+        );
+        p_trident_5axis_ab.width_x = 300.0;
+        p_trident_5axis_ab.depth_y = 300.0;
+        p_trident_5axis_ab.height_z = 250.0;
+        p_trident_5axis_ab.gcode_origin_at_bed_center = true;
+        p_trident_5axis_ab.gcode_dialect = GcodeDialect::Klipper;
+        p_trident_5axis_ab.kinematics_mode = FiveAxisKinematicsMode::FiveAxisTiltingBedAB;
+        p_trident_5axis_ab.a_min_deg = -45.0;
+        p_trident_5axis_ab.a_max_deg = 45.0;
+        p_trident_5axis_ab.b_min_deg = -45.0;
+        p_trident_5axis_ab.b_max_deg = 45.0;
+        p_trident_5axis_ab.max_a_speed_deg_s = 60.0;
+        p_trident_5axis_ab.max_b_speed_deg_s = 60.0;
+        p_trident_5axis_ab.a_accel_deg_s2 = 300.0;
+        p_trident_5axis_ab.b_accel_deg_s2 = 300.0;
+        p_trident_5axis_ab.orientation_smoothing_window_mm = 2.5;
+        p_trident_5axis_ab.bed_tilts_with_b = true;
+        p_trident_5axis_ab.outer_wall_accel_mms2 = 2500.0;
+        p_trident_5axis_ab.inner_wall_accel_mms2 = 4000.0;
+        p_trident_5axis_ab.infill_accel_mms2 = 6000.0;
+        p_trident_5axis_ab.travel_accel_mms2 = 9000.0;
+        p_trident_5axis_ab.start_gcode_template = p_5axis.start_gcode_template.clone();
+        p_trident_5axis_ab.end_gcode_template = p_5axis.end_gcode_template.clone();
 
         let mut p_rrf_5axis_bc =
             PrinterPreset::from_config("5-Axis Circular Bed (RRF B/C)", &base_cfg, true);
@@ -1578,6 +1662,7 @@ impl PresetLibrary {
             p_core_one_l_indx_4,
             p_core_one_l_indx_8,
             p_5axis,
+            p_trident_5axis_ab,
             p_rrf_5axis_bc,
             p_6axis,
         ]

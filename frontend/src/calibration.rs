@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{FiveAxisKinematicsMode, GcodeDialect, NozzleFrame, SlicerConfig};
+use crate::config::{GcodeDialect, NozzleFrame, SlicerConfig};
 use crate::gcode::{
     compute_exclude_object_polygon_2d, expand_gcode_template, format_accel_limit_cmd,
     format_exclude_object_define, format_moonraker_estimated_time, format_pressure_advance_cmd,
@@ -1200,7 +1200,8 @@ fn finalize_calibration_gcode_result(
     }
     gcode.push_str("M83 ; Ensure relative extrusion\n");
 
-    let is_five_axis = config.machine.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC;
+    let is_five_axis = config.machine.kinematics_mode.is_five_axis();
+    let (rot_axis_1, rot_axis_2) = config.machine.kinematics_mode.rotary_axis_letters();
     let mut emitted_accel = -1.0f32;
     let mut emitted_feed_mm_min = -1.0f32;
     let mut emitted_pa = -1.0f32;
@@ -1353,11 +1354,13 @@ fn finalize_calibration_gcode_result(
                 if is_five_axis {
                     if emit_f {
                         gcode.push_str(&format!(
-                            "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6} F{:.1}\n",
+                            "G1 X{:.4} Y{:.4} Z{:.4} {}{:.3} {}{:.3} E{:.6} F{:.1}\n",
                             seg.p1_bed.x,
                             seg.p1_bed.y,
                             seg.p1_bed.z,
+                            rot_axis_1,
                             seg.b1_deg,
+                            rot_axis_2,
                             seg.c1_deg,
                             e_emitted,
                             feed_mm_min
@@ -1365,11 +1368,13 @@ fn finalize_calibration_gcode_result(
                         emitted_feed_mm_min = feed_mm_min;
                     } else {
                         gcode.push_str(&format!(
-                            "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6}\n",
+                            "G1 X{:.4} Y{:.4} Z{:.4} {}{:.3} {}{:.3} E{:.6}\n",
                             seg.p1_bed.x,
                             seg.p1_bed.y,
                             seg.p1_bed.z,
+                            rot_axis_1,
                             seg.b1_deg,
+                            rot_axis_2,
                             seg.c1_deg,
                             e_emitted
                         ));
@@ -1391,11 +1396,13 @@ fn finalize_calibration_gcode_result(
                 let feed_mm_min = (seg.cruise_speed_mms * 60.0).max(60.0);
                 if is_five_axis {
                     gcode.push_str(&format!(
-                        "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} F{:.1}\n",
+                        "G0 X{:.4} Y{:.4} Z{:.4} {}{:.3} {}{:.3} F{:.1}\n",
                         seg.p1_bed.x,
                         seg.p1_bed.y,
                         seg.p1_bed.z,
+                        rot_axis_1,
                         seg.b1_deg,
+                        rot_axis_2,
                         seg.c1_deg,
                         feed_mm_min
                     ));
