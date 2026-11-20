@@ -1826,15 +1826,54 @@ impl PresetLibrary {
             ToolPreset::from_config("0.4mm Prusa Nextruder High-Flow", &base_cfg, true);
         t_nextruder.nozzle_diameter_mm = 0.40;
         t_nextruder.has_rotational_axes = false;
+        t_nextruder.max_angle_from_bed_normal_deg = 45.0;
         t_nextruder.max_volumetric_flow_mm3s = 26.0;
         t_nextruder.retract_length_mm = 0.70;
         t_nextruder.retract_speed_mms = 35.0;
         t_nextruder.z_hop_mm = 0.20;
+        t_nextruder.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.50, 0.0),
+            ClearancePointXZ::new(3.5, 1.5),
+            ClearancePointXZ::new(11.0, 3.0),
+            ClearancePointXZ::new(24.0, 9.0),
+            ClearancePointXZ::new(34.0, 18.0),
+            ClearancePointXZ::new(38.0, 45.0),
+        ];
+
+        let mut t_nextruder_std =
+            ToolPreset::from_config("0.4mm Prusa Nextruder Standard", &base_cfg, true);
+        t_nextruder_std.nozzle_diameter_mm = 0.40;
+        t_nextruder_std.has_rotational_axes = false;
+        t_nextruder_std.max_angle_from_bed_normal_deg = 45.0;
+        t_nextruder_std.max_volumetric_flow_mm3s = 16.0;
+        t_nextruder_std.retract_length_mm = 0.70;
+        t_nextruder_std.retract_speed_mms = 35.0;
+        t_nextruder_std.z_hop_mm = 0.20;
+        t_nextruder_std.clearance_profile_xz = t_nextruder.clearance_profile_xz.clone();
+
+        let mut t_nextruder_06 =
+            ToolPreset::from_config("0.6mm Prusa Nextruder High-Flow", &base_cfg, true);
+        t_nextruder_06.nozzle_diameter_mm = 0.60;
+        t_nextruder_06.has_rotational_axes = false;
+        t_nextruder_06.max_angle_from_bed_normal_deg = 45.0;
+        t_nextruder_06.max_volumetric_flow_mm3s = 32.0;
+        t_nextruder_06.retract_length_mm = 0.80;
+        t_nextruder_06.retract_speed_mms = 35.0;
+        t_nextruder_06.z_hop_mm = 0.25;
+        t_nextruder_06.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.75, 0.0),
+            ClearancePointXZ::new(3.5, 1.5),
+            ClearancePointXZ::new(11.0, 3.0),
+            ClearancePointXZ::new(24.0, 9.0),
+            ClearancePointXZ::new(34.0, 18.0),
+            ClearancePointXZ::new(38.0, 45.0),
+        ];
 
         let mut t_indx =
             ToolPreset::from_config("0.4mm Bondtech INDX Toolchanger", &base_cfg, true);
         t_indx.nozzle_diameter_mm = 0.40;
         t_indx.has_rotational_axes = false;
+        t_indx.max_angle_from_bed_normal_deg = 45.0;
         t_indx.max_volumetric_flow_mm3s = 24.0;
         t_indx.retract_length_mm = 0.60;
         t_indx.retract_speed_mms = 40.0;
@@ -1842,6 +1881,35 @@ impl PresetLibrary {
         t_indx.tool_change_time_s = 12.0;
         t_indx.tool_change_hop_before = true;
         t_indx.tool_change_approach_after = true;
+        t_indx.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.50, 0.0),
+            ClearancePointXZ::new(3.0, 2.0),
+            ClearancePointXZ::new(8.5, 5.0),
+            ClearancePointXZ::new(17.5, 11.0),
+            ClearancePointXZ::new(30.0, 22.0),
+            ClearancePointXZ::new(35.0, 45.0),
+        ];
+
+        let mut t_indx_06 =
+            ToolPreset::from_config("0.6mm Bondtech INDX Toolchanger", &base_cfg, true);
+        t_indx_06.nozzle_diameter_mm = 0.60;
+        t_indx_06.has_rotational_axes = false;
+        t_indx_06.max_angle_from_bed_normal_deg = 45.0;
+        t_indx_06.max_volumetric_flow_mm3s = 30.0;
+        t_indx_06.retract_length_mm = 0.70;
+        t_indx_06.retract_speed_mms = 40.0;
+        t_indx_06.z_hop_mm = 0.25;
+        t_indx_06.tool_change_time_s = 12.0;
+        t_indx_06.tool_change_hop_before = true;
+        t_indx_06.tool_change_approach_after = true;
+        t_indx_06.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.75, 0.0),
+            ClearancePointXZ::new(3.0, 2.0),
+            ClearancePointXZ::new(8.5, 5.0),
+            ClearancePointXZ::new(17.5, 11.0),
+            ClearancePointXZ::new(30.0, 22.0),
+            ClearancePointXZ::new(35.0, 45.0),
+        ];
 
         let mut t_bambu_x1_p1 =
             ToolPreset::from_config("0.4mm Bambu Lab X1/P1 Hardened Steel", &base_cfg, true);
@@ -2051,8 +2119,11 @@ impl PresetLibrary {
             t_06,
             t_025,
             t_rect,
+            t_nextruder_std,
             t_nextruder,
+            t_nextruder_06,
             t_indx,
+            t_indx_06,
             t_bambu_x1_p1,
             t_bambu_a1,
             t_sb_std,
@@ -2727,13 +2798,25 @@ mod tests {
             assert!(!lib.is_category_modified(PresetCategory::Printer, &cfg));
         }
 
-        assert!(lib.select_and_apply(
-            PresetCategory::Tool,
-            "0.4mm Bondtech INDX Toolchanger",
-            &mut cfg
-        ));
-        assert!((cfg.gcode.tool_change_time_s - 12.0).abs() < 1.0e-4);
-        assert!(!lib.is_category_modified(PresetCategory::Tool, &cfg));
+        // Verify all 5 Prusa Nextruder & Bondtech INDX toolhead presets and their XZ clearance envelopes
+        let prusa_tools = [
+            ("0.4mm Prusa Nextruder Standard", 0.40, 16.0),
+            ("0.4mm Prusa Nextruder High-Flow", 0.40, 26.0),
+            ("0.6mm Prusa Nextruder High-Flow", 0.60, 32.0),
+            ("0.4mm Bondtech INDX Toolchanger", 0.40, 24.0),
+            ("0.6mm Bondtech INDX Toolchanger", 0.60, 30.0),
+        ];
+        for (t_name, expected_diam, expected_flow) in prusa_tools {
+            assert!(
+                lib.select_and_apply(PresetCategory::Tool, t_name, &mut cfg),
+                "Missing built-in Prusa tool preset {t_name}"
+            );
+            assert!((cfg.active_tool().unwrap().nozzle_diameter_mm - expected_diam).abs() < 1.0e-4);
+            assert!((cfg.gcode.max_volumetric_flow_mm3s - expected_flow).abs() < 1.0e-4);
+            let prof = &cfg.active_tool().unwrap().clearance_profile_xz;
+            assert!(prof.len() >= 6);
+            assert!(!lib.is_category_modified(PresetCategory::Tool, &cfg));
+        }
 
         // Switching to Bambu Lab printer presets applies BambuLab dialect, BambuLan protocol, build volumes, and AMS tool counts
         let bambu_expected: [(&str, f32, f32, f32, usize); 7] = [
