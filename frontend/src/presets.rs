@@ -1877,6 +1877,175 @@ impl PresetLibrary {
             ClearancePointXZ::new(38.0, 45.0),
         ];
 
+        // --- Voron Toolhead Presets (Measured from official VoronDesign & Armchair Heavy Industries CAD/STLs) ---
+
+        // 1a. Voron Stealthburner (Standard HF hotend: 1.5 mm nozzle protrusion below duct tips,
+        //     65.1 mm main cowling width -> 32.6 mm radius, 71.1 mm rear carriage width -> 35.5 mm radius)
+        let mut t_sb_std =
+            ToolPreset::from_config("0.4mm Voron Stealthburner (Standard)", &base_cfg, true);
+        t_sb_std.nozzle_diameter_mm = 0.40;
+        t_sb_std.has_rotational_axes = false;
+        t_sb_std.max_angle_from_bed_normal_deg = 45.0;
+        t_sb_std.max_volumetric_flow_mm3s = 24.0;
+        t_sb_std.retract_length_mm = 0.75;
+        t_sb_std.retract_speed_mms = 40.0;
+        t_sb_std.z_hop_mm = 0.40;
+        t_sb_std.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.50, 0.0),
+            ClearancePointXZ::new(4.0, 1.5),
+            ClearancePointXZ::new(10.5, 2.0),
+            ClearancePointXZ::new(24.0, 6.0),
+            ClearancePointXZ::new(32.6, 12.0),
+            ClearancePointXZ::new(35.5, 45.0),
+        ];
+
+        // 1b. Voron Stealthburner (+8.5mm MZE / UHF: shifts shroud/ducts up by +8.5 mm relative to nozzle tip)
+        let mut t_sb_mze = ToolPreset::from_config(
+            "0.4mm Voron Stealthburner (+8.5mm MZE / UHF)",
+            &base_cfg,
+            true,
+        );
+        t_sb_mze.nozzle_diameter_mm = 0.40;
+        t_sb_mze.has_rotational_axes = false;
+        t_sb_mze.max_angle_from_bed_normal_deg = 45.0;
+        t_sb_mze.max_volumetric_flow_mm3s = 35.0;
+        t_sb_mze.retract_length_mm = 0.90;
+        t_sb_mze.retract_speed_mms = 45.0;
+        t_sb_mze.z_hop_mm = 0.40;
+        t_sb_mze.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.50, 0.0),
+            ClearancePointXZ::new(3.5, 2.0),
+            ClearancePointXZ::new(6.0, 8.5),
+            ClearancePointXZ::new(10.5, 10.5),
+            ClearancePointXZ::new(24.0, 14.5),
+            ClearancePointXZ::new(32.6, 20.5),
+            ClearancePointXZ::new(35.5, 53.5),
+        ];
+
+        // 2a. Voron DownDraft (Standard / Dual 4010 Low-Mount: 61.0 mm shroud width -> 30.5 mm radius;
+        //     Dual 5015 variant reaches 34.0 mm at z >= 15 mm)
+        let mut t_dd_std = ToolPreset::from_config(
+            "0.4mm Voron DownDraft (Standard / Low-Mount)",
+            &base_cfg,
+            true,
+        );
+        t_dd_std.nozzle_diameter_mm = 0.40;
+        t_dd_std.has_rotational_axes = false;
+        t_dd_std.max_angle_from_bed_normal_deg = 45.0;
+        t_dd_std.max_volumetric_flow_mm3s = 26.0;
+        t_dd_std.retract_length_mm = 0.75;
+        t_dd_std.retract_speed_mms = 45.0;
+        t_dd_std.z_hop_mm = 0.40;
+        t_dd_std.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.50, 0.0),
+            ClearancePointXZ::new(4.0, 1.5),
+            ClearancePointXZ::new(9.5, 2.2),
+            ClearancePointXZ::new(22.0, 6.5),
+            ClearancePointXZ::new(30.5, 10.5),
+            ClearancePointXZ::new(34.0, 43.0),
+        ];
+
+        // 2b. Voron DownDraft (+8.5mm MZE / UHF High-Mount: Note that DownDraft uses modular Low/Middle/High
+        //     front mounts to keep the lower duct tips at constant height relative to the nozzle tip, while
+        //     giving more vertical heater-block clearance inside the throat!)
+        let mut t_dd_mze = ToolPreset::from_config(
+            "0.4mm Voron DownDraft (+8.5mm MZE / UHF)",
+            &base_cfg,
+            true,
+        );
+        t_dd_mze.nozzle_diameter_mm = 0.40;
+        t_dd_mze.has_rotational_axes = false;
+        t_dd_mze.max_angle_from_bed_normal_deg = 45.0;
+        t_dd_mze.max_volumetric_flow_mm3s = 38.0;
+        t_dd_mze.retract_length_mm = 0.90;
+        t_dd_mze.retract_speed_mms = 45.0;
+        t_dd_mze.z_hop_mm = 0.40;
+        t_dd_mze.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.50, 0.0),
+            ClearancePointXZ::new(3.5, 2.0),
+            ClearancePointXZ::new(6.0, 8.5),
+            ClearancePointXZ::new(9.5, 10.7),
+            ClearancePointXZ::new(22.0, 15.0),
+            ClearancePointXZ::new(30.5, 19.0),
+            ClearancePointXZ::new(34.0, 51.5),
+        ];
+
+        // 3a. Voron Xol Toolhead (Standard HF: SLiMXolPAP / 4010 ducts 71.68 mm wide -> 35.8 mm radius,
+        //     upper fan mount 78.64 mm wide -> 39.3 mm radius)
+        let mut t_xol_std =
+            ToolPreset::from_config("0.4mm Voron Xol (Standard)", &base_cfg, true);
+        t_xol_std.nozzle_diameter_mm = 0.40;
+        t_xol_std.has_rotational_axes = false;
+        t_xol_std.max_angle_from_bed_normal_deg = 45.0;
+        t_xol_std.max_volumetric_flow_mm3s = 28.0;
+        t_xol_std.retract_length_mm = 0.80;
+        t_xol_std.retract_speed_mms = 45.0;
+        t_xol_std.z_hop_mm = 0.40;
+        t_xol_std.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.50, 0.0),
+            ClearancePointXZ::new(4.0, 1.5),
+            ClearancePointXZ::new(9.0, 5.5),
+            ClearancePointXZ::new(35.8, 9.0),
+            ClearancePointXZ::new(39.3, 44.0),
+        ];
+
+        // 3b. Voron Xol Toolhead (+8.5mm MZE / UHF: with free-hanging MZE or UHF nozzle drop)
+        let mut t_xol_mze =
+            ToolPreset::from_config("0.4mm Voron Xol (+8.5mm MZE / UHF)", &base_cfg, true);
+        t_xol_mze.nozzle_diameter_mm = 0.40;
+        t_xol_mze.has_rotational_axes = false;
+        t_xol_mze.max_angle_from_bed_normal_deg = 45.0;
+        t_xol_mze.max_volumetric_flow_mm3s = 38.0;
+        t_xol_mze.retract_length_mm = 0.90;
+        t_xol_mze.retract_speed_mms = 45.0;
+        t_xol_mze.z_hop_mm = 0.40;
+        t_xol_mze.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.50, 0.0),
+            ClearancePointXZ::new(3.5, 2.0),
+            ClearancePointXZ::new(6.0, 8.5),
+            ClearancePointXZ::new(9.0, 14.0),
+            ClearancePointXZ::new(35.8, 17.5),
+            ClearancePointXZ::new(39.3, 52.5),
+        ];
+
+        // 4a. Voron A4T Toolhead (Standard HF: 1.4 mm tip clearance, 64 mm lower duct span -> 32.0 mm radius
+        //     at z = 9.0 mm, 88.58 mm outer cowling width -> 44.3 mm radius at z = 40..53.8 mm)
+        let mut t_a4t_std =
+            ToolPreset::from_config("0.4mm Voron A4T (Standard)", &base_cfg, true);
+        t_a4t_std.nozzle_diameter_mm = 0.40;
+        t_a4t_std.has_rotational_axes = false;
+        t_a4t_std.max_angle_from_bed_normal_deg = 45.0;
+        t_a4t_std.max_volumetric_flow_mm3s = 28.0;
+        t_a4t_std.retract_length_mm = 0.80;
+        t_a4t_std.retract_speed_mms = 45.0;
+        t_a4t_std.z_hop_mm = 0.40;
+        t_a4t_std.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.50, 0.0),
+            ClearancePointXZ::new(4.0, 1.4),
+            ClearancePointXZ::new(9.0, 6.0),
+            ClearancePointXZ::new(32.0, 9.0),
+            ClearancePointXZ::new(44.3, 40.0),
+        ];
+
+        // 4b. Voron A4T Toolhead (+8.5mm MZE / UHF: standard A4T cowling with +8.5 mm MZE drop, or UHF cowling)
+        let mut t_a4t_mze =
+            ToolPreset::from_config("0.4mm Voron A4T (+8.5mm MZE / UHF)", &base_cfg, true);
+        t_a4t_mze.nozzle_diameter_mm = 0.40;
+        t_a4t_mze.has_rotational_axes = false;
+        t_a4t_mze.max_angle_from_bed_normal_deg = 45.0;
+        t_a4t_mze.max_volumetric_flow_mm3s = 38.0;
+        t_a4t_mze.retract_length_mm = 0.90;
+        t_a4t_mze.retract_speed_mms = 45.0;
+        t_a4t_mze.z_hop_mm = 0.40;
+        t_a4t_mze.clearance_profile_xz = vec![
+            ClearancePointXZ::new(0.50, 0.0),
+            ClearancePointXZ::new(3.5, 2.0),
+            ClearancePointXZ::new(6.0, 8.5),
+            ClearancePointXZ::new(9.0, 14.5),
+            ClearancePointXZ::new(32.0, 17.5),
+            ClearancePointXZ::new(44.3, 48.5),
+        ];
+
         vec![
             t_04,
             t_06,
@@ -1886,6 +2055,14 @@ impl PresetLibrary {
             t_indx,
             t_bambu_x1_p1,
             t_bambu_a1,
+            t_sb_std,
+            t_sb_mze,
+            t_dd_std,
+            t_dd_mze,
+            t_xol_std,
+            t_xol_mze,
+            t_a4t_std,
+            t_a4t_mze,
         ]
     }
 
@@ -2590,6 +2767,34 @@ mod tests {
             &mut cfg
         ));
         assert!(!lib.is_category_modified(PresetCategory::Tool, &cfg));
+
+        // Verify all 8 Voron toolhead presets (Stealthburner, DownDraft, Xol, A4T with & without +8.5mm MZE)
+        let voron_tools = [
+            ("0.4mm Voron Stealthburner (Standard)", 24.0),
+            ("0.4mm Voron Stealthburner (+8.5mm MZE / UHF)", 35.0),
+            ("0.4mm Voron DownDraft (Standard / Low-Mount)", 26.0),
+            ("0.4mm Voron DownDraft (+8.5mm MZE / UHF)", 38.0),
+            ("0.4mm Voron Xol (Standard)", 28.0),
+            ("0.4mm Voron Xol (+8.5mm MZE / UHF)", 38.0),
+            ("0.4mm Voron A4T (Standard)", 28.0),
+            ("0.4mm Voron A4T (+8.5mm MZE / UHF)", 38.0),
+        ];
+        for (t_name, expected_flow) in voron_tools {
+            assert!(
+                lib.select_and_apply(PresetCategory::Tool, t_name, &mut cfg),
+                "Missing built-in Voron tool preset {t_name}"
+            );
+            assert!((cfg.gcode.max_volumetric_flow_mm3s - expected_flow).abs() < 1.0e-4);
+            let prof = &cfg.active_tool().unwrap().clearance_profile_xz;
+            assert!(prof.len() >= 5);
+            for w in prof.windows(2) {
+                assert!(
+                    w[1].z_height_mm >= w[0].z_height_mm,
+                    "Clearance profile Z must be monotonically non-decreasing in {t_name}"
+                );
+            }
+            assert!(!lib.is_category_modified(PresetCategory::Tool, &cfg));
+        }
     }
 
     #[test]
