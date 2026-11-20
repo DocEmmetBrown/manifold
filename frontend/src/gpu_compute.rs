@@ -410,6 +410,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let print_tau_tol = print_tau + 0.65 * h_top;
     let base_curv_tol = max(0.45 * h_top, 0.35 * fine_voxel);
     let margin_extra = max(0.65 * fine_voxel, 0.85 * h_top);
+    let cos_noz_surf = dot(n_sdf, z_axis);
 
     var dirs24 = array<vec2<f32>, 24>(
         vec2<f32>(1.0, 0.0),
@@ -464,7 +465,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         if (z > skin_depth_mm + 0.55 * h_top) {
             let h_above_surf_axis = dot(p_axis - x_surf, n_sdf);
+            let h_above_noz_axis = dot(p_axis - x_surf, z_axis);
             if (h_above_surf_axis > base_curv_tol &&
+                (cos_noz_surf < 0.85 || h_above_noz_axis > base_curv_tol) &&
                 is_brick_possibly_occupied(p_axis, slice_tau_limit)) {
                 let st = sample_dense_sdf_and_tau(p_axis);
                 if (st.x <= 0.08 * fine_voxel) {
@@ -493,9 +496,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let y_pos = p_axis + r * r_vec;
 
                 let h_above_surf = dot(y_pos - x_surf, n_sdf);
+                let h_above_noz = dot(y_pos - x_surf, z_axis);
                 let h_above_base = h_above_surf + skin_depth_mm;
                 let above_surf = h_above_surf > curv_tol;
-                let above_base = check_steep_core && (h_above_base > curv_tol);
+                let above_base = check_steep_core &&
+                    (h_above_base > curv_tol) &&
+                    (cos_noz_surf < 0.85 || h_above_noz > base_curv_tol);
                 if (!above_surf && !above_base) {
                     continue;
                 }
@@ -514,8 +520,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     continue;
                 }
 
+                var eff_above_surf = above_surf;
+                if (eff_above_surf && cos_noz_surf >= 0.85 && h_above_noz <= base_curv_tol) {
+                    let y_overhead = y_pos + (base_curv_tol + 0.35 * fine_voxel - h_above_noz) * z_axis;
+                    let st_over = sample_dense_sdf_and_tau(y_overhead);
+                    if (st_over.x > 0.05 * fine_voxel) {
+                        eff_above_surf = false;
+                    }
+                }
+                if (!eff_above_surf && !above_base) {
+                    continue;
+                }
+
                 var hits_obstacle = false;
-                if (above_surf) {
+                if (eff_above_surf) {
                     if (st.y <= print_tau_tol || allow_future_tip) {
                         hits_obstacle = true;
                     }

@@ -5832,6 +5832,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             const float tipOrificeClearR = tipRadiusMm + wallHalfWidthMm + 0.25f * fineVoxelSize;
             const float printTauTol = printTau + 0.65f * hTop;
             const float baseCurvTol = std::max(0.45f * hTop, 0.35f * fineVoxelSize);
+            const float cosNozSurf = nSdf.dot(zAxis);
 
             auto isBrickPossiblyOccupiedAt = [&](
                 const openvdb::Vec3f& pt,
@@ -5882,7 +5883,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 // Check centerline point `pAxis` when above the outer surface
                 if (z > skinDepthMm + 0.55f * hTop) {
                     const float hAboveSurfAxis = (pAxis - xSurf).dot(nSdf);
+                    const float hAboveNozAxis = (pAxis - xSurf).dot(zAxis);
                     if (hAboveSurfAxis > baseCurvTol &&
+                        (cosNozSurf < 0.85f || hAboveNozAxis > baseCurvTol) &&
                         isBrickPossiblyOccupiedAt(pAxis, sliceTauLimit)) {
                         const openvdb::Vec3d wpAxis(pAxis.x(), pAxis.y(), pAxis.z());
                         const float axisSdf = sampleAnySdfWith(
@@ -5921,9 +5924,13 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
 
                         // 1. Cheap geometric plane filter FIRST (3 flops)
                         const float hAboveSurf = (yPos - xSurf).dot(nSdf);
+                        const float hAboveNoz = (yPos - xSurf).dot(zAxis);
                         const float hAboveBase = hAboveSurf + skinDepthMm;
                         const bool aboveSurf = (hAboveSurf > curvTol);
-                        const bool aboveBase = (checkSteepCore && hAboveBase > curvTol);
+                        const bool aboveBase =
+                            checkSteepCore &&
+                            (hAboveBase > curvTol) &&
+                            (cosNozSurf < 0.85f || hAboveNoz > baseCurvTol);
                         if (!aboveSurf && !aboveBase) {
                             continue;
                         }
@@ -5943,8 +5950,24 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             continue;
                         }
 
+                        bool effAboveSurf = aboveSurf;
+                        if (effAboveSurf && cosNozSurf >= 0.85f && hAboveNoz <= baseCurvTol) {
+                            const openvdb::Vec3f yOverhead =
+                                yPos + (baseCurvTol + 0.35f * fineVoxelSize - hAboveNoz) * zAxis;
+                            const openvdb::Vec3d wpOver(
+                                yOverhead.x(), yOverhead.y(), yOverhead.z());
+                            const float overheadSdf = sampleAnySdfWith(
+                                wpOver, localSdfAcc, localSdfSampler, localFineSdfSampler);
+                            if (overheadSdf > 0.05f * fineVoxelSize) {
+                                effAboveSurf = false;
+                            }
+                        }
+                        if (!effAboveSurf && !aboveBase) {
+                            continue;
+                        }
+
                         bool hitsObstacle = false;
-                        if (aboveSurf) {
+                        if (effAboveSurf) {
                             const float yTau = sampleTauAtWith(
                                 wpY,
                                 localFineEikAcc,
@@ -6294,23 +6317,23 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             surfVoxels.push_back(candidateSlots[idx]);
         }
 
-        // De-round 90-degree corner-polluted surface normals at coplanar cutout/perimeter rims
-        // (`dzStep <= 0.25 * fineVoxelSize`) so rim voxels join their parent face patch and erode
-        // the underlying core cleanly without pulling sloped chamfer neighbors into the face.
+        // De-round 90-degree corner-polluted surface normals and depressed rim positions at
+        // coplanar cutout/perimeter rims via 2-pass planar-aware propagation so rim voxels join
+        // their parent face patch and erode the underlying core cleanly without altering slopes.
         std::vector<openvdb::Vec3f> clearanceNormals(surfVoxels.size());
         if (!surfVoxels.empty()) {
+            std::vector<openvdb::Vec3f> nextPositions(surfVoxels.size());
+            for (std::size_t k = 0; k < surfVoxels.size(); ++k) {
+                clearanceNormals[k] = surfVoxels[k].surfNormal;
+                nextPositions[k] = surfVoxels[k].surfPos;
+            }
+            std::vector<std::uint8_t> isLocallyPlanar(surfVoxels.size(), 0);
             for (std::size_t k = 0; k < surfVoxels.size(); ++k) {
                 const auto& sv = surfVoxels[k];
-                const NozzleBasis nb = queryNozzleFrame(
-                    {sv.surfPos.x(), sv.surfPos.y(), sv.surfPos.z()},
-                    {1.0f, 0.0f, 0.0f});
-                const openvdb::Vec3f zAxis(
-                    nb.nozzle_axis[0], nb.nozzle_axis[1], nb.nozzle_axis[2]);
-                openvdb::Vec3f bestN = sv.surfNormal;
-                float bestDotZ = bestN.dot(zAxis);
-                for (int dz = -1; dz <= 1; ++dz) {
-                    for (int dy = -1; dy <= 1; ++dy) {
-                        for (int dx = -1; dx <= 1; ++dx) {
+                bool planar = false;
+                for (int dz = -1; dz <= 1 && !planar; ++dz) {
+                    for (int dy = -1; dy <= 1 && !planar; ++dy) {
+                        for (int dx = -1; dx <= 1 && !planar; ++dx) {
                             if (dx == 0 && dy == 0 && dz == 0) {
                                 continue;
                             }
@@ -6320,26 +6343,102 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                 continue;
                             }
                             const auto& nbSv = surfVoxels[static_cast<std::size_t>(nbIdx)];
-                            if (sv.surfNormal.dot(nbSv.surfNormal) < 0.82f) {
-                                continue;
-                            }
-                            const float dzStep =
-                                std::abs((nbSv.surfPos - sv.surfPos).dot(nbSv.surfNormal));
-                            if (dzStep > 0.25f * fineVoxelSize) {
-                                continue;
-                            }
-                            const float candDotZ = nbSv.surfNormal.dot(zAxis);
-                            if (candDotZ > bestDotZ + 0.01f) {
-                                bestDotZ = candDotZ;
-                                bestN = nbSv.surfNormal;
+                            if (sv.surfNormal.dot(nbSv.surfNormal) >= 0.9994f &&
+                                std::abs((nbSv.surfPos - sv.surfPos).dot(sv.surfNormal)) <=
+                                    0.18f * fineVoxelSize) {
+                                planar = true;
                             }
                         }
                     }
                 }
-                clearanceNormals[k] = bestN;
+                if (planar) {
+                    isLocallyPlanar[k] = 1;
+                }
             }
-            for (std::size_t k = 0; k < surfVoxels.size(); ++k) {
-                surfVoxels[k].surfNormal = clearanceNormals[k];
+
+            std::vector<openvdb::Vec3f> nextNormals = clearanceNormals;
+            std::vector<std::uint8_t> nextPlanar = isLocallyPlanar;
+            for (int pass = 0; pass < 2; ++pass) {
+                nextNormals = clearanceNormals;
+                nextPlanar = isLocallyPlanar;
+                for (std::size_t k = 0; k < surfVoxels.size(); ++k) {
+                    const auto& sv = surfVoxels[k];
+                    nextPositions[k] = sv.surfPos;
+                    const NozzleBasis nb = queryNozzleFrame(
+                        {sv.surfPos.x(), sv.surfPos.y(), sv.surfPos.z()},
+                        {1.0f, 0.0f, 0.0f});
+                    const openvdb::Vec3f zAxis(
+                        nb.nozzle_axis[0], nb.nozzle_axis[1], nb.nozzle_axis[2]);
+                    openvdb::Vec3f bestN = clearanceNormals[k];
+                    float bestDotZ = bestN.dot(zAxis);
+                    float bestLift = 0.0f;
+                    bool adoptedPlanar = false;
+
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                if (dx == 0 && dy == 0 && dz == 0) {
+                                    continue;
+                                }
+                                const int nbIdx =
+                                    surfIdxAcc.getValue(sv.ijk + openvdb::Coord(dx, dy, dz));
+                                if (nbIdx < 0) {
+                                    continue;
+                                }
+                                const auto uNb = static_cast<std::size_t>(nbIdx);
+                                const openvdb::Vec3f& nbN = clearanceNormals[uNb];
+                                const openvdb::Vec3f& nbPos = surfVoxels[uNb].surfPos;
+                                const bool nbPlanar = (isLocallyPlanar[uNb] != 0);
+                                if (nbPlanar) {
+                                    if (clearanceNormals[k].dot(nbN) < 0.85f) {
+                                        continue;
+                                    }
+                                    const float signedPlaneDelta = (nbPos - sv.surfPos).dot(nbN);
+                                    if (std::abs(signedPlaneDelta) > 0.55f * fineVoxelSize) {
+                                        continue;
+                                    }
+                                    const float candDotZ = nbN.dot(zAxis);
+                                    if (candDotZ > bestDotZ + 2.0e-4f) {
+                                        bestDotZ = candDotZ;
+                                        bestN = nbN;
+                                        bestLift = std::clamp(
+                                            signedPlaneDelta, 0.0f, 0.55f * fineVoxelSize);
+                                        adoptedPlanar = true;
+                                    }
+                                } else {
+                                    if (clearanceNormals[k].dot(nbN) < 0.82f) {
+                                        continue;
+                                    }
+                                    const float dzStep =
+                                        std::abs((nbPos - sv.surfPos).dot(nbN));
+                                    if (dzStep > 0.25f * fineVoxelSize) {
+                                        continue;
+                                    }
+                                    const float candDotZ = nbN.dot(zAxis);
+                                    if (candDotZ > bestDotZ + 0.01f) {
+                                        bestDotZ = candDotZ;
+                                        bestN = nbN;
+                                        bestLift = 0.0f;
+                                        adoptedPlanar = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    nextNormals[k] = bestN;
+                    if (bestLift > 0.0f) {
+                        nextPositions[k] = sv.surfPos + bestLift * bestN;
+                    }
+                    if (adoptedPlanar) {
+                        nextPlanar[k] = 1;
+                    }
+                }
+                clearanceNormals.swap(nextNormals);
+                isLocallyPlanar.swap(nextPlanar);
+                for (std::size_t k = 0; k < surfVoxels.size(); ++k) {
+                    surfVoxels[k].surfNormal = clearanceNormals[k];
+                    surfVoxels[k].surfPos = nextPositions[k];
+                }
             }
         }
 
@@ -6366,15 +6465,79 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 denseGpuGridFailed = true;
                 return false;
             }
+            float sweepMinX = solidBBoxMaxX;
+            float sweepMinY = solidBBoxMaxY;
+            float sweepMinZ = solidBBoxMaxZ;
+            float sweepMaxX = solidBBoxMinX;
+            float sweepMaxY = solidBBoxMinY;
+            float sweepMaxZ = solidBBoxMinZ;
+            const float marginExtra = std::max(0.65f * fineVoxelSize, 0.85f * hTop);
+            const float baseCurvTol = std::max(0.45f * hTop, 0.35f * fineVoxelSize);
+            const float overheadPad = baseCurvTol + fineVoxelSize;
+            const float clampPad = std::max(2.0f * fineVoxelSize, overheadPad);
+            for (std::size_t k = 0; k < surfVoxels.size(); ++k) {
+                const auto& sv = surfVoxels[k];
+                const openvdb::Vec3f& cNorm = clearanceNormals[k];
+                const NozzleBasis candNb = queryNozzleFrame(
+                    {sv.surfPos.x(), sv.surfPos.y(), sv.surfPos.z()},
+                    {1.0f, 0.0f, 0.0f});
+                const openvdb::Vec3f zNoz(
+                    candNb.nozzle_axis[0], candNb.nozzle_axis[1], candNb.nozzle_axis[2]);
+                const float depthMm = static_cast<float>(sv.requestedLayers) * hTop;
+                const float zMaxCand =
+                    std::min(maxToolClearanceHeightMm, depthMm + 3.0f * hTop);
+                const float rMaxCand =
+                    evalToolClearanceRadiusAtZ(zMaxCand) + marginExtra + 2.0f * fineVoxelSize;
+                const openvdb::Vec3f xBase = sv.surfPos - depthMm * cNorm;
+                const openvdb::Vec3f pTop = xBase + zMaxCand * zNoz;
+                const openvdb::Vec3f pOver = sv.surfPos + overheadPad * zNoz;
+                sweepMinX = std::min(
+                    sweepMinX,
+                    std::min({xBase.x(), pTop.x(), sv.surfPos.x(), pOver.x()}) - rMaxCand);
+                sweepMaxX = std::max(
+                    sweepMaxX,
+                    std::max({xBase.x(), pTop.x(), sv.surfPos.x(), pOver.x()}) + rMaxCand);
+                sweepMinY = std::min(
+                    sweepMinY,
+                    std::min({xBase.y(), pTop.y(), sv.surfPos.y(), pOver.y()}) - rMaxCand);
+                sweepMaxY = std::max(
+                    sweepMaxY,
+                    std::max({xBase.y(), pTop.y(), sv.surfPos.y(), pOver.y()}) + rMaxCand);
+                sweepMinZ = std::min(
+                    sweepMinZ,
+                    std::min({xBase.z(), pTop.z(), sv.surfPos.z(), pOver.z()}) - rMaxCand);
+                sweepMaxZ = std::max(
+                    sweepMaxZ,
+                    std::max({xBase.z(), pTop.z(), sv.surfPos.z(), pOver.z()}) + rMaxCand);
+            }
+            if (sweepMaxX <= sweepMinX) {
+                sweepMinX = solidBBoxMinX;
+                sweepMaxX = solidBBoxMaxX;
+            }
+            if (sweepMaxY <= sweepMinY) {
+                sweepMinY = solidBBoxMinY;
+                sweepMaxY = solidBBoxMaxY;
+            }
+            if (sweepMaxZ <= sweepMinZ) {
+                sweepMinZ = solidBBoxMinZ;
+                sweepMaxZ = solidBBoxMaxZ;
+            }
+            denseOriginX = std::max(solidBBoxMinX - clampPad, sweepMinX);
+            denseOriginY = std::max(solidBBoxMinY - clampPad, sweepMinY);
+            denseOriginZ = std::max(solidBBoxMinZ - clampPad, sweepMinZ);
+            const float denseMaxX = std::min(solidBBoxMaxX + clampPad, sweepMaxX);
+            const float denseMaxY = std::min(solidBBoxMaxY + clampPad, sweepMaxY);
+            const float denseMaxZ = std::min(solidBBoxMaxZ + clampPad, sweepMaxZ);
+
             float stepMm = fineVoxelSize;
-            const float spanX = std::max(voxelSize, solidBBoxMaxX - solidBBoxMinX);
-            const float spanY = std::max(voxelSize, solidBBoxMaxY - solidBBoxMinY);
-            const float spanZ = std::max(voxelSize, solidBBoxMaxZ - solidBBoxMinZ);
+            const float spanX = std::max(voxelSize, denseMaxX - denseOriginX);
+            const float spanY = std::max(voxelSize, denseMaxY - denseOriginY);
+            const float spanZ = std::max(voxelSize, denseMaxZ - denseOriginZ);
             const double estFineCells =
                 (static_cast<double>(spanX) / stepMm + 2.0) *
                 (static_cast<double>(spanY) / stepMm + 2.0) *
                 (static_cast<double>(spanZ) / stepMm + 2.0);
-            if (estFineCells > 4.5e6) {
+            if (estFineCells > 7.5e6) {
                 stepMm = voxelSize;
             }
             invDenseStep = 1.0f / std::max(stepMm, 1.0e-3f);

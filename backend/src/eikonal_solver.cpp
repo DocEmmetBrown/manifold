@@ -7,6 +7,7 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <queue>
 #include <string>
 #include <unordered_map>
@@ -2699,6 +2700,7 @@ EikonalSolveResult solveConstrainedEikonal(
         }
     }
 
+    bool hasCrownSlowness = false;
     if (baseContext.heightOnlyOrderField) {
         notifyProgress(0.60f, "Evaluating height-only planar order field along nozzle axis...");
         tbb::parallel_for(
@@ -2798,6 +2800,7 @@ EikonalSolveResult solveConstrainedEikonal(
         overhangConstraint.enforceOnField(domain, iterCtx);
 
         CrownAlignmentState crownState = buildCrownAlignmentState(domain, iterCtx);
+        hasCrownSlowness = crownState.active;
 
         // 3. Step B: Outer Iterative Tool-Orientation & Constraint Relaxation Loop
         const std::uint32_t totalIters = std::clamp<std::uint32_t>(baseContext.totalIterations, 1, 16);
@@ -2887,6 +2890,16 @@ EikonalSolveResult solveConstrainedEikonal(
     toolAxisGrid->setName("tool_axis");
     toolAxisGrid->setTransform(domain.transform->copy());
 
+    openvdb::FloatGrid::Ptr slownessGrid;
+    std::optional<openvdb::FloatGrid::Accessor> slownessAccessor;
+    if (hasCrownSlowness) {
+        slownessGrid = openvdb::FloatGrid::create(1.0f);
+        slownessGrid->setName("slowness");
+        slownessGrid->setGridClass(openvdb::GRID_FOG_VOLUME);
+        slownessGrid->setTransform(domain.transform->copy());
+        slownessAccessor.emplace(slownessGrid->getAccessor());
+    }
+
     auto eikAccessor = eikonalGrid->getAccessor();
     auto ovAccessor = overhangGrid->getAccessor();
     auto tiltAccessor = toolTiltGrid->getAccessor();
@@ -2906,6 +2919,9 @@ EikonalSolveResult solveConstrainedEikonal(
                 domain.toolAxis[i][0],
                 domain.toolAxis[i][1],
                 domain.toolAxis[i][2]));
+        if (slownessAccessor) {
+            slownessAccessor->setValue(ijk, domain.baseSlowness[i]);
+        }
     }
 
     notifyProgress(1.0f, "Field computation complete.");
@@ -2916,6 +2932,7 @@ EikonalSolveResult solveConstrainedEikonal(
     result.toolTiltDegGrid = toolTiltGrid;
     result.supportNeededGrid = supportNeededGrid;
     result.toolAxisGrid = toolAxisGrid;
+    result.slownessGrid = slownessGrid;
     result.minAxialBed = domain.minZBed;
     return result;
 }
@@ -2966,13 +2983,13 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
     std::vector<float> coarseTauSampled(n, -1.0f);
     const bool useCoarseSlowness =
         !baseContext.heightOnlyOrderField &&
+        (coarseSolved.slownessGrid != nullptr) &&
         (baseContext.conformalSkin.auto_enabled || !baseContext.conformalSkinHints.empty());
     const float hTargetFine = std::max(0.02f, baseContext.layerHeight.target_mm);
     const float hMinFine = std::clamp(baseContext.layerHeight.min_mm, 0.01f, hTargetFine);
     const float hMaxFine = std::max(hTargetFine, baseContext.layerHeight.max_mm);
     const float fineSMin = std::clamp(hTargetFine / std::max(hMaxFine, 1.0e-3f), 0.45f, 1.0f);
     const float fineSMax = std::clamp(hTargetFine / std::max(hMinFine, 1.0e-3f), 1.0f, 2.5f);
-    const double coarseDx = coarseSolved.eikonalGrid->transform().voxelSize()[0];
 
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, n, 512),
@@ -2987,6 +3004,16 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
                 openvdb::Vec3SGrid::ConstAccessor,
                 openvdb::tools::BoxSampler>
                 coarseAxisSampler(coarseAxisAcc, coarseSolved.toolAxisGrid->transform());
+            std::optional<openvdb::FloatGrid::ConstAccessor> coarseSlowAcc;
+            std::optional<openvdb::tools::GridSampler<
+                openvdb::FloatGrid::ConstAccessor,
+                openvdb::tools::BoxSampler>>
+                coarseSlowSampler;
+            if (useCoarseSlowness) {
+                coarseSlowAcc.emplace(coarseSolved.slownessGrid->getConstAccessor());
+                coarseSlowSampler.emplace(
+                    *coarseSlowAcc, coarseSolved.slownessGrid->transform());
+            }
 
             for (std::size_t i = r.begin(); i != r.end(); ++i) {
                 const auto& pos = domain.posBed[i];
@@ -3021,30 +3048,12 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
                 const float cTau = hasValidCoarseTau ? std::max(0.0f, cTauRaw) : -1.0f;
                 coarseTauSampled[i] = cTau;
 
-                if (useCoarseSlowness && hasValidCoarseTau && (fineSMax - fineSMin) > 0.08f) {
-                    const double hC = 0.5 * coarseDx;
-                    const float txP = coarseEikSampler.wsSample(wp + openvdb::Vec3d(hC, 0.0, 0.0));
-                    const float txM = coarseEikSampler.wsSample(wp - openvdb::Vec3d(hC, 0.0, 0.0));
-                    const float tyP = coarseEikSampler.wsSample(wp + openvdb::Vec3d(0.0, hC, 0.0));
-                    const float tyM = coarseEikSampler.wsSample(wp - openvdb::Vec3d(0.0, hC, 0.0));
-                    const float tzP = coarseEikSampler.wsSample(wp + openvdb::Vec3d(0.0, 0.0, hC));
-                    const float tzM = coarseEikSampler.wsSample(wp - openvdb::Vec3d(0.0, 0.0, hC));
-                    if (std::isfinite(txP) && txP < coarseValidLimit &&
-                        std::isfinite(txM) && txM < coarseValidLimit &&
-                        std::isfinite(tyP) && tyP < coarseValidLimit &&
-                        std::isfinite(tyM) && tyM < coarseValidLimit &&
-                        std::isfinite(tzP) && tzP < coarseValidLimit &&
-                        std::isfinite(tzM) && tzM < coarseValidLimit) {
-                        const float invSpanC = 1.0f / static_cast<float>(2.0 * hC);
-                        const float gxC = (txP - txM) * invSpanC;
-                        const float gyC = (tyP - tyM) * invSpanC;
-                        const float gzC = (tzP - tzM) * invSpanC;
-                        const float gNormC = std::sqrt(gxC * gxC + gyC * gyC + gzC * gzC);
-                        if (gNormC >= 0.25f && gNormC <= 3.5f) {
-                            const float sC = std::clamp(gNormC, fineSMin, fineSMax);
-                            domain.baseSlowness[i] = sC;
-                            domain.slowness[i] = sC;
-                        }
+                if (coarseSlowSampler && hasValidCoarseTau && (fineSMax - fineSMin) > 0.08f) {
+                    const float sRaw = coarseSlowSampler->wsSample(wp);
+                    if (std::isfinite(sRaw)) {
+                        const float sC = std::clamp(sRaw, fineSMin, fineSMax);
+                        domain.baseSlowness[i] = sC;
+                        domain.slowness[i] = sC;
                     }
                 }
 

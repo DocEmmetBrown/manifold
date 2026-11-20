@@ -249,6 +249,7 @@ struct EikonalSolveResult {
     openvdb::FloatGrid::Ptr toolTiltDegGrid;
     openvdb::FloatGrid::Ptr supportNeededGrid;
     openvdb::Vec3SGrid::Ptr toolAxisGrid;
+    openvdb::FloatGrid::Ptr slownessGrid;
     float minAxialBed = 0.0f;
 };
 
