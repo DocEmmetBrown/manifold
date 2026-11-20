@@ -3231,6 +3231,8 @@ dependencies = [
  "quick-xml 0.39.4",
  "reqwest",
  "rfd",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "stl_io",

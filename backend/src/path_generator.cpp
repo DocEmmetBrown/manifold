@@ -3060,32 +3060,18 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
             auto computeIsosurfaceNozzleAxis = [&](const Vec3f& p,
                                                    const Vec3f& meshIsoNormal,
                                                    bool isConformalSkin) -> Vec3f {
-                const Vec3f solvedAxis = sampleNozzleAxis(p);
                 if (!toolHasRotationalAxes) {
-                    return solvedAxis;
+                    return sampleNozzleAxis(p);
                 }
                 Vec3f nIso = normalize3(meshIsoNormal, fallbackNozzle);
                 if (dot3(nIso, fallbackNozzle) < 0.0f) {
                     nIso = nIso * -1.0f;
                 }
                 const float gammaMax = computeBedSafeMaxTiltRad(p);
-                if (isConformalSkin) {
+                if (isConformalSkin || orientOuterSurfacesToNormal) {
                     return clampVecToCone(nIso, fallbackNozzle, gammaMax);
                 }
-                if (orientOuterSurfacesToNormal) {
-                    // Use whichever of the local layer isosurface normal `nIso` and the solved 3D
-                    // tool orientation field `solvedAxis` tilts more strongly (e.g. from overhang
-                    // guidance or orientation hints), clamped to bed-safe clearance `gammaMax`.
-                    const Vec3f isoClamped = clampVecToCone(nIso, fallbackNozzle, gammaMax);
-                    const Vec3f solvedClamped = clampVecToCone(solvedAxis, fallbackNozzle, gammaMax);
-                    const float cosIso = dot3(isoClamped, fallbackNozzle);
-                    const float cosSolved = dot3(solvedClamped, fallbackNozzle);
-                    if (cosSolved + 1.0e-4f < cosIso) {
-                        return solvedClamped;
-                    }
-                    return isoClamped;
-                }
-                return clampVecToCone(solvedAxis, fallbackNozzle, gammaMax);
+                return clampVecToCone(sampleNozzleAxis(p), fallbackNozzle, gammaMax);
             };
 
             auto computeOuterSurfaceNozzleAxis = [&](const Vec3f& p,
@@ -3095,19 +3081,20 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 if (outUsedSurfaceNormal != nullptr) {
                     *outUsedSurfaceNormal = false;
                 }
-                const Vec3f solvedAxis = sampleNozzleAxis(p);
                 if (!toolHasRotationalAxes) {
-                    return solvedAxis;
+                    return sampleNozzleAxis(p);
                 }
                 Vec3f nIso = normalize3(meshIsoNormal, fallbackNozzle);
                 if (dot3(nIso, fallbackNozzle) < 0.0f) {
                     nIso = nIso * -1.0f;
                 }
                 const float gammaMax = computeBedSafeMaxTiltRad(p);
-                const Vec3f isoAxis = computeIsosurfaceNozzleAxis(p, nIso, isConformalSkin);
+                const Vec3f isoAxis = clampVecToCone(nIso, fallbackNozzle, gammaMax);
 
                 if (!orientOuterSurfacesToNormal) {
-                    return isoAxis;
+                    return isConformalSkin
+                        ? isoAxis
+                        : clampVecToCone(sampleNozzleAxis(p), fallbackNozzle, gammaMax);
                 }
 
                 const Vec3f nSurf = sampleOutwardSdfNormal(p, nIso, isConformalSkin);

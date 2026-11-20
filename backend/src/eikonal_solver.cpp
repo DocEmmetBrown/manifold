@@ -1281,30 +1281,24 @@ void OverhangIslandConstraint::applyPreSweepModifiers(
                     (nrmCount > 0) ? (sumNrmDot / static_cast<float>(nrmCount)) : 1.0f;
 
                 // Also probe inward along -n_surf to verify that this surface is backed by solid
-                // interior rather than a 1-voxel razor fin where opposite walls would fight each other.
+                // interior rather than a thin fin/arch tip where opposite walls would fight each other.
                 const int probeSteps =
-                    std::clamp<int>(static_cast<int>(std::lround(1.0f / dx)), 2, 4);
+                    std::clamp<int>(static_cast<int>(std::lround(1.5f / dx)), 3, 6);
                 const openvdb::Coord probeCoord = domain.coords[i].offsetBy(
                     static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[0])),
                     static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[1])),
                     static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[2])));
                 const std::int32_t probeIdx = domain.findVoxelIndex(probeCoord);
-                float probeFactor = 1.0f;
                 if (probeIdx < 0 || !domain.isInterior[static_cast<std::size_t>(probeIdx)]) {
-                    probeFactor = 0.35f;
-                } else {
-                    const float probeDot =
-                        dot3(nSurf, domain.sdfGrad[static_cast<std::size_t>(probeIdx)]);
-                    // Allow thin structural walls (e.g. 1.2..2.0 mm hull/cabin walls) whose local
-                    // 6-neighbor surface normal is coherent even if the inward probe crosses the
-                    // wall's medial plane.
-                    probeFactor = std::max(0.45f, smoothstep01(0.25f, 0.75f, probeDot));
+                    continue;
                 }
+                const float probeDot =
+                    dot3(nSurf, domain.sdfGrad[static_cast<std::size_t>(probeIdx)]);
 
                 const float coherenceFactor =
-                    smoothstep01(0.70f, 0.92f, avgNrmDot) *
-                    smoothstep01(0.25f, 0.75f, minNrmDot) *
-                    probeFactor;
+                    smoothstep01(0.75f, 0.94f, avgNrmDot) *
+                    smoothstep01(0.35f, 0.80f, minNrmDot) *
+                    smoothstep01(0.55f, 0.85f, probeDot);
                 if (coherenceFactor <= 1.0e-4f) {
                     continue;
                 }
